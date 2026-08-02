@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -18,6 +20,15 @@ type PgStore struct {
 	pool   *pgxpool.Pool
 	cipher *Cipher // nil = no at-rest encryption (passthrough)
 }
+
+var _ NamespaceStore = (*PgStore)(nil)
+var _ ConnectionNamespaceStore = (*PgStore)(nil)
+
+const (
+	enginePostgresMaxConns        int32 = 2
+	enginePostgresMaxConnLifetime       = 30 * time.Minute
+	enginePostgresMaxConnIdleTime       = 5 * time.Minute
+)
 
 // SetCipher enables AES-GCM encryption of token columns at rest.
 func (s *PgStore) SetCipher(c *Cipher) { s.cipher = c }
@@ -39,6 +50,10 @@ func (s *PgStore) EncryptExisting(ctx context.Context) error {
 	return nil
 }
 
+// The legacy workspace column stores Account.Group: a display-only alias for
+// the owning connection namespace. Its name is preserved so rolling upgrades
+// and portable config remain compatible; connection_namespace_id below is the
+// authoritative ownership boundary.
 const accountsSchema = `
 CREATE TABLE IF NOT EXISTS narthex_accounts (
     name           TEXT PRIMARY KEY,
@@ -56,7 +71,20 @@ CREATE TABLE IF NOT EXISTS narthex_accounts (
     bearer_token   TEXT NOT NULL DEFAULT '',
     disabled_tools TEXT[],
     tool_overrides JSONB NOT NULL DEFAULT '{}'::jsonb,
-    read_only      BOOLEAN NOT NULL DEFAULT false
+    read_only      BOOLEAN NOT NULL DEFAULT false,
+    connection_namespace_id TEXT NOT NULL DEFAULT '',
+    connection_scope TEXT NOT NULL DEFAULT 'shared',
+    owner_subject TEXT NOT NULL DEFAULT '',
+    revision BIGINT NOT NULL DEFAULT 1 CHECK (revision >= 1),
+	incarnation_id TEXT NOT NULL DEFAULT ('accti_' || md5(random()::text || clock_timestamp()::text)),
+    CONSTRAINT narthex_accounts_connection_scope_check
+        CHECK (connection_scope IN ('shared','personal','service'))
+);`
+
+const engineStateSchema = `
+CREATE TABLE IF NOT EXISTS narthex_engine_state (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );`
 
 // idempotent migrations for tables created before these columns existed.
@@ -64,12 +92,65 @@ const accountsMigrate = `
 ALTER TABLE narthex_accounts ADD COLUMN IF NOT EXISTS disabled_tools TEXT[];
 ALTER TABLE narthex_accounts ADD COLUMN IF NOT EXISTS tool_overrides JSONB NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE narthex_accounts ADD COLUMN IF NOT EXISTS read_only BOOLEAN NOT NULL DEFAULT false;
-ALTER TABLE narthex_accounts ADD COLUMN IF NOT EXISTS scope TEXT NOT NULL DEFAULT '';`
+ALTER TABLE narthex_accounts ADD COLUMN IF NOT EXISTS scope TEXT NOT NULL DEFAULT '';
+ALTER TABLE narthex_accounts ADD COLUMN IF NOT EXISTS connection_namespace_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE narthex_accounts ADD COLUMN IF NOT EXISTS connection_scope TEXT NOT NULL DEFAULT 'shared';
+ALTER TABLE narthex_accounts ADD COLUMN IF NOT EXISTS owner_subject TEXT NOT NULL DEFAULT '';
+ALTER TABLE narthex_accounts ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;
+ALTER TABLE narthex_accounts ADD COLUMN IF NOT EXISTS incarnation_id TEXT NOT NULL DEFAULT ('accti_' || md5(random()::text || clock_timestamp()::text));
+ALTER TABLE narthex_accounts ALTER COLUMN revision SET DEFAULT 1;
+ALTER TABLE narthex_accounts ALTER COLUMN incarnation_id SET DEFAULT ('accti_' || md5(random()::text || clock_timestamp()::text));
+UPDATE narthex_accounts SET connection_scope='shared' WHERE connection_scope='';
+UPDATE narthex_accounts SET connection_scope='shared' WHERE connection_scope NOT IN ('shared','personal','service');
+UPDATE narthex_accounts SET revision=1 WHERE revision < 1;
+UPDATE narthex_accounts SET incarnation_id=('accti_' || md5(random()::text || clock_timestamp()::text || name)) WHERE incarnation_id='';
+CREATE UNIQUE INDEX IF NOT EXISTS narthex_accounts_incarnation_id_idx ON narthex_accounts (incarnation_id);
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'narthex_accounts_connection_scope_check'
+          AND conrelid = 'narthex_accounts'::regclass
+    ) THEN
+        ALTER TABLE narthex_accounts
+            ADD CONSTRAINT narthex_accounts_connection_scope_check
+            CHECK (connection_scope IN ('shared','personal','service'));
+    END IF;
+END $$;`
 
-const accountCols = `name,label,workspace,url,auth_mode,client_id,client_secret,access_token,refresh_token,token_endpoint,resource,scope,bearer_token,disabled_tools,tool_overrides,read_only`
+// Connection namespaces deliberately use a separate table family from the
+// legacy narthex_namespaces + narthex_namespace_accounts endpoint-bundle
+// tables. The former own credentials; the latter expose shared MCP endpoints.
+const connectionNamespacesSchema = `
+CREATE TABLE IF NOT EXISTS narthex_connection_namespaces (
+    id         TEXT PRIMARY KEY,
+    slug       TEXT NOT NULL UNIQUE,
+    label      TEXT NOT NULL,
+    revision   BIGINT NOT NULL DEFAULT 1 CHECK (revision >= 1),
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS narthex_connection_namespace_managers (
+    connection_namespace_id TEXT NOT NULL REFERENCES narthex_connection_namespaces(id) ON DELETE CASCADE,
+    subject                 TEXT NOT NULL,
+    PRIMARY KEY (connection_namespace_id, subject)
+);
+CREATE INDEX IF NOT EXISTS narthex_accounts_connection_namespace_idx
+    ON narthex_accounts (connection_namespace_id);
+CREATE INDEX IF NOT EXISTS narthex_connection_namespaces_slug_idx
+    ON narthex_connection_namespaces (slug);
+ALTER TABLE narthex_connection_namespaces ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
+ALTER TABLE narthex_connection_namespaces ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();`
+
+const accountCols = `name,label,workspace,url,auth_mode,connection_namespace_id,connection_scope,owner_subject,revision,incarnation_id,client_id,client_secret,access_token,refresh_token,token_endpoint,resource,scope,bearer_token,disabled_tools,tool_overrides,read_only`
 
 func NewPgStore(ctx context.Context, dsn string) (*PgStore, error) {
-	pool, err := pgxpool.New(ctx, dsn)
+	config, err := enginePostgresPoolConfig(dsn)
+	if err != nil {
+		return nil, err
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
 		return nil, err
 	}
@@ -80,6 +161,27 @@ func NewPgStore(ctx context.Context, dsn string) (*PgStore, error) {
 	if _, err := pool.Exec(ctx, accountsMigrate); err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("migrate accounts schema: %w", err)
+	}
+	if _, err := pool.Exec(ctx, connectionNamespacesSchema); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("ensure connection namespaces schema: %w", err)
+	}
+	if _, err := pool.Exec(ctx, mcpClientsSchema); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("ensure MCP client registry schema: %w", err)
+	}
+	store := &PgStore{pool: pool}
+	if err := store.backfillConnectionNamespaces(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("backfill connection namespaces: %w", err)
+	}
+	if err := store.backfillMCPClients(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("backfill MCP clients: %w", err)
+	}
+	if _, err := pool.Exec(ctx, engineStateSchema); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("ensure engine state schema: %w", err)
 	}
 	if _, err := pool.Exec(ctx, callsSchema); err != nil {
 		pool.Close()
@@ -97,6 +199,10 @@ func NewPgStore(ctx context.Context, dsn string) (*PgStore, error) {
 		pool.Close()
 		return nil, fmt.Errorf("migrate connectors schema: %w", err)
 	}
+	if _, err := pool.Exec(ctx, namespacesSchema); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("ensure namespaces schema: %w", err)
+	}
 	if _, err := pool.Exec(ctx, pendingSchema); err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("ensure pending_calls schema: %w", err)
@@ -105,7 +211,300 @@ func NewPgStore(ctx context.Context, dsn string) (*PgStore, error) {
 		pool.Close()
 		return nil, fmt.Errorf("migrate pending_calls schema: %w", err)
 	}
-	return &PgStore{pool: pool}, nil
+	if _, err := pool.Exec(ctx, usageSchema); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("ensure usage schema: %w", err)
+	}
+	if _, err := pool.Exec(ctx, usageMigrate); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("migrate usage schema: %w", err)
+	}
+	return store, nil
+}
+
+func enginePostgresPoolConfig(dsn string) (*pgxpool.Config, error) {
+	config, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("parse Engine database URL: %w", err)
+	}
+	// Hosted Engines share one Cloud SQL instance across isolated workspace
+	// databases. Keep each scale-to-zero Engine's connection footprint bounded
+	// so a small number of active workspaces cannot starve Platform control
+	// operations. Callers cannot raise this safety cap through pool_* DSN
+	// parameters.
+	config.MaxConns = enginePostgresMaxConns
+	config.MinConns = 0
+	config.MaxConnLifetime = enginePostgresMaxConnLifetime
+	config.MaxConnIdleTime = enginePostgresMaxConnIdleTime
+	return config, nil
+}
+
+type persistedAccountConnection struct {
+	Name                  string
+	Group                 string
+	ConnectionNamespaceID string
+	ConnectionScope       ConnectionScope
+	OwnerSubject          string
+	Revision              int64
+}
+
+// backfillConnectionNamespaces upgrades legacy Group/workspace-only account
+// rows on startup. A group label is never treated as proof of personal access:
+// all rows that lack a durable namespace are explicitly made shared. This is
+// an intentionally conservative rolling migration, not an authorization
+// inference.
+func (s *PgStore) backfillConnectionNamespaces(ctx context.Context) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	rows, err := tx.Query(ctx, `
+SELECT name,workspace,connection_namespace_id,connection_scope,owner_subject,revision
+FROM narthex_accounts
+FOR UPDATE`)
+	if err != nil {
+		return err
+	}
+	var accounts []persistedAccountConnection
+	for rows.Next() {
+		var a persistedAccountConnection
+		if err := rows.Scan(&a.Name, &a.Group, &a.ConnectionNamespaceID, &a.ConnectionScope, &a.OwnerSubject, &a.Revision); err != nil {
+			rows.Close()
+			return err
+		}
+		accounts = append(accounts, a)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
+	for _, persisted := range accounts {
+		a := Account{
+			Name:                  persisted.Name,
+			Group:                 persisted.Group,
+			ConnectionNamespaceID: strings.TrimSpace(persisted.ConnectionNamespaceID),
+			ConnectionScope:       persisted.ConnectionScope,
+			OwnerSubject:          persisted.OwnerSubject,
+			Revision:              persisted.Revision,
+		}
+		if a.ConnectionNamespaceID == "" {
+			a.ConnectionScope = ConnectionScopeShared
+			a.OwnerSubject = ""
+		}
+		if err := s.ensureAccountConnectionNamespaceTx(ctx, tx, &a); err != nil {
+			return fmt.Errorf("account %q: %w", a.Name, err)
+		}
+		if a.ConnectionNamespaceID != persisted.ConnectionNamespaceID || a.ConnectionScope != persisted.ConnectionScope ||
+			a.OwnerSubject != persisted.OwnerSubject || a.Revision != persisted.Revision || a.Group != persisted.Group {
+			if _, err := tx.Exec(ctx, `
+UPDATE narthex_accounts
+SET workspace=$2, connection_namespace_id=$3, connection_scope=$4, owner_subject=$5, revision=$6
+WHERE name=$1`, a.Name, a.Group, a.ConnectionNamespaceID, a.ConnectionScope, a.OwnerSubject, a.Revision); err != nil {
+				return err
+			}
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+func pgConnectionNamespaceSlug(ctx context.Context, tx pgx.Tx, label string) (string, error) {
+	base := normalizeConnectionNamespaceSlug(label)
+	if base == "" {
+		base = "general"
+	}
+	for n := 1; ; n++ {
+		slug := base
+		if n > 1 {
+			slug = fmt.Sprintf("%s-%d", base, n)
+		}
+		var exists bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM narthex_connection_namespaces WHERE slug=$1)`, slug).Scan(&exists); err != nil {
+			return "", err
+		}
+		if !exists {
+			return slug, nil
+		}
+	}
+}
+
+func insertConnectionNamespaceTx(ctx context.Context, tx pgx.Tx, ns ConnectionNamespace) (ConnectionNamespace, error) {
+	if err := prepareConnectionNamespaceForCreate(&ns); err != nil {
+		return ConnectionNamespace{}, err
+	}
+	for {
+		// Serialize same-slug creates across Engine replicas. The random ID is
+		// still checked by the primary key, but a collision is astronomically
+		// unlikely and a retry is cheap.
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, "connection-namespace:"+ns.Slug); err != nil {
+			return ConnectionNamespace{}, err
+		}
+		var inserted string
+		err := tx.QueryRow(ctx, `
+			INSERT INTO narthex_connection_namespaces (id,slug,label,revision,created_by,created_at,updated_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7)
+			ON CONFLICT DO NOTHING
+			RETURNING id`, ns.ID, ns.Slug, ns.Label, ns.Revision, ns.CreatedBy, ns.CreatedAt, ns.UpdatedAt).Scan(&inserted)
+		if err == nil {
+			for _, grant := range ns.ManagerGrants {
+				if _, err := tx.Exec(ctx, `
+INSERT INTO narthex_connection_namespace_managers (connection_namespace_id,subject)
+VALUES ($1,$2)`, ns.ID, grant.Subject); err != nil {
+					return ConnectionNamespace{}, err
+				}
+			}
+			return ns, nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return ConnectionNamespace{}, err
+		}
+		// A slug collision is common enough under a label migration. Try a
+		// suffix; an ID collision takes the same safe path.
+		slug, slugErr := pgConnectionNamespaceSlug(ctx, tx, ns.Slug)
+		if slugErr != nil {
+			return ConnectionNamespace{}, slugErr
+		}
+		ns.Slug = slug
+		ns.ID = newConnectionNamespaceID()
+	}
+}
+
+func loadConnectionNamespaceByIDTx(ctx context.Context, tx pgx.Tx, id string) (ConnectionNamespace, error) {
+	var ns ConnectionNamespace
+	err := tx.QueryRow(ctx, `
+	SELECT id,slug,label,revision,created_by,created_at,updated_at
+FROM narthex_connection_namespaces
+WHERE id=$1`, id).Scan(&ns.ID, &ns.Slug, &ns.Label, &ns.Revision, &ns.CreatedBy, &ns.CreatedAt, &ns.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ConnectionNamespace{}, ErrConnectionNamespaceNotFound
+	}
+	return ns, err
+}
+
+func (s *PgStore) ensureAccountConnectionNamespaceTx(ctx context.Context, tx pgx.Tx, a *Account) error {
+	if err := normalizeAccountConnection(a); err != nil {
+		return err
+	}
+	if a.ConnectionNamespaceID != "" {
+		ns, err := loadConnectionNamespaceByIDTx(ctx, tx, a.ConnectionNamespaceID)
+		if err != nil {
+			return err
+		}
+		if strings.TrimSpace(a.Group) == "" {
+			a.Group = ns.Label
+		}
+		return nil
+	}
+
+	label := defaultConnectionNamespaceLabel(*a)
+	if a.ConnectionScope != ConnectionScopePersonal {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, "connection-namespace-label:"+strings.ToLower(label)); err != nil {
+			return err
+		}
+		var existing string
+		err := tx.QueryRow(ctx, `
+SELECT id FROM narthex_connection_namespaces
+WHERE lower(label)=lower($1)
+ORDER BY id
+LIMIT 1`, label).Scan(&existing)
+		if err == nil {
+			a.ConnectionNamespaceID = existing
+			return nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+	}
+
+	ns := ConnectionNamespace{
+		ID:        newConnectionNamespaceID(),
+		Slug:      normalizeConnectionNamespaceSlug(label),
+		Label:     label,
+		Revision:  1,
+		CreatedBy: a.OwnerSubject,
+	}
+	if a.ConnectionScope == ConnectionScopePersonal {
+		ns.Slug = "personal"
+	}
+	created, err := insertConnectionNamespaceTx(ctx, tx, ns)
+	if err != nil {
+		return err
+	}
+	a.ConnectionNamespaceID = created.ID
+	return nil
+}
+
+// LoadOrCreateTokenGeneration returns the Engine's durable workspace OAuth
+// generation. INSERT ... ON CONFLICT makes first startup safe under concurrent
+// constructors; the subsequent SELECT observes the winning value.
+func (s *PgStore) LoadOrCreateTokenGeneration(ctx context.Context, candidate string) (string, error) {
+	if candidate == "" {
+		return "", errors.New("token generation candidate is required")
+	}
+	const key = "oauth_token_generation"
+	if _, err := s.pool.Exec(ctx, `
+INSERT INTO narthex_engine_state (key,value)
+VALUES ($1,$2)
+ON CONFLICT (key) DO NOTHING`, key, candidate); err != nil {
+		return "", fmt.Errorf("initialize token generation: %w", err)
+	}
+	var generation string
+	if err := s.pool.QueryRow(ctx, `SELECT value FROM narthex_engine_state WHERE key=$1`, key).Scan(&generation); err != nil {
+		return "", fmt.Errorf("load token generation: %w", err)
+	}
+	if generation == "" {
+		return "", errors.New("load token generation: stored generation is empty")
+	}
+	return generation, nil
+}
+
+func (s *PgStore) CurrentTokenGeneration(ctx context.Context) (string, error) {
+	const key = "oauth_token_generation"
+	var generation string
+	if err := s.pool.QueryRow(ctx, `SELECT value FROM narthex_engine_state WHERE key=$1`, key).Scan(&generation); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", errors.New("token generation is not initialized")
+		}
+		return "", fmt.Errorf("load current token generation: %w", err)
+	}
+	if generation == "" {
+		return "", errors.New("load current token generation: stored generation is empty")
+	}
+	return generation, nil
+}
+
+// RotateTokenGeneration uses compare-and-swap so a stale Engine instance can
+// never overwrite a newer revocation generation. On a stale expectation it
+// returns the already-current value for the caller to adopt.
+func (s *PgStore) RotateTokenGeneration(ctx context.Context, expected, replacement string) (string, error) {
+	if expected == "" || replacement == "" {
+		return "", errors.New("expected and replacement token generations are required")
+	}
+	const key = "oauth_token_generation"
+	var generation string
+	err := s.pool.QueryRow(ctx, `
+UPDATE narthex_engine_state
+SET value=$3
+WHERE key=$1 AND value=$2
+RETURNING value`, key, expected, replacement).Scan(&generation)
+	if err == nil {
+		return generation, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return "", fmt.Errorf("rotate token generation: %w", err)
+	}
+	if err := s.pool.QueryRow(ctx, `SELECT value FROM narthex_engine_state WHERE key=$1`, key).Scan(&generation); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", errors.New("token generation is not initialized")
+		}
+		return "", fmt.Errorf("load current token generation: %w", err)
+	}
+	if generation == "" {
+		return "", errors.New("load current token generation: stored generation is empty")
+	}
+	return generation, nil
 }
 
 const connectorsSchema = `
@@ -131,16 +530,37 @@ ALTER TABLE narthex_connectors ADD COLUMN IF NOT EXISTS redact JSONB NOT NULL DE
 ALTER TABLE narthex_connectors ADD COLUMN IF NOT EXISTS disable_injection_scan BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE narthex_connectors ADD COLUMN IF NOT EXISTS epoch TEXT NOT NULL DEFAULT '';`
 
+const namespacesSchema = `
+CREATE TABLE IF NOT EXISTS narthex_namespaces (
+    slug     TEXT PRIMARY KEY,
+    label    TEXT NOT NULL DEFAULT '',
+    epoch    TEXT NOT NULL DEFAULT '',
+    revision BIGINT NOT NULL DEFAULT 1 CHECK (revision >= 1)
+);
+CREATE TABLE IF NOT EXISTS narthex_namespace_accounts (
+    namespace_slug TEXT NOT NULL REFERENCES narthex_namespaces(slug) ON DELETE CASCADE,
+    account_name   TEXT NOT NULL REFERENCES narthex_accounts(name) ON DELETE CASCADE,
+    PRIMARY KEY (namespace_slug, account_name)
+);
+CREATE INDEX IF NOT EXISTS narthex_namespace_accounts_account_idx
+    ON narthex_namespace_accounts (account_name);`
+
 const pendingSchema = `
 CREATE TABLE IF NOT EXISTS pending_calls (
-    id         TEXT PRIMARY KEY,
-    ts         TIMESTAMPTZ NOT NULL DEFAULT now(),
-    connector  TEXT NOT NULL DEFAULT '',
-    account    TEXT NOT NULL DEFAULT '',
-    tool       TEXT NOT NULL DEFAULT '',
-    args       TEXT NOT NULL DEFAULT '{}',
-    status     TEXT NOT NULL DEFAULT 'pending',
-    decided_at TIMESTAMPTZ
+    id                      TEXT PRIMARY KEY,
+    ts                      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    connector               TEXT NOT NULL DEFAULT '',
+    account                 TEXT NOT NULL DEFAULT '',
+    account_incarnation_id  TEXT NOT NULL DEFAULT '',
+    account_revision        BIGINT NOT NULL DEFAULT 0,
+    connection_namespace_id TEXT NOT NULL DEFAULT '',
+    tool                    TEXT NOT NULL DEFAULT '',
+    args                    TEXT NOT NULL DEFAULT '{}',
+    status                  TEXT NOT NULL DEFAULT 'pending',
+    expires_at              TIMESTAMPTZ NOT NULL DEFAULT (now() + interval '3 minutes'),
+    decided_at              TIMESTAMPTZ,
+    decided_by              TEXT NOT NULL DEFAULT '',
+    decision_note           TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS pending_calls_ts_idx ON pending_calls (ts DESC);`
 
@@ -150,7 +570,20 @@ CREATE INDEX IF NOT EXISTS pending_calls_ts_idx ON pending_calls (ts DESC);`
 const pendingMigrate = `
 ALTER TABLE pending_calls ALTER COLUMN args DROP DEFAULT;
 ALTER TABLE pending_calls ALTER COLUMN args TYPE TEXT USING args::text;
-ALTER TABLE pending_calls ALTER COLUMN args SET DEFAULT '{}';`
+ALTER TABLE pending_calls ALTER COLUMN args SET DEFAULT '{}';
+ALTER TABLE pending_calls ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
+ALTER TABLE pending_calls ADD COLUMN IF NOT EXISTS decided_by TEXT NOT NULL DEFAULT '';
+ALTER TABLE pending_calls ADD COLUMN IF NOT EXISTS decision_note TEXT NOT NULL DEFAULT '';
+ALTER TABLE pending_calls ADD COLUMN IF NOT EXISTS account_incarnation_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE pending_calls ADD COLUMN IF NOT EXISTS account_revision BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE pending_calls ADD COLUMN IF NOT EXISTS connection_namespace_id TEXT NOT NULL DEFAULT '';
+UPDATE pending_calls
+SET expires_at = ts + interval '3 minutes'
+WHERE expires_at IS NULL;
+ALTER TABLE pending_calls ALTER COLUMN expires_at SET DEFAULT (now() + interval '3 minutes');
+ALTER TABLE pending_calls ALTER COLUMN expires_at SET NOT NULL;
+CREATE INDEX IF NOT EXISTS pending_calls_pending_expiry_idx
+    ON pending_calls (expires_at) WHERE status = 'pending';`
 
 const callsSchema = `
 CREATE TABLE IF NOT EXISTS tool_calls (
@@ -162,6 +595,8 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     ms        BIGINT NOT NULL,
     error     TEXT NOT NULL DEFAULT '',
     connector TEXT NOT NULL DEFAULT '',
+    endpoint_kind TEXT NOT NULL DEFAULT '',
+    endpoint_generation TEXT NOT NULL DEFAULT '',
     decision  TEXT NOT NULL DEFAULT '',
     args      TEXT NOT NULL DEFAULT '',
     result    TEXT NOT NULL DEFAULT '',
@@ -174,6 +609,8 @@ CREATE INDEX IF NOT EXISTS tool_calls_ts_idx ON tool_calls (ts DESC);`
 // guardrail columns.
 const callsMigrate = `
 ALTER TABLE tool_calls ADD COLUMN IF NOT EXISTS connector TEXT NOT NULL DEFAULT '';
+ALTER TABLE tool_calls ADD COLUMN IF NOT EXISTS endpoint_kind TEXT NOT NULL DEFAULT '';
+ALTER TABLE tool_calls ADD COLUMN IF NOT EXISTS endpoint_generation TEXT NOT NULL DEFAULT '';
 ALTER TABLE tool_calls ADD COLUMN IF NOT EXISTS decision TEXT NOT NULL DEFAULT '';
 ALTER TABLE tool_calls ADD COLUMN IF NOT EXISTS args TEXT NOT NULL DEFAULT '';
 ALTER TABLE tool_calls ADD COLUMN IF NOT EXISTS result TEXT NOT NULL DEFAULT '';
@@ -190,10 +627,15 @@ func (s *PgStore) LogCall(rec CallRecord) {
 		if rec.TS.IsZero() {
 			rec.TS = time.Now()
 		}
-		if _, err := s.pool.Exec(ctx, `INSERT INTO tool_calls (ts,account,tool,ok,ms,error,connector,decision,args,result,guard)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-			rec.TS, rec.Account, rec.Tool, rec.OK, rec.Ms, clampErr(rec.Error), rec.Connector, rec.Decision,
-			s.enc(clampPayload(rec.Args, maxPayloadBytes)), s.enc(clampPayload(rec.Result, maxPayloadBytes)), rec.Guard); err != nil {
+		if _, err := s.pool.Exec(ctx, `INSERT INTO tool_calls (
+    ts,account,tool,ok,ms,error,connector,endpoint_kind,endpoint_generation,decision,args,result,guard
+)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+			rec.TS, rec.Account, rec.Tool, rec.OK, rec.Ms, clampErr(rec.Error),
+			rec.Connector, rec.EndpointKind, rec.EndpointGeneration, rec.Decision,
+			s.enc(clampPayload(rec.Args, maxPayloadBytes)),
+			s.enc(clampPayload(rec.Result, maxPayloadBytes)),
+			rec.Guard); err != nil {
 			log.Printf("engine: audit insert failed (call %s/%s dropped): %v", rec.Account, rec.Tool, err)
 		}
 	}()
@@ -203,7 +645,9 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
 // list response stays payload-free (and no decryption work happens per row).
 // Guard IS selected — it's tiny and the Activity UI chips on it.
 func (s *PgStore) RecentCalls(ctx context.Context, limit int) ([]CallRecord, error) {
-	rows, err := s.pool.Query(ctx, `SELECT id,ts,account,tool,ok,ms,error,connector,decision,guard,triage FROM tool_calls ORDER BY ts DESC LIMIT $1`, limit)
+	rows, err := s.pool.Query(ctx, `
+SELECT id,ts,account,tool,ok,ms,error,connector,endpoint_kind,endpoint_generation,decision,guard,triage
+FROM tool_calls ORDER BY ts DESC LIMIT $1`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -211,7 +655,11 @@ func (s *PgStore) RecentCalls(ctx context.Context, limit int) ([]CallRecord, err
 	var out []CallRecord
 	for rows.Next() {
 		var c CallRecord
-		if err := rows.Scan(&c.ID, &c.TS, &c.Account, &c.Tool, &c.OK, &c.Ms, &c.Error, &c.Connector, &c.Decision, &c.Guard, &c.Triage); err == nil {
+		if err := rows.Scan(
+			&c.ID, &c.TS, &c.Account, &c.Tool, &c.OK, &c.Ms, &c.Error,
+			&c.Connector, &c.EndpointKind, &c.EndpointGeneration,
+			&c.Decision, &c.Guard, &c.Triage,
+		); err == nil {
 			out = append(out, c)
 		}
 	}
@@ -221,8 +669,13 @@ func (s *PgStore) RecentCalls(ctx context.Context, limit int) ([]CallRecord, err
 // CallDetail returns one full record including decrypted payloads.
 func (s *PgStore) CallDetail(ctx context.Context, id int64) (CallRecord, bool, error) {
 	var c CallRecord
-	err := s.pool.QueryRow(ctx, `SELECT id,ts,account,tool,ok,ms,error,connector,decision,args,result,guard,triage FROM tool_calls WHERE id=$1`, id).
-		Scan(&c.ID, &c.TS, &c.Account, &c.Tool, &c.OK, &c.Ms, &c.Error, &c.Connector, &c.Decision, &c.Args, &c.Result, &c.Guard, &c.Triage)
+	err := s.pool.QueryRow(ctx, `
+SELECT id,ts,account,tool,ok,ms,error,connector,endpoint_kind,endpoint_generation,decision,args,result,guard,triage
+FROM tool_calls WHERE id=$1`, id).Scan(
+		&c.ID, &c.TS, &c.Account, &c.Tool, &c.OK, &c.Ms, &c.Error,
+		&c.Connector, &c.EndpointKind, &c.EndpointGeneration,
+		&c.Decision, &c.Args, &c.Result, &c.Guard, &c.Triage,
+	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return CallRecord{}, false, nil
 	}
@@ -264,6 +717,32 @@ func (s *PgStore) PurgeCalls(ctx context.Context, olderThan time.Duration) (int6
 
 func (s *PgStore) Close() { s.pool.Close() }
 
+type accountScanner interface {
+	Scan(...any) error
+}
+
+func (s *PgStore) scanAccount(row accountScanner) (Account, error) {
+	var a Account
+	var overrides []byte
+	err := row.Scan(
+		&a.Name, &a.Label, &a.Group, &a.URL, &a.AuthMode,
+		&a.ConnectionNamespaceID, &a.ConnectionScope, &a.OwnerSubject, &a.Revision,
+		&a.IncarnationID,
+		&a.ClientID, &a.ClientSecret, &a.AccessToken, &a.RefreshToken,
+		&a.TokenEndpoint, &a.Resource, &a.Scope, &a.BearerToken,
+		&a.DisabledTools, &overrides, &a.ReadOnly,
+	)
+	if err != nil {
+		return Account{}, err
+	}
+	if err := json.Unmarshal(overrides, &a.ToolOverrides); err != nil {
+		return Account{}, err
+	}
+	a.ClientSecret, a.AccessToken, a.RefreshToken, a.BearerToken =
+		s.dec(a.ClientSecret), s.dec(a.AccessToken), s.dec(a.RefreshToken), s.dec(a.BearerToken)
+	return a, nil
+}
+
 func (s *PgStore) Accounts() []Account {
 	rows, err := s.pool.Query(context.Background(), `SELECT `+accountCols+` FROM narthex_accounts ORDER BY name`)
 	if err != nil {
@@ -272,15 +751,7 @@ func (s *PgStore) Accounts() []Account {
 	defer rows.Close()
 	var out []Account
 	for rows.Next() {
-		var a Account
-		var overrides []byte
-		if err := rows.Scan(&a.Name, &a.Label, &a.Group, &a.URL, &a.AuthMode, &a.ClientID, &a.ClientSecret,
-			&a.AccessToken, &a.RefreshToken, &a.TokenEndpoint, &a.Resource, &a.Scope, &a.BearerToken, &a.DisabledTools, &overrides, &a.ReadOnly); err == nil {
-			if err := json.Unmarshal(overrides, &a.ToolOverrides); err != nil {
-				continue
-			}
-			a.ClientSecret, a.AccessToken, a.RefreshToken, a.BearerToken =
-				s.dec(a.ClientSecret), s.dec(a.AccessToken), s.dec(a.RefreshToken), s.dec(a.BearerToken)
+		if a, err := s.scanAccount(rows); err == nil {
 			out = append(out, a)
 		}
 	}
@@ -306,19 +777,85 @@ func (s *PgStore) RefreshToken(name string) string {
 	return s.dec(rt)
 }
 
-func (s *PgStore) UpdateTokens(name, access, refresh string) error {
-	ctx := context.Background()
+func (s *PgStore) UpdateTokens(ctx context.Context, name, expectedIncarnationID, access, refresh string) error {
+	if expectedIncarnationID == "" {
+		return ErrAccountIncarnation
+	}
+	var tag pgconn.CommandTag
+	var err error
 	if refresh != "" {
-		_, err := s.pool.Exec(ctx, `UPDATE narthex_accounts SET access_token=$2, refresh_token=$3 WHERE name=$1`, name, s.enc(access), s.enc(refresh))
+		tag, err = s.pool.Exec(ctx, `UPDATE narthex_accounts SET access_token=$3, refresh_token=$4 WHERE name=$1 AND incarnation_id=$2`, name, expectedIncarnationID, s.enc(access), s.enc(refresh))
+	} else {
+		tag, err = s.pool.Exec(ctx, `UPDATE narthex_accounts SET access_token=$3 WHERE name=$1 AND incarnation_id=$2`, name, expectedIncarnationID, s.enc(access))
+	}
+	if err != nil {
 		return err
 	}
-	_, err := s.pool.Exec(ctx, `UPDATE narthex_accounts SET access_token=$2 WHERE name=$1`, name, s.enc(access))
-	return err
+	if tag.RowsAffected() != 1 {
+		return ErrAccountIncarnation
+	}
+	return nil
 }
 
-// Upsert adds or updates an account — used by the console "Connect" flow and by
-// migration. Tokens included so a freshly-connected account works immediately.
-func (s *PgStore) Upsert(ctx context.Context, a Account) error {
+// SetBearerToken updates one credential under the account's current ownership
+// revision. The lock/CAS is intentional: a manager who was just removed from
+// a namespace must not be able to race a token write that restores stale
+// account metadata through a whole-row Upsert.
+func (s *PgStore) SetBearerToken(ctx context.Context, name, expectedIncarnationID, token string, expectedRevision int64) (Account, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Account{}, err
+	}
+	defer tx.Rollback(ctx)
+	current, err := s.scanAccount(tx.QueryRow(ctx, `SELECT `+accountCols+` FROM narthex_accounts WHERE name=$1 FOR UPDATE`, name))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Account{}, ErrAccountNotFound
+	}
+	if err != nil {
+		return Account{}, err
+	}
+	if expectedIncarnationID == "" || current.IncarnationID != expectedIncarnationID {
+		return Account{}, ErrAccountIncarnation
+	}
+	if expectedRevision < 1 || current.Revision != expectedRevision {
+		return Account{}, ErrConnectionNamespaceRevision
+	}
+	updated, err := s.scanAccount(tx.QueryRow(ctx, `
+UPDATE narthex_accounts
+SET auth_mode='token', bearer_token=$2, revision=revision+1
+WHERE name=$1
+RETURNING `+accountCols, name, s.enc(token)))
+	if err != nil {
+		return Account{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Account{}, err
+	}
+	return updated, nil
+}
+
+// Create inserts a new account without replacing an existing account with the
+// same name. The database constraint makes this check atomic across requests.
+func (s *PgStore) Create(ctx context.Context, a Account) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	// Store-owned identity: callers cannot recreate a deleted account with its
+	// former incarnation identifier.
+	a.IncarnationID = newAccountIncarnationID()
+	if err := s.ensureAccountConnectionNamespaceTx(ctx, tx, &a); err != nil {
+		return err
+	}
+	if a.IsPersonal() {
+		if err := lockMCPClientNamespacesTx(ctx, tx, []string{a.ConnectionNamespaceID}); err != nil {
+			return err
+		}
+	}
+	if err := validatePersonalAccountMCPClientGrantsTx(ctx, tx, a); err != nil {
+		return err
+	}
 	ob, err := json.Marshal(a.ToolOverrides)
 	if err != nil {
 		return err
@@ -326,32 +863,273 @@ func (s *PgStore) Upsert(ctx context.Context, a Account) error {
 	if a.ToolOverrides == nil {
 		ob = []byte(`{}`)
 	}
-	_, err = s.pool.Exec(ctx, `
+	tag, err := tx.Exec(ctx, `
 INSERT INTO narthex_accounts (`+accountCols+`)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+ON CONFLICT (name) DO NOTHING`,
+		a.Name, a.Label, a.Group, a.URL, a.AuthMode,
+		a.ConnectionNamespaceID, a.ConnectionScope, a.OwnerSubject, a.Revision,
+		a.IncarnationID, a.ClientID, s.enc(a.ClientSecret), s.enc(a.AccessToken), s.enc(a.RefreshToken),
+		a.TokenEndpoint, a.Resource, a.Scope, s.enc(a.BearerToken), a.DisabledTools, ob, a.ReadOnly)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrAccountExists
+	}
+	return tx.Commit(ctx)
+}
+
+// Upsert adds or updates an account — used by the console "Connect" flow and by
+// migration. Tokens included so a freshly-connected account works immediately.
+func (s *PgStore) Upsert(ctx context.Context, a Account) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	incomingRevision := a.Revision
+	var previous *Account
+	stored, readErr := s.scanAccount(tx.QueryRow(ctx, `SELECT `+accountCols+` FROM narthex_accounts WHERE name=$1 FOR UPDATE`, a.Name))
+	if readErr == nil {
+		previous = &stored
+		// The account identity is immutable across whole-row updates.
+		a.IncarnationID = stored.IncarnationID
+		if a.IncarnationID == "" {
+			a.IncarnationID = newAccountIncarnationID()
+		}
+		// Preserve an already-personal boundary when a legacy upsert omits all
+		// new ownership fields. A caller that wants to change the boundary must
+		// use MoveAccountToConnectionNamespace with an account revision.
+		if strings.TrimSpace(a.ConnectionNamespaceID) == "" && strings.TrimSpace(string(a.ConnectionScope)) == "" && strings.TrimSpace(a.OwnerSubject) == "" && stored.IsPersonal() {
+			a.ConnectionNamespaceID = stored.ConnectionNamespaceID
+			a.ConnectionScope = stored.ConnectionScope
+			a.OwnerSubject = stored.OwnerSubject
+			a.Group = stored.Group
+		}
+	} else if !errors.Is(readErr, pgx.ErrNoRows) {
+		return readErr
+	}
+	if previous == nil {
+		a.IncarnationID = newAccountIncarnationID()
+	}
+	if err := s.ensureAccountConnectionNamespaceTx(ctx, tx, &a); err != nil {
+		return err
+	}
+	var affectedClients []MCPClient
+	if previous != nil && accountOwnershipChanged(*previous, a) {
+		// Whole-account compatibility writes (including self-hosted
+		// /admin/token) may still carry only a legacy Group label. Once that
+		// label resolves to a different durable folder, use the exact locking
+		// and epoch-rotation boundary as an explicit account move.
+		affectedClients, err = prepareMCPClientEpochRotationForAccountOwnershipChangeTx(ctx, tx, *previous, a)
+		if err != nil {
+			return err
+		}
+	} else if a.IsPersonal() {
+		if err := lockMCPClientNamespacesTx(ctx, tx, []string{a.ConnectionNamespaceID}); err != nil {
+			return err
+		}
+	}
+	if err := validatePersonalAccountMCPClientGrantsTx(ctx, tx, a); err != nil {
+		return err
+	}
+	if previous != nil && incomingRevision < 1 {
+		if a.ConnectionNamespaceID != previous.ConnectionNamespaceID || a.ConnectionScope != previous.ConnectionScope || a.OwnerSubject != previous.OwnerSubject {
+			a.Revision = previous.Revision + 1
+		} else {
+			a.Revision = previous.Revision
+		}
+	}
+	ob, err := json.Marshal(a.ToolOverrides)
+	if err != nil {
+		return err
+	}
+	if a.ToolOverrides == nil {
+		ob = []byte(`{}`)
+	}
+	_, err = tx.Exec(ctx, `
+INSERT INTO narthex_accounts (`+accountCols+`)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
 ON CONFLICT (name) DO UPDATE SET
-  label=$2, workspace=$3, url=$4, auth_mode=$5, client_id=$6, client_secret=$7,
-  access_token=$8, refresh_token=$9, token_endpoint=$10, resource=$11, scope=$12, bearer_token=$13, disabled_tools=$14, tool_overrides=$15, read_only=$16`,
-		a.Name, a.Label, a.Group, a.URL, a.AuthMode, a.ClientID, s.enc(a.ClientSecret),
-		s.enc(a.AccessToken), s.enc(a.RefreshToken), a.TokenEndpoint, a.Resource, a.Scope, s.enc(a.BearerToken), a.DisabledTools, ob, a.ReadOnly)
-	return err
+  label=$2, workspace=$3, url=$4, auth_mode=$5,
+  connection_namespace_id=$6, connection_scope=$7, owner_subject=$8, revision=$9,
+	incarnation_id=CASE
+	  WHEN narthex_accounts.incarnation_id='' THEN EXCLUDED.incarnation_id
+	  ELSE narthex_accounts.incarnation_id
+	END,
+  client_id=$11, client_secret=$12, access_token=$13, refresh_token=$14,
+  token_endpoint=$15, resource=$16, scope=$17, bearer_token=$18,
+  disabled_tools=$19, tool_overrides=$20, read_only=$21`,
+		a.Name, a.Label, a.Group, a.URL, a.AuthMode,
+		a.ConnectionNamespaceID, a.ConnectionScope, a.OwnerSubject, a.Revision,
+		a.IncarnationID, a.ClientID, s.enc(a.ClientSecret), s.enc(a.AccessToken), s.enc(a.RefreshToken),
+		a.TokenEndpoint, a.Resource, a.Scope, s.enc(a.BearerToken), a.DisabledTools, ob, a.ReadOnly)
+	if err != nil {
+		return err
+	}
+	if a.IsPersonal() {
+		if err := removePersonalAccountExposureTx(ctx, tx, a.Name); err != nil {
+			return err
+		}
+	}
+	if previous != nil && accountOwnershipChanged(*previous, a) {
+		if err := rotateMCPClientEpochsForAccountMoveTx(ctx, tx, affectedClients, *previous, a); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+// CompleteOAuth locks the account row, verifies its immutable incarnation and
+// ownership boundary, and updates credential columns only. Metadata and policy
+// edits that happen while provider consent is open are therefore never
+// replaced by an older whole-Account snapshot.
+func (s *PgStore) CompleteOAuth(ctx context.Context, precondition OAuthCompletionPrecondition, completion Account) (Account, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Account{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	current, err := s.scanAccount(tx.QueryRow(ctx, `SELECT `+accountCols+` FROM narthex_accounts WHERE name=$1 FOR UPDATE`, completion.Name))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Account{}, ErrConnectAccountDeleted
+	}
+	if err != nil {
+		return Account{}, err
+	}
+	if precondition.IncarnationID == "" || current.IncarnationID != precondition.IncarnationID {
+		return Account{}, ErrConnectAccountReplaced
+	}
+	if !equalAccountURL(current.URL, precondition.URL) {
+		return Account{}, ErrConnectAccountURLChanged
+	}
+	if current.ConnectionNamespaceID != precondition.ConnectionNamespaceID ||
+		current.ConnectionScope != precondition.ConnectionScope ||
+		current.OwnerSubject != precondition.OwnerSubject {
+		return Account{}, ErrConnectAccountMoved
+	}
+
+	refresh := completion.RefreshToken
+	if refresh == "" && current.ClientID == completion.ClientID {
+		refresh = current.RefreshToken
+	}
+	if _, err := tx.Exec(ctx, `
+UPDATE narthex_accounts
+SET auth_mode='oauth', client_id=$2, client_secret=$3, access_token=$4,
+    refresh_token=$5, token_endpoint=$6, resource=$7, scope=$8, bearer_token=''
+WHERE name=$1`, completion.Name, completion.ClientID, s.enc(completion.ClientSecret),
+		s.enc(completion.AccessToken), s.enc(refresh), completion.TokenEndpoint,
+		completion.Resource, completion.Scope); err != nil {
+		return Account{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Account{}, err
+	}
+	current.AuthMode = "oauth"
+	current.ClientID, current.ClientSecret = completion.ClientID, completion.ClientSecret
+	current.AccessToken, current.RefreshToken = completion.AccessToken, refresh
+	current.TokenEndpoint, current.Resource, current.Scope = completion.TokenEndpoint, completion.Resource, completion.Scope
+	current.BearerToken = ""
+	return current, nil
 }
 
 func (s *PgStore) Account(name string) (Account, bool) {
-	var a Account
-	var overrides []byte
-	err := s.pool.QueryRow(context.Background(), `SELECT `+accountCols+` FROM narthex_accounts WHERE name=$1`, name).
-		Scan(&a.Name, &a.Label, &a.Group, &a.URL, &a.AuthMode, &a.ClientID, &a.ClientSecret,
-			&a.AccessToken, &a.RefreshToken, &a.TokenEndpoint, &a.Resource, &a.Scope, &a.BearerToken, &a.DisabledTools, &overrides, &a.ReadOnly)
+	a, err := s.scanAccount(s.pool.QueryRow(context.Background(), `SELECT `+accountCols+` FROM narthex_accounts WHERE name=$1`, name))
 	if err != nil {
 		return Account{}, false
 	}
-	if err := json.Unmarshal(overrides, &a.ToolOverrides); err != nil {
-		return Account{}, false
-	}
-	a.ClientSecret, a.AccessToken, a.RefreshToken, a.BearerToken =
-		s.dec(a.ClientSecret), s.dec(a.AccessToken), s.dec(a.RefreshToken), s.dec(a.BearerToken)
 	return a, true
+}
+
+// UpdateAccountPolicy applies only curation/presentation fields after locking
+// and comparing the exact account snapshot authorized by the console. In
+// particular, no ownership column appears in the SET clause: a stale manager
+// cannot restore a namespace assignment which changed after authorization.
+func (s *PgStore) UpdateAccountPolicy(ctx context.Context, name string, precondition AccountPolicyPrecondition, mutation AccountPolicyMutation) (Account, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Account{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	current, err := s.scanAccount(tx.QueryRow(ctx, `SELECT `+accountCols+` FROM narthex_accounts WHERE name=$1 FOR UPDATE`, name))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Account{}, ErrAccountPolicyPrecondition
+	}
+	if err != nil {
+		return Account{}, err
+	}
+	if !precondition.matches(current) {
+		return Account{}, ErrAccountPolicyPrecondition
+	}
+
+	changed := false
+	if mutation.Label != nil {
+		label := strings.TrimSpace(*mutation.Label)
+		if current.Label != label {
+			current.Label = label
+			changed = true
+		}
+	}
+	if mutation.DisabledTools != nil {
+		disabled := append([]string(nil), (*mutation.DisabledTools)...)
+		if !sameStrings(current.DisabledTools, disabled) {
+			current.DisabledTools = disabled
+			changed = true
+		}
+	}
+	if mutation.ToolOverrides != nil {
+		overrides := copyAccount(Account{ToolOverrides: *mutation.ToolOverrides}).ToolOverrides
+		if !sameToolOverrides(current.ToolOverrides, overrides) {
+			current.ToolOverrides = overrides
+			changed = true
+		}
+	}
+	if mutation.ReadOnly != nil && current.ReadOnly != *mutation.ReadOnly {
+		current.ReadOnly = *mutation.ReadOnly
+		changed = true
+	}
+	if !changed {
+		if err := tx.Commit(ctx); err != nil {
+			return Account{}, err
+		}
+		return current, nil
+	}
+
+	overrides, err := json.Marshal(current.ToolOverrides)
+	if err != nil {
+		return Account{}, err
+	}
+	if current.ToolOverrides == nil {
+		overrides = []byte(`{}`)
+	}
+	beforeRevision := current.Revision
+	current.Revision++
+	updated, err := s.scanAccount(tx.QueryRow(ctx, `
+UPDATE narthex_accounts
+SET label=$2,disabled_tools=$3,tool_overrides=$4,read_only=$5,revision=$6
+WHERE name=$1
+  AND incarnation_id=$7
+  AND revision=$8
+  AND connection_namespace_id=$9
+  AND connection_scope=$10
+  AND owner_subject=$11
+RETURNING `+accountCols,
+		current.Name, current.Label, current.DisabledTools, overrides, current.ReadOnly, current.Revision,
+		precondition.IncarnationID, beforeRevision, precondition.ConnectionNamespaceID,
+		precondition.ConnectionScope, precondition.OwnerSubject))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Account{}, ErrAccountPolicyPrecondition
+	}
+	if err != nil {
+		return Account{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Account{}, err
+	}
+	return updated, nil
 }
 
 func (s *PgStore) SetDisabledTools(ctx context.Context, name string, disabled []string) error {
@@ -385,14 +1163,148 @@ func (s *PgStore) SetReadOnly(ctx context.Context, name string, ro bool) error {
 	return err
 }
 
-func (s *PgStore) Delete(ctx context.Context, name string) error {
-	_, err := s.pool.Exec(ctx, `DELETE FROM narthex_accounts WHERE name=$1`, name)
-	return err
+func (s *PgStore) Delete(ctx context.Context, name, expectedIncarnationID string, expectedRevision int64) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	var currentIncarnationID string
+	var currentRevision int64
+	if err := tx.QueryRow(ctx, `SELECT incarnation_id,revision FROM narthex_accounts WHERE name=$1 FOR UPDATE`, name).Scan(&currentIncarnationID, &currentRevision); errors.Is(err, pgx.ErrNoRows) {
+		return ErrAccountIncarnation
+	} else if err != nil {
+		return err
+	}
+	if expectedIncarnationID == "" || currentIncarnationID != expectedIncarnationID {
+		return ErrAccountIncarnation
+	}
+	if expectedRevision < 1 || currentRevision != expectedRevision {
+		return ErrConnectionNamespaceRevision
+	}
+	if _, err := tx.Exec(ctx, `
+UPDATE narthex_namespaces
+SET revision=revision+1
+WHERE slug IN (
+    SELECT namespace_slug FROM narthex_namespace_accounts WHERE account_name=$1
+)`, name); err != nil {
+		return err
+	}
+	// A connector's JSONB maps are keyed by the immutable account/tool prefix.
+	// Prune both maps in the same transaction as account deletion so recreating
+	// the same prefix cannot silently inherit the old connector exposure or
+	// leave portable config referencing a nonexistent account.
+	if _, err := tx.Exec(ctx, `
+UPDATE narthex_connectors
+SET tools=tools - $1, approval=approval - $1
+WHERE tools ? $1 OR approval ? $1`, name); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM narthex_accounts WHERE name=$1`, name); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *PgStore) SetMeta(ctx context.Context, name, label, group string) error {
-	_, err := s.pool.Exec(ctx, `UPDATE narthex_accounts SET label=$2, workspace=$3 WHERE name=$1`, name, label, group)
-	return err
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	current, err := s.scanAccount(tx.QueryRow(ctx, `SELECT `+accountCols+` FROM narthex_accounts WHERE name=$1 FOR UPDATE`, name))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil // preserve historical no-op behavior for a deleted account
+	}
+	if err != nil {
+		return err
+	}
+	label, group = strings.TrimSpace(label), strings.TrimSpace(group)
+	before := current
+	// SetMeta is intentionally label-only. Reassigning an account by legacy
+	// Group here could let a stale metadata write undo a newer CAS ownership
+	// move. Intentional legacy group-only changes go through Upsert, which
+	// serializes and rotates affected scoped MCP-client epochs.
+	if group != strings.TrimSpace(before.Group) {
+		return fmt.Errorf("%w: use MoveAccountToConnectionNamespace for ownership changes", ErrConnectionNamespaceRevision)
+	}
+	current.Label = label
+	if current.Label == before.Label {
+		return tx.Commit(ctx)
+	}
+	current.Revision = before.Revision + 1
+	if _, err := tx.Exec(ctx, `
+UPDATE narthex_accounts
+SET label=$2, revision=$3
+WHERE name=$1`, current.Name, current.Label, current.Revision); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// UpdatePortableAccountConfig atomically changes only the secret-free fields
+// carried by portable config. Ownership, credentials, and OAuth metadata are
+// intentionally absent from the UPDATE: an import based on an old export can
+// never overwrite a concurrent connection-namespace move.
+func (s *PgStore) UpdatePortableAccountConfig(ctx context.Context, name string, update PortableAccountConfig) (Account, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Account{}, err
+	}
+	defer tx.Rollback(ctx)
+	current, err := s.scanAccount(tx.QueryRow(ctx, `SELECT `+accountCols+` FROM narthex_accounts WHERE name=$1 FOR UPDATE`, name))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Account{}, ErrAccountNotFound
+	}
+	if err != nil {
+		return Account{}, err
+	}
+	update.Label = strings.TrimSpace(update.Label)
+	update.URL = strings.TrimSpace(update.URL)
+	if (current.BearerToken != "" || current.AccessToken != "" || current.RefreshToken != "" || current.ClientSecret != "") &&
+		!equalAccountURL(current.URL, update.URL) {
+		return Account{}, ErrConnectAccountURLChanged
+	}
+	overrides, err := json.Marshal(update.ToolOverrides)
+	if err != nil {
+		return Account{}, err
+	}
+	if update.ToolOverrides == nil {
+		overrides = []byte(`{}`)
+	}
+	updated, err := s.scanAccount(tx.QueryRow(ctx, `
+UPDATE narthex_accounts
+SET label=$2,url=$3,disabled_tools=$4,tool_overrides=$5,read_only=$6
+WHERE name=$1
+RETURNING `+accountCols,
+		current.Name, update.Label, update.URL, update.DisabledTools, overrides, update.ReadOnly))
+	if err != nil {
+		return Account{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Account{}, err
+	}
+	return updated, nil
+}
+
+func rejectPersonalAccountsTx(ctx context.Context, tx pgx.Tx, accounts []string) error {
+	if len(accounts) == 0 {
+		return nil
+	}
+	var account string
+	err := tx.QueryRow(ctx, `
+SELECT name
+FROM narthex_accounts
+WHERE name = ANY($1) AND connection_scope='personal'
+ORDER BY name
+LIMIT 1`, accounts).Scan(&account)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return fmt.Errorf("%w: %s", ErrPersonalAccountExposure, account)
 }
 
 // ---- PgStore: ConnectorStore ----
@@ -459,11 +1371,35 @@ func (s *PgStore) UpsertConnector(ctx context.Context, c VirtualConnector) error
 	if err != nil {
 		return err
 	}
-	_, err = s.pool.Exec(ctx, `
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if err := rejectPersonalAccountsTx(ctx, tx, accountNamesInToolMap(c.Tools)); err != nil {
+		return err
+	}
+	if err := rejectPersonalAccountsTx(ctx, tx, accountNamesInToolMap(c.Approval)); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, c.Slug); err != nil {
+		return err
+	}
+	var namespaceExists bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM narthex_namespaces WHERE slug=$1)`, c.Slug).Scan(&namespaceExists); err != nil {
+		return err
+	}
+	if namespaceExists {
+		return fmt.Errorf("%w: %s", ErrEndpointCollision, c.Slug)
+	}
+	_, err = tx.Exec(ctx, `
 INSERT INTO narthex_connectors (slug,label,tools,approval,record,max_result_bytes,redact,disable_injection_scan,epoch) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
 ON CONFLICT (slug) DO UPDATE SET label=$2, tools=$3, approval=$4, record=$5, max_result_bytes=$6, redact=$7, disable_injection_scan=$8, epoch=$9`,
 		c.Slug, c.Label, b, ab, c.Record, c.MaxResultBytes, rb, c.DisableInjectionScan, c.Epoch)
-	return err
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func orEmpty(m map[string][]string) map[string][]string {
@@ -482,17 +1418,807 @@ func orEmptySlice(s []string) []string {
 	return s
 }
 
-func (s *PgStore) DeleteConnector(ctx context.Context, slug string) error {
-	_, err := s.pool.Exec(ctx, `DELETE FROM narthex_connectors WHERE slug=$1`, slug)
+func (s *PgStore) DeleteConnector(ctx context.Context, slug, expectedGeneration string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	// Share the slug advisory lock with connector upserts and namespace
+	// creation/deletion. This makes kind reuse linearizable across Engine
+	// replicas instead of letting a stale delete remove a newer incarnation.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, slug); err != nil {
+		return err
+	}
+	var generation string
+	if err := tx.QueryRow(ctx, `SELECT epoch FROM narthex_connectors WHERE slug=$1 FOR UPDATE`, slug).Scan(&generation); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrConnectorNotFound
+		}
+		return err
+	}
+	if generation != expectedGeneration {
+		return ErrEndpointGeneration
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM narthex_connectors WHERE slug=$1`, slug); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// ---- PgStore: NamespaceStore ----
+
+const namespaceSelect = `
+SELECT n.slug,n.label,n.epoch,n.revision,
+       COALESCE(
+           array_agg(m.account_name ORDER BY m.account_name)
+               FILTER (WHERE m.account_name IS NOT NULL),
+           ARRAY[]::TEXT[]
+       )
+FROM narthex_namespaces n
+LEFT JOIN narthex_namespace_accounts m ON m.namespace_slug=n.slug`
+
+type namespaceQueryer interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+func scanNamespace(row pgx.Row) (Namespace, error) {
+	var ns Namespace
+	err := row.Scan(&ns.Slug, &ns.Label, &ns.Epoch, &ns.Revision, &ns.Accounts)
+	if ns.Accounts == nil {
+		ns.Accounts = []string{}
+	}
+	return ns, err
+}
+
+func loadNamespace(ctx context.Context, q namespaceQueryer, slug string) (Namespace, error) {
+	return scanNamespace(q.QueryRow(ctx, namespaceSelect+`
+WHERE n.slug=$1
+GROUP BY n.slug,n.label,n.epoch,n.revision`, slug))
+}
+
+func (s *PgStore) Namespaces(ctx context.Context) ([]Namespace, error) {
+	rows, err := s.pool.Query(ctx, namespaceSelect+`
+GROUP BY n.slug,n.label,n.epoch,n.revision
+ORDER BY n.slug`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Namespace
+	for rows.Next() {
+		var ns Namespace
+		if err := rows.Scan(&ns.Slug, &ns.Label, &ns.Epoch, &ns.Revision, &ns.Accounts); err != nil {
+			return nil, err
+		}
+		if ns.Accounts == nil {
+			ns.Accounts = []string{}
+		}
+		out = append(out, ns)
+	}
+	return out, rows.Err()
+}
+
+func (s *PgStore) Namespace(ctx context.Context, slug string) (Namespace, bool) {
+	ns, err := loadNamespace(ctx, s.pool, slug)
+	if err != nil {
+		return Namespace{}, false
+	}
+	return ns, true
+}
+
+func (s *PgStore) CreateNamespace(ctx context.Context, ns Namespace) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, ns.Slug); err != nil {
+		return err
+	}
+	var connectorExists bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM narthex_connectors WHERE slug=$1)`, ns.Slug).Scan(&connectorExists); err != nil {
+		return err
+	}
+	if connectorExists {
+		return fmt.Errorf("%w: %s", ErrEndpointCollision, ns.Slug)
+	}
+	if ns.Revision < 1 {
+		ns.Revision = 1
+	}
+	if ns.Epoch == "" {
+		ns.Epoch = newEpoch()
+	}
+	members := normalizedNamespaceAccounts(ns.Accounts)
+	if err := rejectPersonalAccountsTx(ctx, tx, members); err != nil {
+		return err
+	}
+	var inserted string
+	if err := tx.QueryRow(ctx, `
+INSERT INTO narthex_namespaces (slug,label,epoch,revision)
+VALUES ($1,$2,$3,$4)
+ON CONFLICT (slug) DO NOTHING
+RETURNING slug`, ns.Slug, ns.Label, ns.Epoch, ns.Revision).Scan(&inserted); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNamespaceExists
+		}
+		return err
+	}
+	for _, account := range members {
+		tag, err := tx.Exec(ctx, `
+INSERT INTO narthex_namespace_accounts (namespace_slug,account_name)
+SELECT $1,name FROM narthex_accounts WHERE name=$2
+ON CONFLICT DO NOTHING`, ns.Slug, account)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return fmt.Errorf("%w: %s", ErrAccountNotFound, account)
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *PgStore) UpdateNamespace(ctx context.Context, update Namespace, precondition NamespacePrecondition) (Namespace, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Namespace{}, err
+	}
+	defer tx.Rollback(ctx)
+	var currentGeneration string
+	var currentRevision int64
+	if err := tx.QueryRow(ctx, `SELECT epoch,revision FROM narthex_namespaces WHERE slug=$1 FOR UPDATE`, update.Slug).
+		Scan(&currentGeneration, &currentRevision); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Namespace{}, ErrNamespaceNotFound
+		}
+		return Namespace{}, err
+	}
+	if precondition.Generation == "" || precondition.Revision < 1 ||
+		currentGeneration != precondition.Generation || currentRevision != precondition.Revision {
+		return Namespace{}, ErrNamespaceRevision
+	}
+	current, err := loadNamespace(ctx, tx, update.Slug)
+	if err != nil {
+		return Namespace{}, err
+	}
+	accounts := normalizedNamespaceAccounts(update.Accounts)
+	if err := rejectPersonalAccountsTx(ctx, tx, accounts); err != nil {
+		return Namespace{}, err
+	}
+	for _, account := range accounts {
+		var exists bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM narthex_accounts WHERE name=$1)`, account).Scan(&exists); err != nil {
+			return Namespace{}, err
+		}
+		if !exists {
+			return Namespace{}, fmt.Errorf("%w: %s", ErrAccountNotFound, account)
+		}
+	}
+	if current.Label == update.Label && sameStrings(current.Accounts, accounts) {
+		if err := tx.Commit(ctx); err != nil {
+			return Namespace{}, err
+		}
+		return current, nil
+	}
+	if _, err := tx.Exec(ctx, `
+UPDATE narthex_namespaces SET label=$2,revision=revision+1 WHERE slug=$1`,
+		update.Slug, update.Label); err != nil {
+		return Namespace{}, err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM narthex_namespace_accounts WHERE namespace_slug=$1`, update.Slug); err != nil {
+		return Namespace{}, err
+	}
+	for _, account := range accounts {
+		if _, err := tx.Exec(ctx, `
+INSERT INTO narthex_namespace_accounts (namespace_slug,account_name) VALUES ($1,$2)`,
+			update.Slug, account); err != nil {
+			return Namespace{}, err
+		}
+	}
+	ns, err := loadNamespace(ctx, tx, update.Slug)
+	if err != nil {
+		return Namespace{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Namespace{}, err
+	}
+	return ns, nil
+}
+
+func (s *PgStore) AddNamespaceAccount(ctx context.Context, slug, account string, precondition NamespacePrecondition) (Namespace, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Namespace{}, err
+	}
+	defer tx.Rollback(ctx)
+	var currentGeneration string
+	var currentRevision int64
+	if err := tx.QueryRow(ctx, `SELECT epoch,revision FROM narthex_namespaces WHERE slug=$1 FOR UPDATE`, slug).
+		Scan(&currentGeneration, &currentRevision); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Namespace{}, ErrNamespaceNotFound
+		}
+		return Namespace{}, err
+	}
+	if precondition.Generation == "" || precondition.Revision < 1 ||
+		currentGeneration != precondition.Generation || currentRevision != precondition.Revision {
+		return Namespace{}, ErrNamespaceRevision
+	}
+	var accountExists bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM narthex_accounts WHERE name=$1)`, account).Scan(&accountExists); err != nil {
+		return Namespace{}, err
+	}
+	if !accountExists {
+		return Namespace{}, fmt.Errorf("%w: %s", ErrAccountNotFound, account)
+	}
+	if err := rejectPersonalAccountsTx(ctx, tx, []string{account}); err != nil {
+		return Namespace{}, err
+	}
+	tag, err := tx.Exec(ctx, `
+INSERT INTO narthex_namespace_accounts (namespace_slug,account_name)
+VALUES ($1,$2)
+ON CONFLICT DO NOTHING`, slug, account)
+	if err != nil {
+		return Namespace{}, err
+	}
+	if tag.RowsAffected() > 0 {
+		if _, err := tx.Exec(ctx, `UPDATE narthex_namespaces SET revision=revision+1 WHERE slug=$1`, slug); err != nil {
+			return Namespace{}, err
+		}
+	}
+	ns, err := loadNamespace(ctx, tx, slug)
+	if err != nil {
+		return Namespace{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Namespace{}, err
+	}
+	return ns, nil
+}
+
+func (s *PgStore) RemoveNamespaceAccount(ctx context.Context, slug, account string, precondition NamespacePrecondition) (Namespace, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Namespace{}, err
+	}
+	defer tx.Rollback(ctx)
+	var currentGeneration string
+	var currentRevision int64
+	if err := tx.QueryRow(ctx, `SELECT epoch,revision FROM narthex_namespaces WHERE slug=$1 FOR UPDATE`, slug).
+		Scan(&currentGeneration, &currentRevision); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Namespace{}, ErrNamespaceNotFound
+		}
+		return Namespace{}, err
+	}
+	if precondition.Generation == "" || precondition.Revision < 1 ||
+		currentGeneration != precondition.Generation || currentRevision != precondition.Revision {
+		return Namespace{}, ErrNamespaceRevision
+	}
+	tag, err := tx.Exec(ctx, `
+DELETE FROM narthex_namespace_accounts
+WHERE namespace_slug=$1 AND account_name=$2`, slug, account)
+	if err != nil {
+		return Namespace{}, err
+	}
+	if tag.RowsAffected() > 0 {
+		if _, err := tx.Exec(ctx, `UPDATE narthex_namespaces SET revision=revision+1 WHERE slug=$1`, slug); err != nil {
+			return Namespace{}, err
+		}
+	}
+	ns, err := loadNamespace(ctx, tx, slug)
+	if err != nil {
+		return Namespace{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Namespace{}, err
+	}
+	return ns, nil
+}
+
+func (s *PgStore) DeleteNamespace(ctx context.Context, slug string, precondition NamespacePrecondition) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	// Serialize namespace deletion with connector upsert and namespace create
+	// for this slug. The generation+revision comparison then rejects a stale
+	// replica after delete/recreate, even when the recreated row reset to v1.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, slug); err != nil {
+		return err
+	}
+	var currentGeneration string
+	var currentRevision int64
+	if err := tx.QueryRow(ctx, `SELECT epoch,revision FROM narthex_namespaces WHERE slug=$1 FOR UPDATE`, slug).
+		Scan(&currentGeneration, &currentRevision); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNamespaceNotFound
+		}
+		return err
+	}
+	if precondition.Generation == "" || precondition.Revision < 1 ||
+		currentGeneration != precondition.Generation || currentRevision != precondition.Revision {
+		return ErrNamespaceRevision
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM narthex_namespaces WHERE slug=$1`, slug); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// ---- PgStore: ConnectionNamespaceStore ----
+
+const connectionNamespaceSelect = `
+SELECT n.id,n.slug,n.label,n.revision,n.created_by,n.created_at,n.updated_at,
+       COALESCE(
+           array_agg(m.subject ORDER BY m.subject) FILTER (WHERE m.subject IS NOT NULL),
+           ARRAY[]::TEXT[]
+       )
+FROM narthex_connection_namespaces n
+LEFT JOIN narthex_connection_namespace_managers m
+  ON m.connection_namespace_id=n.id`
+
+type connectionNamespaceQueryer interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+func scanConnectionNamespace(row pgx.Row) (ConnectionNamespace, error) {
+	var (
+		ns       ConnectionNamespace
+		subjects []string
+	)
+	if err := row.Scan(&ns.ID, &ns.Slug, &ns.Label, &ns.Revision, &ns.CreatedBy, &ns.CreatedAt, &ns.UpdatedAt, &subjects); err != nil {
+		return ConnectionNamespace{}, err
+	}
+	for _, subject := range subjects {
+		ns.ManagerGrants = append(ns.ManagerGrants, ConnectionNamespaceManagerGrant{Subject: subject})
+	}
+	if ns.ManagerGrants == nil {
+		ns.ManagerGrants = []ConnectionNamespaceManagerGrant{}
+	}
+	return ns, nil
+}
+
+func loadConnectionNamespace(ctx context.Context, q connectionNamespaceQueryer, id string) (ConnectionNamespace, error) {
+	return scanConnectionNamespace(q.QueryRow(ctx, connectionNamespaceSelect+`
+WHERE n.id=$1
+GROUP BY n.id,n.slug,n.label,n.revision,n.created_by,n.created_at,n.updated_at`, id))
+}
+
+func (s *PgStore) ConnectionNamespaces(ctx context.Context) ([]ConnectionNamespace, error) {
+	rows, err := s.pool.Query(ctx, connectionNamespaceSelect+`
+GROUP BY n.id,n.slug,n.label,n.revision,n.created_by,n.created_at,n.updated_at
+ORDER BY n.slug,n.id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ConnectionNamespace
+	for rows.Next() {
+		ns, err := scanConnectionNamespace(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ns)
+	}
+	return out, rows.Err()
+}
+
+func (s *PgStore) ConnectionNamespace(ctx context.Context, id string) (ConnectionNamespace, bool) {
+	ns, err := loadConnectionNamespace(ctx, s.pool, strings.TrimSpace(id))
+	if err != nil {
+		return ConnectionNamespace{}, false
+	}
+	return ns, true
+}
+
+func (s *PgStore) ConnectionNamespaceBySlug(ctx context.Context, slug string) (ConnectionNamespace, bool) {
+	slug = normalizeConnectionNamespaceSlug(slug)
+	ns, err := scanConnectionNamespace(s.pool.QueryRow(ctx, connectionNamespaceSelect+`
+WHERE n.slug=$1
+GROUP BY n.id,n.slug,n.label,n.revision,n.created_by,n.created_at,n.updated_at`, slug))
+	if err != nil {
+		return ConnectionNamespace{}, false
+	}
+	return ns, true
+}
+
+func (s *PgStore) CreateConnectionNamespace(ctx context.Context, ns ConnectionNamespace) (ConnectionNamespace, error) {
+	if err := prepareConnectionNamespaceForCreate(&ns); err != nil {
+		return ConnectionNamespace{}, err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return ConnectionNamespace{}, err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, "connection-namespace:"+ns.Slug); err != nil {
+		return ConnectionNamespace{}, err
+	}
+	var exists bool
+	if err := tx.QueryRow(ctx, `
+SELECT EXISTS(
+    SELECT 1 FROM narthex_connection_namespaces WHERE id=$1 OR slug=$2
+)`, ns.ID, ns.Slug).Scan(&exists); err != nil {
+		return ConnectionNamespace{}, err
+	}
+	if exists {
+		return ConnectionNamespace{}, ErrConnectionNamespaceExists
+	}
+	if _, err := tx.Exec(ctx, `
+	INSERT INTO narthex_connection_namespaces (id,slug,label,revision,created_by,created_at,updated_at)
+	VALUES ($1,$2,$3,$4,$5,$6,$7)`, ns.ID, ns.Slug, ns.Label, ns.Revision, ns.CreatedBy, ns.CreatedAt, ns.UpdatedAt); err != nil {
+		return ConnectionNamespace{}, err
+	}
+	for _, grant := range ns.ManagerGrants {
+		if _, err := tx.Exec(ctx, `
+INSERT INTO narthex_connection_namespace_managers (connection_namespace_id,subject)
+VALUES ($1,$2)`, ns.ID, grant.Subject); err != nil {
+			return ConnectionNamespace{}, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return ConnectionNamespace{}, err
+	}
+	return copyConnectionNamespace(ns), nil
+}
+
+func loadConnectionNamespaceForUpdate(ctx context.Context, tx pgx.Tx, id string) (ConnectionNamespace, error) {
+	var ns ConnectionNamespace
+	err := tx.QueryRow(ctx, `
+	SELECT id,slug,label,revision,created_by,created_at,updated_at
+FROM narthex_connection_namespaces
+WHERE id=$1
+FOR UPDATE`, id).Scan(&ns.ID, &ns.Slug, &ns.Label, &ns.Revision, &ns.CreatedBy, &ns.CreatedAt, &ns.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ConnectionNamespace{}, ErrConnectionNamespaceNotFound
+	}
+	if err != nil {
+		return ConnectionNamespace{}, err
+	}
+	rows, err := tx.Query(ctx, `
+SELECT subject
+FROM narthex_connection_namespace_managers
+WHERE connection_namespace_id=$1
+ORDER BY subject`, id)
+	if err != nil {
+		return ConnectionNamespace{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var subject string
+		if err := rows.Scan(&subject); err != nil {
+			return ConnectionNamespace{}, err
+		}
+		ns.ManagerGrants = append(ns.ManagerGrants, ConnectionNamespaceManagerGrant{Subject: subject})
+	}
+	if err := rows.Err(); err != nil {
+		return ConnectionNamespace{}, err
+	}
+	if ns.ManagerGrants == nil {
+		ns.ManagerGrants = []ConnectionNamespaceManagerGrant{}
+	}
+	return ns, nil
+}
+
+func (s *PgStore) updateConnectionNamespaceTx(ctx context.Context, tx pgx.Tx, update ConnectionNamespace, precondition ConnectionNamespacePrecondition) (ConnectionNamespace, error) {
+	current, err := loadConnectionNamespaceForUpdate(ctx, tx, strings.TrimSpace(update.ID))
+	if err != nil {
+		return ConnectionNamespace{}, err
+	}
+	if !connectionNamespacePreconditionMatches(current, precondition) {
+		return ConnectionNamespace{}, ErrConnectionNamespaceRevision
+	}
+	if update.Slug != "" && normalizeConnectionNamespaceSlug(update.Slug) != current.Slug {
+		return ConnectionNamespace{}, errors.New("connection namespace slug is immutable")
+	}
+	if update.CreatedBy != "" && strings.TrimSpace(update.CreatedBy) != current.CreatedBy {
+		return ConnectionNamespace{}, errors.New("connection namespace creator is immutable")
+	}
+	label := strings.TrimSpace(update.Label)
+	if label == "" {
+		return ConnectionNamespace{}, errors.New("connection namespace label is required")
+	}
+	grants := normalizedManagerGrants(update.ManagerGrants)
+	if current.Label == label && sameManagerGrants(current.ManagerGrants, grants) {
+		return current, nil
+	}
+	if err := tx.QueryRow(ctx, `
+	UPDATE narthex_connection_namespaces
+	SET label=$2,revision=revision+1,updated_at=now()
+	WHERE id=$1
+RETURNING revision,updated_at`, current.ID, label).Scan(&current.Revision, &current.UpdatedAt); err != nil {
+		return ConnectionNamespace{}, err
+	}
+	if current.Label != label {
+		if _, err := tx.Exec(ctx, `
+UPDATE narthex_accounts
+SET workspace=$2
+WHERE connection_namespace_id=$1`, current.ID, label); err != nil {
+			return ConnectionNamespace{}, err
+		}
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM narthex_connection_namespace_managers WHERE connection_namespace_id=$1`, current.ID); err != nil {
+		return ConnectionNamespace{}, err
+	}
+	for _, grant := range grants {
+		if _, err := tx.Exec(ctx, `
+INSERT INTO narthex_connection_namespace_managers (connection_namespace_id,subject)
+VALUES ($1,$2)`, current.ID, grant.Subject); err != nil {
+			return ConnectionNamespace{}, err
+		}
+	}
+	current.Label, current.ManagerGrants = label, grants
+	return current, nil
+}
+
+func (s *PgStore) UpdateConnectionNamespace(ctx context.Context, ns ConnectionNamespace, precondition ConnectionNamespacePrecondition) (ConnectionNamespace, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return ConnectionNamespace{}, err
+	}
+	defer tx.Rollback(ctx)
+	updated, err := s.updateConnectionNamespaceTx(ctx, tx, ns, precondition)
+	if err != nil {
+		return ConnectionNamespace{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return ConnectionNamespace{}, err
+	}
+	return updated, nil
+}
+
+func (s *PgStore) SetConnectionNamespaceManagers(ctx context.Context, id string, managers []ConnectionNamespaceManagerGrant, precondition ConnectionNamespacePrecondition) (ConnectionNamespace, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return ConnectionNamespace{}, err
+	}
+	defer tx.Rollback(ctx)
+	current, err := loadConnectionNamespaceForUpdate(ctx, tx, strings.TrimSpace(id))
+	if err != nil {
+		return ConnectionNamespace{}, err
+	}
+	if !connectionNamespacePreconditionMatches(current, precondition) {
+		return ConnectionNamespace{}, ErrConnectionNamespaceRevision
+	}
+	current.ManagerGrants = managers
+	updated, err := s.updateConnectionNamespaceTx(ctx, tx, current, precondition)
+	if err != nil {
+		return ConnectionNamespace{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return ConnectionNamespace{}, err
+	}
+	return updated, nil
+}
+
+func (s *PgStore) DeleteConnectionNamespace(ctx context.Context, id string, precondition ConnectionNamespacePrecondition) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	current, err := loadConnectionNamespaceForUpdate(ctx, tx, strings.TrimSpace(id))
+	if err != nil {
+		return err
+	}
+	if !connectionNamespacePreconditionMatches(current, precondition) {
+		return ErrConnectionNamespaceRevision
+	}
+	var inUse bool
+	if err := tx.QueryRow(ctx, `
+SELECT EXISTS(SELECT 1 FROM narthex_accounts WHERE connection_namespace_id=$1)`, current.ID).Scan(&inUse); err != nil {
+		return err
+	}
+	if inUse {
+		return ErrConnectionNamespaceInUse
+	}
+	if err := tx.QueryRow(ctx, `
+SELECT EXISTS(
+    SELECT 1
+    FROM narthex_mcp_clients c
+    JOIN narthex_mcp_client_namespaces g ON g.client_id=c.id
+    WHERE c.status='active' AND g.connection_namespace_id=$1
+)`, current.ID).Scan(&inUse); err != nil {
+		return err
+	}
+	if inUse {
+		return ErrConnectionNamespaceInUse
+	}
+	// Revoked client registrations have no delivery authority. Remove their
+	// inert historical grant before deleting the namespace so an older
+	// restrictive FK cannot turn a successful revoke into an undeletable
+	// empty folder. Bump the record revision to keep its audit shape honest.
+	if _, err := tx.Exec(ctx, `
+UPDATE narthex_mcp_clients c
+SET revision=revision+1,updated_at=now()
+WHERE c.status='revoked'
+  AND EXISTS (
+      SELECT 1 FROM narthex_mcp_client_namespaces g
+      WHERE g.client_id=c.id AND g.connection_namespace_id=$1
+  )`, current.ID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+DELETE FROM narthex_mcp_client_namespaces g
+USING narthex_mcp_clients c
+WHERE g.client_id=c.id
+  AND c.status='revoked'
+  AND g.connection_namespace_id=$1`, current.ID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM narthex_connection_namespaces WHERE id=$1`, current.ID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func removePersonalAccountExposureTx(ctx context.Context, tx pgx.Tx, account string) error {
+	// Revisions make stale endpoint management clients fail closed after a
+	// privacy move. Connector allowlists are keyed by the stable account name,
+	// so prune both policy maps atomically as well.
+	if _, err := tx.Exec(ctx, `
+UPDATE narthex_namespaces
+SET revision=revision+1
+WHERE slug IN (
+    SELECT namespace_slug FROM narthex_namespace_accounts WHERE account_name=$1
+)`, account); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM narthex_namespace_accounts WHERE account_name=$1`, account); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+UPDATE narthex_connectors
+SET tools=tools - $1, approval=approval - $1
+WHERE tools ? $1 OR approval ? $1`, account); err != nil {
+		return err
+	}
+	return nil
+}
+
+// cancelPendingForAccountMoveTx invalidates still-parked connector requests in
+// the same transaction as their account's ownership move. A concurrent human
+// decision therefore either commits before the move (and the Gateway's
+// revision-bound dispatch check blocks it after the move) or observes this
+// cancellation and cannot release the waiter at all.
+func cancelPendingForAccountMoveTx(ctx context.Context, tx pgx.Tx, account string) error {
+	_, err := tx.Exec(ctx, `
+UPDATE pending_calls
+SET status='cancelled', decided_at=now(), decided_by='engine',
+    decision_note='connection ownership changed while approval was pending'
+WHERE account=$1 AND status='pending' AND expires_at > now()`, account)
 	return err
 }
 
-// ---- PgStore: ApprovalLog ----
-// The row is the audit record; the live wait for a decision is in-process.
+// MoveAccountToConnectionNamespace changes a credential ownership boundary by
+// CAS and leaves Account.Name untouched. If the target scope is personal, all
+// current shared endpoint memberships and virtual connector maps are removed
+// in the same transaction before the personal scope is committed.
+func (s *PgStore) MoveAccountToConnectionNamespace(ctx context.Context, name, expectedIncarnationID string, assignment AccountConnectionAssignment, expectedRevision int64) (Account, error) {
+	assignment, err := normalizeAccountConnectionAssignment(assignment)
+	if err != nil {
+		return Account{}, err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Account{}, err
+	}
+	defer tx.Rollback(ctx)
+	target, err := loadConnectionNamespaceForUpdate(ctx, tx, assignment.ConnectionNamespaceID)
+	if err != nil {
+		return Account{}, err
+	}
+	current, err := s.scanAccount(tx.QueryRow(ctx, `SELECT `+accountCols+` FROM narthex_accounts WHERE name=$1 FOR UPDATE`, name))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Account{}, ErrAccountNotFound
+	}
+	if err != nil {
+		return Account{}, err
+	}
+	if expectedIncarnationID == "" || current.IncarnationID != expectedIncarnationID {
+		return Account{}, ErrAccountIncarnation
+	}
+	if expectedRevision < 1 || current.Revision != expectedRevision {
+		return Account{}, ErrConnectionNamespaceRevision
+	}
+	if current.ConnectionNamespaceID == assignment.ConnectionNamespaceID && current.ConnectionScope == assignment.Scope && current.OwnerSubject == assignment.OwnerSubject {
+		if err := tx.Commit(ctx); err != nil {
+			return Account{}, err
+		}
+		return current, nil
+	}
+	proposed := copyAccount(current)
+	proposed.ConnectionNamespaceID = assignment.ConnectionNamespaceID
+	proposed.ConnectionScope = assignment.Scope
+	proposed.OwnerSubject = assignment.OwnerSubject
+	proposed.Group = target.Label
+	moveNamespaceIDs := []string{current.ConnectionNamespaceID, proposed.ConnectionNamespaceID}
+	// Lock any current candidates before taking the namespace advisory locks.
+	// Scope edits lock their client row before those same advisory locks, so
+	// this order avoids a client-row/advisory-lock cycle. A second selection
+	// after the advisory locks catches registrations created in the short gap.
+	if _, err := lockActiveMCPClientsForAccountMoveTx(ctx, tx, moveNamespaceIDs); err != nil {
+		return Account{}, err
+	}
+	if err := lockMCPClientNamespacesTx(ctx, tx, moveNamespaceIDs); err != nil {
+		return Account{}, err
+	}
+	affectedClients, err := lockActiveMCPClientsForAccountMoveTx(ctx, tx, moveNamespaceIDs)
+	if err != nil {
+		return Account{}, err
+	}
+	if err := validatePersonalAccountMCPClientGrantsTx(ctx, tx, proposed); err != nil {
+		return Account{}, err
+	}
+	if err := cancelPendingForAccountMoveTx(ctx, tx, current.Name); err != nil {
+		return Account{}, err
+	}
+	if assignment.Scope == ConnectionScopePersonal {
+		if err := removePersonalAccountExposureTx(ctx, tx, current.Name); err != nil {
+			return Account{}, err
+		}
+	}
+	// Persist the client generation boundary in the same transaction as the
+	// account assignment. Existing scoped OAuth grants then fail closed until a
+	// client refreshes, while unchanged scoped clients retain their sessions.
+	if err := rotateMCPClientEpochsForAccountMoveTx(ctx, tx, affectedClients, current, proposed); err != nil {
+		return Account{}, err
+	}
+	current.ConnectionNamespaceID = assignment.ConnectionNamespaceID
+	current.ConnectionScope = assignment.Scope
+	current.OwnerSubject = assignment.OwnerSubject
+	current.Group = target.Label
+	current.Revision++
+	if _, err := tx.Exec(ctx, `
+UPDATE narthex_accounts
+SET workspace=$2,connection_namespace_id=$3,connection_scope=$4,owner_subject=$5,revision=$6
+WHERE name=$1`, current.Name, current.Group, current.ConnectionNamespaceID, current.ConnectionScope, current.OwnerSubject, current.Revision); err != nil {
+		return Account{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Account{}, err
+	}
+	return current, nil
+}
+
+// ---- PgStore: durable approval lifecycle ----
+//
+// Approval decisions are conditional transitions. In particular, a decision
+// may only move a still-pending row whose persisted deadline has not elapsed.
+// This prevents a late Approve from reviving a timed-out call and gives every
+// Engine instance one authoritative result to observe.
+
+const pendingCallColumns = `id,ts,connector,account,account_incarnation_id,account_revision,connection_namespace_id,tool,args,status,expires_at,decided_at,decided_by,decision_note`
+
+type pendingCallScanner interface {
+	Scan(...any) error
+}
+
+func (s *PgStore) scanPendingCall(row pendingCallScanner) (PendingCall, error) {
+	var (
+		p       PendingCall
+		args    string
+		expires time.Time
+	)
+	if err := row.Scan(
+		&p.ID, &p.TS, &p.Connector, &p.Account, &p.AccountIncarnationID, &p.AccountRevision, &p.ConnectionNamespaceID, &p.Tool, &args, &p.Status,
+		&expires, &p.DecidedAt, &p.DecidedBy, &p.DecisionNote,
+	); err != nil {
+		return PendingCall{}, err
+	}
+	p.ExpiresAt = &expires
+	if err := json.Unmarshal([]byte(s.dec(args)), &p.Args); err != nil {
+		return PendingCall{}, fmt.Errorf("pending call %q args: %w", p.ID, err)
+	}
+	return p, nil
+}
 
 func (s *PgStore) LogPending(ctx context.Context, p PendingCall) error {
-	if p.TS.IsZero() {
-		p.TS = time.Now()
+	if err := normalizePendingCall(&p); err != nil {
+		return err
 	}
 	args := p.Args
 	if args == nil {
@@ -503,43 +2229,193 @@ func (s *PgStore) LogPending(ctx context.Context, p PendingCall) error {
 		return err
 	}
 	_, err = s.pool.Exec(ctx, `
-INSERT INTO pending_calls (id,ts,connector,account,tool,args,status) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-		p.ID, p.TS, p.Connector, p.Account, p.Tool, s.enc(string(b)), p.Status)
+INSERT INTO pending_calls
+    (id,ts,connector,account,account_incarnation_id,account_revision,connection_namespace_id,tool,args,status,expires_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+		p.ID, p.TS, p.Connector, p.Account, p.AccountIncarnationID, p.AccountRevision, p.ConnectionNamespaceID,
+		p.Tool, s.enc(string(b)), p.Status, p.ExpiresAt)
 	return err
 }
 
-// ExpireOrphanedPending marks every still-pending call expired. Run at
-// startup: a row pending when the process starts can never be decided — its
-// in-process waiter died with the previous instance — so without this sweep
-// it renders in the console forever with no-op Approve/Deny buttons.
-func (s *PgStore) ExpireOrphanedPending(ctx context.Context) (int64, error) {
-	tag, err := s.pool.Exec(ctx, `UPDATE pending_calls SET status='expired', decided_at=now() WHERE status='pending'`)
+// ApprovalCall reads one approval row for cross-instance waiters and console
+// error handling. It intentionally includes terminal history.
+func (s *PgStore) ApprovalCall(ctx context.Context, id string) (PendingCall, bool, error) {
+	p, err := s.scanPendingCall(s.pool.QueryRow(ctx,
+		`SELECT `+pendingCallColumns+` FROM pending_calls WHERE id=$1`, id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return PendingCall{}, false, nil
+	}
+	if err != nil {
+		return PendingCall{}, false, err
+	}
+	return p, true, nil
+}
+
+func (s *PgStore) pendingTransitionResult(ctx context.Context, id, wanted string) (PendingCall, error) {
+	p, found, err := s.ApprovalCall(ctx, id)
+	if err != nil {
+		return PendingCall{}, err
+	}
+	if !found {
+		return PendingCall{}, ErrApprovalNotFound
+	}
+	if p.Status == wanted { // idempotent retry of the same terminal action
+		return p, nil
+	}
+	if p.Status == ApprovalPending && approvalIsDue(p, time.Now()) {
+		return p, ErrApprovalExpired
+	}
+	return p, ErrApprovalNotPending
+}
+
+// SetDecision is the compatibility wrapper for direct store callers. It uses
+// DecidePending, so it never overwrites a previous terminal decision.
+func (s *PgStore) SetDecision(ctx context.Context, id, status string) error {
+	_, err := s.DecidePending(ctx, id, ApprovalDecision{Status: status})
+	return err
+}
+
+// DecidePending atomically transitions pending -> approved|denied. The
+// deadline predicate is inside the UPDATE (rather than only in Go) so two
+// console requests and a timeout race cannot both win.
+func (s *PgStore) DecidePending(ctx context.Context, id string, decision ApprovalDecision) (PendingCall, error) {
+	decision, err := normalizeHumanDecision(decision)
+	if err != nil {
+		return PendingCall{}, err
+	}
+	p, err := s.scanPendingCall(s.pool.QueryRow(ctx, `
+UPDATE pending_calls
+SET status=$2, decided_at=now(), decided_by=$3, decision_note=$4
+WHERE id=$1 AND status='pending' AND expires_at > now()
+RETURNING `+pendingCallColumns, id, decision.Status, decision.Actor, decision.Note))
+	if err == nil {
+		return p, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return PendingCall{}, err
+	}
+	return s.pendingTransitionResult(ctx, id, decision.Status)
+}
+
+// ExpirePending atomically transitions only a due pending call. Calling it
+// again after a successful expiry is idempotent.
+func (s *PgStore) ExpirePending(ctx context.Context, id string, now time.Time) (PendingCall, error) {
+	p, err := s.scanPendingCall(s.pool.QueryRow(ctx, `
+UPDATE pending_calls
+SET status='expired', decided_at=now(), decided_by='engine', decision_note='approval deadline elapsed'
+WHERE id=$1 AND status='pending' AND expires_at <= $2
+RETURNING `+pendingCallColumns, id, now))
+	if err == nil {
+		return p, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return PendingCall{}, err
+	}
+	return s.pendingTransitionResult(ctx, id, ApprovalExpired)
+}
+
+// CancelPending records that the original MCP request ended before a human
+// decision. It cannot cancel a genuinely timed-out call; that row becomes
+// expired instead.
+func (s *PgStore) CancelPending(ctx context.Context, id, actor, note string) (PendingCall, error) {
+	actor = strings.TrimSpace(actor)
+	if actor == "" {
+		actor = "engine"
+	}
+	note = strings.TrimSpace(note)
+	if len(actor) > maxApprovalActorBytes || len(note) > maxApprovalNoteBytes {
+		return PendingCall{}, errors.New("approval cancellation metadata is too long")
+	}
+	p, err := s.scanPendingCall(s.pool.QueryRow(ctx, `
+UPDATE pending_calls
+SET status='cancelled', decided_at=now(), decided_by=$2, decision_note=$3
+WHERE id=$1 AND status='pending' AND expires_at > now()
+RETURNING `+pendingCallColumns, id, actor, note))
+	if err == nil {
+		return p, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return PendingCall{}, err
+	}
+	return s.pendingTransitionResult(ctx, id, ApprovalCancelled)
+}
+
+// ExpireTimedOutPending is the safe maintenance sweep: only rows whose stored
+// deadline has passed are marked expired. It deliberately does not blanket-
+// expire all pending rows at process startup.
+func (s *PgStore) ExpireTimedOutPending(ctx context.Context, now time.Time) (int64, error) {
+	tag, err := s.pool.Exec(ctx, `
+UPDATE pending_calls
+SET status='expired', decided_at=now(), decided_by='engine', decision_note='approval deadline elapsed'
+WHERE status='pending' AND expires_at <= $1`, now)
 	if err != nil {
 		return 0, err
 	}
 	return tag.RowsAffected(), nil
 }
 
-func (s *PgStore) SetDecision(ctx context.Context, id, status string) error {
-	_, err := s.pool.Exec(ctx, `UPDATE pending_calls SET status=$2, decided_at=now() WHERE id=$1`, id, status)
-	return err
+// ApprovalRecovery summarizes startup recovery. Non-expired rows are
+// cancelled, not approved or replayed: their original MCP transport request
+// ended with the previous Engine process and generic tool calls are not safe to
+// re-run from stored arguments.
+type ApprovalRecovery struct {
+	Expired   int64
+	Cancelled int64
+}
+
+func (s *PgStore) RecoverPendingApprovals(ctx context.Context, now time.Time) (ApprovalRecovery, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return ApprovalRecovery{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	result := ApprovalRecovery{}
+	tag, err := tx.Exec(ctx, `
+UPDATE pending_calls
+SET status='expired', decided_at=now(), decided_by='engine', decision_note='approval deadline elapsed'
+WHERE status='pending' AND expires_at <= $1`, now)
+	if err != nil {
+		return ApprovalRecovery{}, err
+	}
+	result.Expired = tag.RowsAffected()
+
+	// Only rows still pending after the deadline sweep are cancelled. This is
+	// an explicit interrupted-request outcome, not a fabricated timeout.
+	tag, err = tx.Exec(ctx, `
+UPDATE pending_calls
+SET status='cancelled', decided_at=now(), decided_by='engine',
+    decision_note='Engine restarted; original MCP request was not replayed'
+WHERE status='pending'`)
+	if err != nil {
+		return ApprovalRecovery{}, err
+	}
+	result.Cancelled = tag.RowsAffected()
+	if err := tx.Commit(ctx); err != nil {
+		return ApprovalRecovery{}, err
+	}
+	return result, nil
+}
+
+// ExpireOrphanedPending remains for source compatibility with older Engine
+// callers. Its corrected behavior is deadline-only; use
+// RecoverPendingApprovals at startup when interrupted waits should be marked
+// cancelled as well.
+func (s *PgStore) ExpireOrphanedPending(ctx context.Context) (int64, error) {
+	return s.ExpireTimedOutPending(ctx, time.Now())
 }
 
 func (s *PgStore) PendingCalls(ctx context.Context) ([]PendingCall, error) {
-	rows, err := s.pool.Query(ctx, `SELECT id,ts,connector,account,tool,args,status,decided_at FROM pending_calls ORDER BY ts DESC LIMIT 500`)
+	rows, err := s.pool.Query(ctx, `SELECT `+pendingCallColumns+` FROM pending_calls ORDER BY ts DESC LIMIT 500`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []PendingCall
 	for rows.Next() {
-		var p PendingCall
-		var args string
-		if err := rows.Scan(&p.ID, &p.TS, &p.Connector, &p.Account, &p.Tool, &args, &p.Status, &p.DecidedAt); err != nil {
+		p, err := s.scanPendingCall(rows)
+		if err != nil {
 			return nil, err
-		}
-		if err := json.Unmarshal([]byte(s.dec(args)), &p.Args); err != nil {
-			return nil, fmt.Errorf("pending call %q args: %w", p.ID, err)
 		}
 		out = append(out, p)
 	}

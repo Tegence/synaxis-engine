@@ -35,15 +35,19 @@ type connector interface {
 type ConsoleAPI struct {
 	store            AccountStore
 	connStore        ConnectorStore // store's connector facet; nil = connectors unsupported (501)
+	nsStore          NamespaceStore // store's endpoint-bundle facet; nil = endpoints unsupported (501)
 	apprLog          ApprovalLog    // store's approval facet; nil = approvals unsupported (501)
 	audit            AuditSink      // store's audit facet; nil = call detail/replay unsupported (501)
 	triage           AuditTriage    // store's triage facet; nil = flagged decisions unsupported (501)
+	usage            *UsageGate     // nil = self-hosted/unlimited
 	gw               *Gateway
 	conn             connector
 	passwordDigest   [sha256.Size]byte
 	adminTokenDigest [sha256.Size]byte
 	hasAdminToken    bool
 	localAdminAuth   bool
+	actorVerifier    *PlatformActorVerifier
+	revokeOAuth      func(context.Context) error
 	secret           []byte
 	selfURL          string   // engine's own public base (issuer)
 	consoleURL       string   // where to bounce the browser after OAuth
@@ -80,6 +84,32 @@ func WithLocalAdminAuth(enabled bool) ConsoleOption {
 	}
 }
 
+// WithPlatformActorVerifier enables the hosted Platform-to-Engine identity
+// boundary. When configured, every protected management request must present
+// both the Engine machine token and a valid request-bound Platform assertion.
+// Leaving it unset retains self-hosted local-admin compatibility.
+func WithPlatformActorVerifier(verifier *PlatformActorVerifier) ConsoleOption {
+	return func(c *ConsoleAPI) {
+		c.actorVerifier = verifier
+	}
+}
+
+// WithOAuthRevoker wires the workspace-wide MCP authorization revocation
+// operation used by the closed Platform when a member loses Engine access.
+func WithOAuthRevoker(revoke func(context.Context) error) ConsoleOption {
+	return func(c *ConsoleAPI) {
+		c.revokeOAuth = revoke
+	}
+}
+
+// WithUsageGate exposes the hosted usage report and signed-grant control
+// endpoints. Leaving it unset preserves unlimited self-hosted behavior.
+func WithUsageGate(gate *UsageGate) ConsoleOption {
+	return func(c *ConsoleAPI) {
+		c.usage = gate
+	}
+}
+
 func NewConsoleAPI(store AccountStore, gw *Gateway, conn *Connector, password, secret, selfURL, consoleURL, origin string, options ...ConsoleOption) *ConsoleAPI {
 	var origins []string
 	for _, o := range strings.Split(origin, ",") {
@@ -90,11 +120,12 @@ func NewConsoleAPI(store AccountStore, gw *Gateway, conn *Connector, password, s
 	// Decide connector/approval support once: stores without the facet get
 	// 501s from the corresponding endpoints instead of runtime surprises.
 	connStore, _ := store.(ConnectorStore)
+	nsStore, _ := store.(NamespaceStore)
 	apprLog, _ := store.(ApprovalLog)
 	audit, _ := store.(AuditSink)
 	triage, _ := store.(AuditTriage)
 	api := &ConsoleAPI{
-		store: store, connStore: connStore, apprLog: apprLog, audit: audit, triage: triage, gw: gw, conn: conn, passwordDigest: sha256.Sum256([]byte(password)), secret: []byte(secret),
+		store: store, connStore: connStore, nsStore: nsStore, apprLog: apprLog, audit: audit, triage: triage, gw: gw, conn: conn, passwordDigest: sha256.Sum256([]byte(password)), secret: []byte(secret),
 		selfURL: strings.TrimRight(selfURL, "/"), consoleURL: strings.TrimRight(consoleURL, "/"), origins: origins, localAdminAuth: true,
 	}
 	for _, option := range options {
@@ -108,17 +139,24 @@ func NewConsoleAPI(store AccountStore, gw *Gateway, conn *Connector, password, s
 // serverDTO is the legacy self-hosted management transport. Management clients
 // key accounts by uuid; the engine's unique key is Name, so uuid == Name.
 type serverDTO struct {
-	UUID        string `json:"uuid"`
-	Name        string `json:"name"`
-	DisplayName string `json:"displayName"`
-	Group       string `json:"group"`
-	Transport   string `json:"transport"`
-	URL         string `json:"url"`
-	Status      string `json:"status"`
-	ErrorStatus string `json:"errorStatus"`
-	Description string `json:"description"`
-	AuthState   string `json:"authState"`
-	ConnectURL  string `json:"connectUrl,omitempty"`
+	UUID                  string `json:"uuid"`
+	Name                  string `json:"name"`       // legacy alias for ToolPrefix
+	Namespace             string `json:"namespace"`  // legacy alias for ToolPrefix
+	ToolPrefix            string `json:"toolPrefix"` // stable tool/account key
+	DisplayName           string `json:"displayName"`
+	ConnectionNamespace   string `json:"connectionNamespace"` // display label for legacy clients
+	ConnectionNamespaceID string `json:"connectionNamespaceId,omitempty"`
+	ConnectionScope       string `json:"connectionScope,omitempty"`
+	OwnerSubject          string `json:"ownerSubject,omitempty"`
+	Revision              int64  `json:"revision,omitempty"`
+	Group                 string `json:"group"` // legacy alias for ConnectionNamespace
+	Transport             string `json:"transport"`
+	URL                   string `json:"url"`
+	Status                string `json:"status"`
+	ErrorStatus           string `json:"errorStatus"`
+	Description           string `json:"description"`
+	AuthState             string `json:"authState"`
+	ConnectURL            string `json:"connectUrl,omitempty"`
 	// ReadOnly mirrors Account.ReadOnly for legacy management clients.
 	ReadOnly bool `json:"readOnly"`
 }
@@ -136,7 +174,9 @@ func toDTO(a Account) serverDTO {
 		auth = "connected"
 	}
 	return serverDTO{
-		UUID: a.Name, Name: a.Name, DisplayName: display, Group: a.Group,
+		UUID: a.Name, Name: a.Name, Namespace: a.Name, ToolPrefix: a.Name, DisplayName: display,
+		ConnectionNamespace: a.Group, ConnectionNamespaceID: a.ConnectionNamespaceID,
+		ConnectionScope: string(a.ConnectionScope), OwnerSubject: a.OwnerSubject, Revision: a.Revision, Group: a.Group,
 		Transport: "http", URL: a.URL, Status: "", ErrorStatus: "NONE", AuthState: auth,
 		ReadOnly: a.ReadOnly,
 	}
@@ -156,11 +196,12 @@ func (c *ConsoleAPI) Routes(mux *http.ServeMux) {
 			if c.cors(w, r) {
 				return
 			}
-			if !c.authed(r) {
+			authorized, ok := c.authorize(r)
+			if !ok {
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 				return
 			}
-			fn(w, r)
+			fn(w, authorized)
 		}
 	}
 	// Deliberately separate from /api/health: these public probes report only
@@ -184,18 +225,119 @@ func (c *ConsoleAPI) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/servers/{id}/token", sec(c.handleToken))
 	mux.HandleFunc("/api/servers/{id}/tools", sec(c.handleTools))
 	mux.HandleFunc("/api/servers/{id}/tools/{tool}", sec(c.handleToolPolicy))
+	// Connection namespaces are credential ownership folders. They are wholly
+	// distinct from /api/namespaces below, which remains the legacy endpoint
+	// bundle API for shared MCP delivery.
+	mux.HandleFunc("/api/connection-namespaces", sec(c.handleConnectionNamespaces))
+	mux.HandleFunc("/api/connection-namespaces/{id}", sec(c.handleConnectionNamespaceByID))
+	mux.HandleFunc("/api/connection-namespaces/{id}/managers", sec(c.handleConnectionNamespaceManagers))
+	mux.HandleFunc("/api/connection-namespaces/{id}/managers/{subject}", sec(c.handleConnectionNamespaceManagerBySubject))
+	// MCP clients are subject-bound registrations for scoped delivery. The
+	// console never mints credentials or accepts an OAuth client ID directly;
+	// binding remains in the signed consent path.
+	mux.HandleFunc("/api/mcp-clients", sec(c.handleMCPClients))
+	mux.HandleFunc("/api/mcp-clients/{id}", sec(c.handleMCPClientByID))
+	mux.HandleFunc("/api/mcp-clients/{id}/namespaces", sec(c.handleMCPClientNamespaces))
+	mux.HandleFunc("/api/mcp-clients/{id}/oauth-client/reset", sec(c.handleMCPClientOAuthReset))
+	mux.HandleFunc("/api/mcp-clients/{id}/revoke", sec(c.handleMCPClientRevoke))
 	mux.HandleFunc("/api/connectors", sec(c.handleConnectors))
 	mux.HandleFunc("/api/connectors/{slug}", sec(c.handleConnectorBySlug))
+	// Endpoint is the preferred product term for a reusable M:N account
+	// bundle. The namespace routes remain exact aliases for rolling upgrades
+	// and existing management clients.
+	mux.HandleFunc("/api/endpoints", sec(c.handleNamespaces))
+	mux.HandleFunc("/api/endpoints/{slug}", sec(c.handleNamespaceBySlug))
+	mux.HandleFunc("/api/endpoints/{slug}/accounts/{account}", sec(c.handleNamespaceAccount))
+	mux.HandleFunc("/api/namespaces", sec(c.handleNamespaces))
+	mux.HandleFunc("/api/namespaces/{slug}", sec(c.handleNamespaceBySlug))
+	mux.HandleFunc("/api/namespaces/{slug}/accounts/{account}", sec(c.handleNamespaceAccount))
 	mux.HandleFunc("/api/guardrails/test", sec(c.handleGuardrailTest))
 	mux.HandleFunc("/api/config", sec(c.handlePortableConfig))
 	mux.HandleFunc("/api/config/import", sec(c.handlePortableConfigImport))
 	mux.HandleFunc("/api/approvals", sec(c.handleApprovals))
+	mux.HandleFunc("/api/oauth/revoke-all", sec(c.handleOAuthRevokeAll))
+	// Activation is a deliberately narrow, credential-free control metric. In
+	// hosted mode it is reserved for the Platform service actor; it must never
+	// become a second way to enumerate connection metadata.
+	mux.HandleFunc("/api/activation", sec(c.handleActivation))
+	mux.HandleFunc("/api/usage", sec(c.handleUsage))
+	mux.HandleFunc("/api/usage/grant", sec(c.handleUsageGrant))
 	mux.HandleFunc("/api/approvals/{id}/approve", sec(func(w http.ResponseWriter, r *http.Request) {
 		c.handleApprovalDecision(w, r, "approved")
 	}))
 	mux.HandleFunc("/api/approvals/{id}/deny", sec(func(w http.ResponseWriter, r *http.Request) {
 		c.handleApprovalDecision(w, r, "denied")
 	}))
+}
+
+func (c *ConsoleAPI) handleUsage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if c.usage == nil {
+		writeJSON(w, http.StatusOK, UsageReport{Mode: "unlimited", Status: "unlimited"})
+		return
+	}
+	report, err := c.usage.Report(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "usage meter unavailable"})
+		return
+	}
+	writeJSON(w, http.StatusOK, report)
+}
+
+func (c *ConsoleAPI) handleUsageGrant(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method != http.MethodPut {
+		w.Header().Set("Allow", http.MethodPut)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if c.usage == nil {
+		writeJSON(w, http.StatusNotImplemented, map[string]string{"error": "hosted usage enforcement is not configured"})
+		return
+	}
+	var req struct {
+		Grant string `json:"grant"`
+	}
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxUsageGrantBytes+1024))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil || strings.TrimSpace(req.Grant) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "a valid signed grant is required"})
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "a valid signed grant is required"})
+		return
+	}
+	report, err := c.usage.ApplyGrant(r.Context(), req.Grant)
+	if err != nil {
+		// Signature/claim/revision details are useful to the trusted control
+		// plane but never include the assertion itself or signing material.
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, report)
+}
+
+func (c *ConsoleAPI) handleOAuthRevokeAll(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if c.revokeOAuth == nil {
+		writeJSON(w, http.StatusNotImplemented, map[string]string{"error": "OAuth revocation unavailable"})
+		return
+	}
+	if err := c.revokeOAuth(r.Context()); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "OAuth revocation unavailable"})
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // --- virtual connectors: curated tool subsets served at /mcp/{slug} ---
@@ -329,6 +471,9 @@ func validateRedact(patterns []string) (string, bool) {
 }
 
 func (c *ConsoleAPI) handleConnectors(w http.ResponseWriter, r *http.Request) {
+	if _, ok := c.requireConnectionNamespaceAdministrator(w, r); !ok {
+		return
+	}
 	if !c.connectorsSupported(w) {
 		return
 	}
@@ -392,12 +537,22 @@ func (c *ConsoleAPI) handleConnectors(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": "connector " + strconv.Quote(slug) + " already exists"})
 			return
 		}
+		if c.nsStore != nil {
+			if _, exists := c.nsStore.Namespace(r.Context(), slug); exists {
+				writeJSON(w, http.StatusConflict, map[string]string{"error": "endpoint slug " + strconv.Quote(slug) + " is already used by a namespace"})
+				return
+			}
+		}
 		if req.Tools == nil {
 			req.Tools = map[string][]string{}
 		}
 		vc := VirtualConnector{Slug: slug, Label: label, Tools: req.Tools, Approval: req.Approval, Record: req.Record,
 			MaxResultBytes: req.MaxResultBytes, Redact: req.Redact, DisableInjectionScan: req.DisableInjectionScan}
 		if err := c.gw.UpsertConnector(r.Context(), vc); err != nil {
+			if errors.Is(err, ErrEndpointCollision) {
+				writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+				return
+			}
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 			return
 		}
@@ -408,6 +563,9 @@ func (c *ConsoleAPI) handleConnectors(w http.ResponseWriter, r *http.Request) {
 }
 
 func (c *ConsoleAPI) handleConnectorBySlug(w http.ResponseWriter, r *http.Request) {
+	if _, ok := c.requireConnectionNamespaceAdministrator(w, r); !ok {
+		return
+	}
 	if !c.connectorsSupported(w) {
 		return
 	}
@@ -505,6 +663,286 @@ func (c *ConsoleAPI) handleConnectorBySlug(w http.ResponseWriter, r *http.Reques
 	}
 }
 
+// --- endpoint bundles: reusable provider-agnostic account collections ---
+//
+// Handler names retain "namespace" for source compatibility. Both the preferred
+// /api/endpoints routes and legacy /api/namespaces routes call these exact
+// handlers, so authentication, validation, CAS, and response schemas cannot
+// drift between route families.
+
+type namespaceDTO struct {
+	Slug         string   `json:"slug"`
+	Label        string   `json:"label"`
+	URL          string   `json:"url"`
+	Members      []string `json:"members"`
+	Generation   string   `json:"generation"`
+	Revision     int64    `json:"revision"`
+	ExposedTools int      `json:"exposedTools"`
+	TotalTools   int      `json:"totalTools"`
+}
+
+func (c *ConsoleAPI) namespaceDTO(ctx context.Context, ns Namespace) namespaceDTO {
+	members := append([]string(nil), ns.Accounts...)
+	if members == nil {
+		members = []string{}
+	}
+	dto := namespaceDTO{
+		Slug: ns.Slug, Label: ns.Label, URL: c.selfURL + "/mcp/" + ns.Slug,
+		Members: members, Generation: ns.Epoch, Revision: ns.Revision,
+	}
+	if stats, err := c.gw.NamespaceStats(ctx, ns.Slug); err == nil {
+		dto.ExposedTools, dto.TotalTools = stats.ExposedTools, stats.TotalTools
+	}
+	return dto
+}
+
+func (c *ConsoleAPI) namespacesSupported(w http.ResponseWriter) bool {
+	if c.nsStore == nil {
+		writeJSON(w, http.StatusNotImplemented, map[string]string{"error": "namespaces not supported by this store"})
+		return false
+	}
+	return true
+}
+
+func (c *ConsoleAPI) validateNamespaceAccounts(accounts []string) (string, bool) {
+	for _, account := range normalizedNamespaceAccounts(accounts) {
+		if _, ok := c.store.Account(account); !ok {
+			return "unknown account " + strconv.Quote(account), false
+		}
+	}
+	return "", true
+}
+
+func writeNamespaceMutationError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, ErrNamespaceExists), errors.Is(err, ErrNamespaceRevision),
+		errors.Is(err, ErrEndpointCollision), errors.Is(err, ErrEndpointGeneration):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+	case errors.Is(err, ErrNamespaceNotFound):
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+	case errors.Is(err, ErrAccountNotFound):
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+	default:
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+	}
+}
+
+func namespacePrecondition(w http.ResponseWriter, generation string, revision int64) (NamespacePrecondition, bool) {
+	precondition := NamespacePrecondition{Generation: generation, Revision: revision}
+	if precondition.Generation == "" || precondition.Revision < 1 {
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "namespace generation and revision precondition required",
+		})
+		return NamespacePrecondition{}, false
+	}
+	return precondition, true
+}
+
+func (c *ConsoleAPI) handleNamespaces(w http.ResponseWriter, r *http.Request) {
+	if _, ok := c.requireConnectionNamespaceAdministrator(w, r); !ok {
+		return
+	}
+	if !c.namespacesSupported(w) {
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		list, err := c.nsStore.Namespaces(r.Context())
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+			return
+		}
+		out := make([]namespaceDTO, len(list))
+		for i, ns := range list {
+			out[i] = c.namespaceDTO(r.Context(), ns)
+		}
+		writeJSON(w, http.StatusOK, out)
+	case http.MethodPost:
+		var req struct {
+			Slug    string   `json:"slug"`
+			Label   string   `json:"label"`
+			Members []string `json:"members"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+			return
+		}
+		label := strings.TrimSpace(req.Label)
+		if label == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "label is required"})
+			return
+		}
+		slug := slugify(req.Slug)
+		if slug == "" {
+			slug = slugify(label)
+		}
+		if slug == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "slug must contain letters or numbers"})
+			return
+		}
+		if msg, ok := c.validateNamespaceAccounts(req.Members); !ok {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": msg})
+			return
+		}
+		ns, err := c.gw.CreateNamespace(r.Context(), Namespace{
+			Slug: slug, Label: label, Accounts: normalizedNamespaceAccounts(req.Members),
+		})
+		if err != nil {
+			writeNamespaceMutationError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, c.namespaceDTO(r.Context(), ns))
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (c *ConsoleAPI) handleNamespaceBySlug(w http.ResponseWriter, r *http.Request) {
+	if _, ok := c.requireConnectionNamespaceAdministrator(w, r); !ok {
+		return
+	}
+	if !c.namespacesSupported(w) {
+		return
+	}
+	slug := r.PathValue("slug")
+	current, ok := c.nsStore.Namespace(r.Context(), slug)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "namespace not found"})
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, c.namespaceDTO(r.Context(), current))
+	case http.MethodPut:
+		var req struct {
+			Label      *string   `json:"label"`
+			Members    *[]string `json:"members"`
+			Generation string    `json:"generation"`
+			Revision   int64     `json:"revision"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+			if errors.Is(err, io.EOF) {
+				namespacePrecondition(w, "", 0)
+				return
+			}
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+			return
+		}
+		precondition, ok := namespacePrecondition(w, req.Generation, req.Revision)
+		if !ok {
+			return
+		}
+		if !namespacePreconditionMatches(current, precondition) {
+			writeNamespaceMutationError(w, ErrNamespaceRevision)
+			return
+		}
+		label := current.Label
+		if req.Label != nil {
+			label = strings.TrimSpace(*req.Label)
+			if label == "" {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "label cannot be empty"})
+				return
+			}
+		}
+		members := current.Accounts
+		if req.Members != nil {
+			members = normalizedNamespaceAccounts(*req.Members)
+		}
+		if msg, ok := c.validateNamespaceAccounts(members); !ok {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": msg})
+			return
+		}
+		updated, err := c.gw.UpdateNamespace(r.Context(), Namespace{
+			Slug: slug, Label: label, Accounts: members,
+		}, precondition)
+		if err != nil {
+			writeNamespaceMutationError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, c.namespaceDTO(r.Context(), updated))
+	case http.MethodDelete:
+		var req NamespacePrecondition
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+			if errors.Is(err, io.EOF) {
+				namespacePrecondition(w, "", 0)
+				return
+			}
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+			return
+		}
+		precondition, ok := namespacePrecondition(w, req.Generation, req.Revision)
+		if !ok {
+			return
+		}
+		if !namespacePreconditionMatches(current, precondition) {
+			writeNamespaceMutationError(w, ErrNamespaceRevision)
+			return
+		}
+		if err := c.gw.DeleteNamespace(r.Context(), slug, precondition); err != nil {
+			writeNamespaceMutationError(w, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (c *ConsoleAPI) handleNamespaceAccount(w http.ResponseWriter, r *http.Request) {
+	if _, ok := c.requireConnectionNamespaceAdministrator(w, r); !ok {
+		return
+	}
+	if !c.namespacesSupported(w) {
+		return
+	}
+	slug, account := r.PathValue("slug"), r.PathValue("account")
+	current, ok := c.nsStore.Namespace(r.Context(), slug)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "namespace not found"})
+		return
+	}
+	if r.Method != http.MethodPut && r.Method != http.MethodDelete {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var req NamespacePrecondition
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		if errors.Is(err, io.EOF) {
+			namespacePrecondition(w, "", 0)
+			return
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	precondition, ok := namespacePrecondition(w, req.Generation, req.Revision)
+	if !ok {
+		return
+	}
+	if !namespacePreconditionMatches(current, precondition) {
+		writeNamespaceMutationError(w, ErrNamespaceRevision)
+		return
+	}
+	if _, ok := c.store.Account(account); !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unknown account " + strconv.Quote(account)})
+		return
+	}
+	var (
+		ns  Namespace
+		err error
+	)
+	switch r.Method {
+	case http.MethodPut:
+		ns, err = c.gw.AddNamespaceAccount(r.Context(), slug, account, precondition)
+	case http.MethodDelete:
+		ns, err = c.gw.RemoveNamespaceAccount(r.Context(), slug, account, precondition)
+	}
+	if err != nil {
+		writeNamespaceMutationError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, c.namespaceDTO(r.Context(), ns))
+}
+
 // --- approvals: pending (approval-gated) tool calls awaiting a decision ---
 
 // approvalsSupported writes the 501 and returns false when the store lacks
@@ -528,20 +966,45 @@ func (c *ConsoleAPI) handleApprovals(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	calls, err := c.apprLog.PendingCalls(r.Context())
-	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+	actor, ok := c.requireConnectionNamespaceActor(w, r)
+	if !ok {
 		return
 	}
-	if calls == nil {
-		calls = []PendingCall{}
+	calls, err := c.apprLog.PendingCalls(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "approval records unavailable"})
+		return
 	}
-	writeJSON(w, http.StatusOK, calls)
+	out := make([]PendingCall, 0, len(calls))
+	for _, call := range calls {
+		if c.visibleApproval(r.Context(), actor, call) {
+			out = append(out, call)
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
-// handleApprovalDecision resolves a parked call via gw.Decide. 404 when the id
-// was never recorded, 409 when it exists but is no longer awaiting a decision
-// (already approved/denied/expired — or the waiter died with the process).
+type approvalDecisionRequest struct {
+	Note string `json:"note"`
+}
+
+func (c *ConsoleAPI) approvalDecisionActor(r *http.Request) string {
+	// The hosted Platform actor is available only after the Ed25519 assertion
+	// has been checked against this exact request. Never recover it from raw
+	// X-Synaxis-* headers: those are browser-controlled before the proxy strips
+	// them and are not an authentication boundary.
+	if actor, ok := PlatformActorFromContext(r.Context()); ok {
+		return "platform:" + actor.UserID
+	}
+	if c.machineAuthed(r) {
+		return "platform-admin"
+	}
+	return "local-admin"
+}
+
+// handleApprovalDecision resolves a parked call through a durable conditional
+// transition. A retry of the same decision is deliberately idempotent; a
+// contradictory decision gets 409 and never overwrites the audit history.
 func (c *ConsoleAPI) handleApprovalDecision(w http.ResponseWriter, r *http.Request, status string) {
 	if !c.approvalsSupported(w) {
 		return
@@ -551,30 +1014,55 @@ func (c *ConsoleAPI) handleApprovalDecision(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	id := r.PathValue("id")
-	if err := c.gw.Decide(r.Context(), id, status); err != nil {
-		// Decide only knows "no live waiter" — the audit record tells 404 vs 409.
-		if calls, lerr := c.apprLog.PendingCalls(r.Context()); lerr == nil {
-			for _, p := range calls {
-				if p.ID == id {
-					msg := "pending call already decided (status " + strconv.Quote(p.Status) + ")"
-					if p.Status == "pending" { // row survived a restart; the in-process waiter did not
-						msg = "pending call is no longer waiting (engine restarted?)"
-					}
-					writeJSON(w, http.StatusConflict, map[string]string{"error": msg})
-					return
-				}
-			}
-		}
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "pending call not found"})
+	if _, _, ok := c.managedApprovalRecord(w, r, id); !ok {
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"id": id, "status": status})
+	var req approvalDecisionRequest
+	if r.Body != nil {
+		dec := json.NewDecoder(io.LimitReader(r.Body, int64(maxApprovalNoteBytes)+1024))
+		if err := dec.Decode(&req); err != nil && err != io.EOF {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid approval decision body"})
+			return
+		}
+		if err := dec.Decode(&struct{}{}); err != io.EOF {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid approval decision body"})
+			return
+		}
+	}
+	p, err := c.gw.DecideWithMetadata(r.Context(), id, ApprovalDecision{
+		Status: status,
+		Actor:  c.approvalDecisionActor(r),
+		Note:   req.Note,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrApprovalNotFound):
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "pending call not found"})
+		case errors.Is(err, ErrApprovalExpired):
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "pending call already decided (status \"expired\")"})
+		case errors.Is(err, ErrApprovalNotPending):
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "pending call already decided (status " + strconv.Quote(p.Status) + ")"})
+		default:
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "could not record approval decision"})
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{
+		"id":            p.ID,
+		"status":        p.Status,
+		"decided_by":    p.DecidedBy,
+		"decision_note": p.DecisionNote,
+	})
 }
 
 // handleTools: GET lists an account's tools with enabled/disabled + hints;
 // PUT { "disabled": [...] } sets the disabled set and re-aggregates live.
 func (c *ConsoleAPI) handleTools(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	account, _, ok := c.managedAccount(w, r, id)
+	if !ok {
+		return
+	}
 	switch r.Method {
 	case http.MethodGet:
 		tools, err := c.gw.ListAccountTools(r.Context(), id)
@@ -594,8 +1082,8 @@ func (c *ConsoleAPI) handleTools(w http.ResponseWriter, r *http.Request) {
 		if req.Disabled == nil {
 			req.Disabled = []string{}
 		}
-		if err := c.store.SetDisabledTools(r.Context(), id, req.Disabled); err != nil {
-			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		if _, err := c.store.UpdateAccountPolicy(r.Context(), id, accountPolicyPrecondition(account), AccountPolicyMutation{DisabledTools: &req.Disabled}); err != nil {
+			writeAccountPolicyMutationError(w, err, "could not update connection policy")
 			return
 		}
 		c.gw.ReplaceAccount(r.Context(), id) // re-aggregate so /mcp reflects the curation immediately
@@ -627,17 +1115,44 @@ func (c *ConsoleAPI) cors(w http.ResponseWriter, r *http.Request) bool {
 }
 
 func (c *ConsoleAPI) authed(r *http.Request) bool {
+	_, ok := c.authorize(r)
+	return ok
+}
+
+func (c *ConsoleAPI) authorize(r *http.Request) (*http.Request, bool) {
+	if c.actorVerifier != nil {
+		// Hosted engines intentionally do not fall back to a local session.
+		// Possession of the machine token alone is also insufficient: a request
+		// must carry a Platform-signed actor assertion bound to its body/path.
+		if !c.machineAuthed(r) {
+			return nil, false
+		}
+		actor, err := c.actorVerifier.VerifyRequest(r)
+		if err != nil {
+			return nil, false
+		}
+		return r.WithContext(withPlatformActor(r.Context(), actor)), true
+	}
+	if c.machineAuthed(r) {
+		return r, true
+	}
+	if c.localAdminAuth {
+		token, _ := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+		return r, c.validToken(token)
+	}
+	return nil, false
+}
+
+func (c *ConsoleAPI) machineAuthed(r *http.Request) bool {
 	token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 	if !ok || token == "" {
 		return false
 	}
-	if c.hasAdminToken {
-		digest := sha256.Sum256([]byte(token))
-		if subtle.ConstantTimeCompare(digest[:], c.adminTokenDigest[:]) == 1 {
-			return true
-		}
+	if !c.hasAdminToken {
+		return false
 	}
-	return c.localAdminAuth && c.validToken(token)
+	digest := sha256.Sum256([]byte(token))
+	return subtle.ConstantTimeCompare(digest[:], c.adminTokenDigest[:]) == 1
 }
 
 func (c *ConsoleAPI) signToken() string {
@@ -711,19 +1226,48 @@ func (c *ConsoleAPI) handleGateway(w http.ResponseWriter, r *http.Request) {
 }
 
 func (c *ConsoleAPI) handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, c.gw.Health(r.Context()))
+	actor, ok := c.requireConnectionNamespaceActor(w, r)
+	if !ok {
+		return
+	}
+	health := c.gw.Health(r.Context())
+	out := make([]AccountHealth, 0, len(health))
+	for _, item := range health {
+		account, found := c.store.Account(item.UUID)
+		if found && c.canReadAccount(r.Context(), actor, account) {
+			out = append(out, publicAccountHealth(item))
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// publicAccountHealth is a defense-in-depth boundary for /api/health. Gateway
+// creates these rows, but the management API must never depend on a caller
+// having remembered to redact a provider error before returning it to a
+// browser. Normalize every status into the small safe presentation contract.
+func publicAccountHealth(item AccountHealth) AccountHealth {
+	item.Status, item.Detail, item.Recovery = healthPresentation(item.Status)
+	item.internalErr = nil
+	return item
 }
 
 func (c *ConsoleAPI) handleLogs(w http.ResponseWriter, r *http.Request) {
-	calls, err := c.gw.RecentCalls(r.Context(), 100)
-	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+	actor, ok := c.requireConnectionNamespaceActor(w, r)
+	if !ok {
 		return
 	}
-	if calls == nil {
-		calls = []CallRecord{}
+	calls, err := c.gw.RecentCalls(r.Context(), 100)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "activity records unavailable"})
+		return
 	}
-	writeJSON(w, http.StatusOK, calls)
+	out := make([]CallRecord, 0, len(calls))
+	for _, call := range calls {
+		if c.visibleCall(r.Context(), actor, call) {
+			out = append(out, call)
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // --- flight recorder: call inspector + replay ---
@@ -755,13 +1299,8 @@ func (c *ConsoleAPI) handleLogByID(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid call id"})
 		return
 	}
-	rec, ok, err := c.gw.CallDetail(r.Context(), id)
-	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
-		return
-	}
+	rec, _, ok := c.visibleCallRecord(w, r, id)
 	if !ok {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "call not found"})
 		return
 	}
 	writeJSON(w, http.StatusOK, rec)
@@ -794,13 +1333,9 @@ func (c *ConsoleAPI) handleLogReplay(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
 		return
 	}
-	// Existence check up front: Replay folds "unknown id" into a generic
-	// error, but the console owes the frontend a clean 404.
-	if _, ok, err := c.gw.CallDetail(r.Context(), id); err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
-		return
-	} else if !ok {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "call not found"})
+	// Existence and namespace checks up front: Replay folds "unknown id" into
+	// a generic error, while an ungranted record must remain undiscoverable.
+	if _, _, ok := c.visibleCallRecord(w, r, id); !ok {
 		return
 	}
 	rec, err := c.gw.Replay(r.Context(), id, req.Force)
@@ -816,90 +1351,248 @@ func (c *ConsoleAPI) handleLogReplay(w http.ResponseWriter, r *http.Request) {
 }
 
 func (c *ConsoleAPI) handleServers(w http.ResponseWriter, r *http.Request) {
+	actor, ok := c.requireConnectionNamespaceActor(w, r)
+	if !ok {
+		return
+	}
 	switch r.Method {
 	case http.MethodGet:
 		accts := c.store.Accounts()
-		out := make([]serverDTO, len(accts))
-		for i, a := range accts {
-			out[i] = toDTO(a)
+		out := make([]serverDTO, 0, len(accts))
+		for _, a := range accts {
+			if c.canReadAccount(r.Context(), actor, a) {
+				out = append(out, toDTO(a))
+			}
 		}
 		writeJSON(w, http.StatusOK, out)
 	case http.MethodPost:
-		c.create(w, r)
+		c.create(w, r, actor)
 	default:
+		w.Header().Set("Allow", "GET, POST")
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
 }
 
-func (c *ConsoleAPI) create(w http.ResponseWriter, r *http.Request) {
+func (c *ConsoleAPI) create(w http.ResponseWriter, r *http.Request, actor PlatformActor) {
 	var req struct {
-		Name        string `json:"name"`
-		Group       string `json:"group"`
-		Transport   string `json:"transport"`
-		URL         string `json:"url"`
-		BearerToken string `json:"bearerToken"`
+		Name                  string           `json:"name"`
+		Namespace             string           `json:"namespace"`
+		ToolPrefix            string           `json:"toolPrefix"`
+		ConnectionNamespace   *string          `json:"connectionNamespace"`
+		ConnectionNamespaceID *string          `json:"connectionNamespaceId"`
+		ConnectionScope       *ConnectionScope `json:"connectionScope"`
+		OwnerSubject          *string          `json:"ownerSubject"`
+		Group                 *string          `json:"group"`
+		Transport             string           `json:"transport"`
+		URL                   string           `json:"url"`
+		BearerToken           string           `json:"bearerToken"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
 		return
 	}
 	friendly := strings.TrimSpace(req.Name)
-	name := slugify(friendly)
+	if friendly == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name is required"})
+		return
+	}
+	toolPrefix := strings.TrimSpace(req.ToolPrefix)
+	legacyNamespace := strings.TrimSpace(req.Namespace)
+	if toolPrefix != "" && legacyNamespace != "" && slugify(toolPrefix) != slugify(legacyNamespace) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "toolPrefix and namespace must resolve to the same tool prefix"})
+		return
+	}
+	if toolPrefix == "" {
+		toolPrefix = legacyNamespace
+	}
+	if toolPrefix == "" {
+		// Legacy clients supplied only name. Keep deriving the stable account
+		// key exactly as before so existing integrations and imports continue
+		// to work unchanged.
+		toolPrefix = friendly
+	}
+	name := slugify(toolPrefix)
 	if name == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name must contain letters or numbers"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "tool prefix must contain letters or numbers"})
+		return
+	}
+	if req.ConnectionNamespace != nil && req.Group != nil &&
+		strings.TrimSpace(*req.ConnectionNamespace) != strings.TrimSpace(*req.Group) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "connectionNamespace and group must match when both are provided"})
+		return
+	}
+	connectionNamespace := ""
+	if req.ConnectionNamespace != nil {
+		connectionNamespace = strings.TrimSpace(*req.ConnectionNamespace)
+	} else if req.Group != nil {
+		connectionNamespace = strings.TrimSpace(*req.Group)
+	}
+	namespaceID := ""
+	if req.ConnectionNamespaceID != nil {
+		namespaceID = strings.TrimSpace(*req.ConnectionNamespaceID)
+	}
+	if connectionNamespace == "" && namespaceID == "" && actor.Role != "operator" {
+		connectionNamespace = "General"
+	}
+	scope := ConnectionScopeShared
+	if req.ConnectionScope != nil {
+		var scopeErr error
+		scope, scopeErr = normalizedConnectionScope(*req.ConnectionScope)
+		if scopeErr != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid connection scope"})
+			return
+		}
+	}
+	ownerSubject := ""
+	if req.OwnerSubject != nil {
+		ownerSubject = strings.TrimSpace(*req.OwnerSubject)
+	}
+	if actor.Role == "operator" {
+		// An invited operator starts with a personal credential by default. A
+		// shared credential is an explicit exception: it must name an existing
+		// durable namespace for which this actor has a manager grant. This lets a
+		// namespace owner delegate a team folder without turning every operator
+		// into a workspace-wide connection administrator.
+		if req.ConnectionScope == nil {
+			scope = ConnectionScopePersonal
+		}
+		switch scope {
+		case ConnectionScopePersonal:
+			if ownerSubject != "" && ownerSubject != actor.UserID {
+				writeJSON(w, http.StatusForbidden, map[string]string{"error": "a personal connection must be owned by its creator"})
+				return
+			}
+			ownerSubject = actor.UserID
+		case ConnectionScopeShared:
+			// A label can be minted by an old console during a rolling upgrade;
+			// it is not proof of a pre-existing delegated boundary. Require the
+			// opaque ID so a shared connection is never created merely by typing a
+			// new folder name.
+			if namespaceID == "" {
+				writeJSON(w, http.StatusForbidden, map[string]string{"error": "choose a managed connection namespace before creating a shared connection"})
+				return
+			}
+		case ConnectionScopeService:
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "operators may not create service connections"})
+			return
+		}
+		if connectionNamespace != "" && namespaceID == "" {
+			// Do not let the legacy label path create a folder on behalf of an
+			// invited operator. Their Personal namespace is created automatically;
+			// every other destination must be an already-delegated durable ID.
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "use your automatic Personal namespace or select a delegated connection namespace by ID"})
+			return
+		}
+	}
+	if scope == ConnectionScopePersonal && ownerSubject == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ownerSubject is required for a personal connection"})
+		return
+	}
+	if scope != ConnectionScopePersonal {
+		ownerSubject = ""
+	}
+	var namespace ConnectionNamespace
+	var err error
+	if actor.Role == "operator" && scope == ConnectionScopePersonal && namespaceID == "" && connectionNamespace == "" {
+		namespace, err = c.defaultPersonalConnectionNamespace(r.Context(), actor)
+	} else {
+		// A manager grant permits an operator to use an existing folder, never
+		// to mint one. This also closes legacy-label paths that could otherwise
+		// turn a personal creation into a future shared/root authority boundary.
+		createIfMissing := actor.Role != "operator"
+		namespace, err = c.resolveManagedConnectionNamespace(
+			r.Context(), actor, namespaceID, connectionNamespace, createIfMissing,
+		)
+	}
+	if err != nil {
+		writeConnectionNamespaceResolutionError(w, err)
 		return
 	}
 	if err := upstreamoauth.ValidateUpstreamURL(strings.TrimSpace(req.URL)); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "url must be a valid https URL"})
 		return
 	}
-	a := Account{Name: name, Label: friendly, Group: strings.TrimSpace(req.Group), URL: strings.TrimSpace(req.URL), AuthMode: "oauth"}
+	a := Account{
+		Name:                  name,
+		Label:                 friendly,
+		Group:                 namespace.Label,
+		URL:                   strings.TrimSpace(req.URL),
+		AuthMode:              "oauth",
+		ConnectionNamespaceID: namespace.ID,
+		ConnectionScope:       scope,
+		OwnerSubject:          ownerSubject,
+	}
 	if t := strings.TrimSpace(req.BearerToken); t != "" {
 		a.AuthMode, a.BearerToken = "token", t
 	}
-	if err := c.store.Upsert(r.Context(), a); err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+	if err := c.store.Create(r.Context(), a); err != nil {
+		if errors.Is(err, ErrAccountExists) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "tool prefix " + strconv.Quote(name) + " already exists; choose a unique toolPrefix"})
+			return
+		}
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "could not save connection"})
+		return
+	}
+	created, found := c.store.Account(name)
+	if !found {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "connection could not be read after creation"})
 		return
 	}
 	if a.AuthMode == "token" {
 		_, _ = c.gw.AddAccount(r.Context(), name) // aggregate immediately; tools appear live
 	}
-	writeJSON(w, http.StatusCreated, toDTO(a))
+	writeJSON(w, http.StatusCreated, toDTO(created))
 }
 
 func (c *ConsoleAPI) handleServerByID(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	a, actor, ok := c.managedAccount(w, r, id)
+	if !ok {
+		return
+	}
 	switch r.Method {
 	case http.MethodDelete:
-		c.gw.RemoveAccount(id)
-		if err := c.store.Delete(r.Context(), id); err != nil {
-			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		if err := c.store.Delete(r.Context(), id, a.IncarnationID, a.Revision); err != nil {
+			if errors.Is(err, ErrAccountIncarnation) {
+				writeJSON(w, http.StatusConflict, map[string]string{"error": "connection changed; reload and try again"})
+				return
+			}
+			if errors.Is(err, ErrConnectionNamespaceRevision) {
+				writeJSON(w, http.StatusConflict, map[string]string{"error": "connection changed; reload and try again"})
+				return
+			}
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "could not delete connection"})
 			return
 		}
+		c.gw.RemoveAccount(id, a.IncarnationID)
 		w.WriteHeader(http.StatusNoContent)
 	case http.MethodPatch:
-		c.update(w, r, id)
+		c.update(w, r, a, actor)
 	default:
+		w.Header().Set("Allow", "PATCH, DELETE")
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
 }
 
-func (c *ConsoleAPI) update(w http.ResponseWriter, r *http.Request, id string) {
-	a, ok := c.store.Account(id)
-	if !ok {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
-		return
-	}
+func (c *ConsoleAPI) update(w http.ResponseWriter, r *http.Request, a Account, actor PlatformActor) {
 	var req struct {
-		DisplayName *string `json:"displayName"`
-		Group       *string `json:"group"`
-		ReadOnly    *bool   `json:"readOnly"`
+		DisplayName           *string          `json:"displayName"`
+		ConnectionNamespace   *string          `json:"connectionNamespace"`
+		ConnectionNamespaceID *string          `json:"connectionNamespaceId"`
+		ConnectionScope       *ConnectionScope `json:"connectionScope"`
+		OwnerSubject          *string          `json:"ownerSubject"`
+		Revision              *int64           `json:"revision"`
+		Group                 *string          `json:"group"`
+		ReadOnly              *bool            `json:"readOnly"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
 		return
 	}
-	label, group := a.Label, a.Group
+	label := a.Label
+	labelPresent := req.DisplayName != nil
+	namespacePresent := req.ConnectionNamespaceID != nil || req.ConnectionNamespace != nil || req.Group != nil
+	assignmentPresent := namespacePresent || req.ConnectionScope != nil || req.OwnerSubject != nil
 	if req.DisplayName != nil {
 		d := strings.TrimSpace(*req.DisplayName)
 		if d == "" {
@@ -908,34 +1601,157 @@ func (c *ConsoleAPI) update(w http.ResponseWriter, r *http.Request, id string) {
 		}
 		label = d
 	}
-	if req.Group != nil {
-		group = strings.TrimSpace(*req.Group)
-	}
-	// ponytail: rename changes only the display Label, NOT Name — so Claude's
-	// tool prefix (notion_lelapa__) stays stable instead of churning on rename.
-	if err := c.store.SetMeta(r.Context(), id, label, group); err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+	if req.ConnectionNamespace != nil && req.Group != nil &&
+		strings.TrimSpace(*req.ConnectionNamespace) != strings.TrimSpace(*req.Group) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "connectionNamespace and group must match when both are provided"})
 		return
 	}
-	if req.ReadOnly != nil {
-		if err := c.store.SetReadOnly(r.Context(), id, *req.ReadOnly); err != nil {
+	legacyNamespace := ""
+	if req.ConnectionNamespace != nil {
+		legacyNamespace = strings.TrimSpace(*req.ConnectionNamespace)
+	} else if req.Group != nil {
+		legacyNamespace = strings.TrimSpace(*req.Group)
+	}
+	requestedNamespaceID := ""
+	if req.ConnectionNamespaceID != nil {
+		requestedNamespaceID = strings.TrimSpace(*req.ConnectionNamespaceID)
+	}
+	// ponytail: rename changes only the display Label, NOT Name — so Claude's
+	// tool prefix (lelapa_notion__) stays stable instead of churning on rename.
+	// Re-read immediately before mutating. This retains omitted fields and,
+	// more importantly, prevents a stale manager from overwriting an ownership
+	// transition which completed between the initial authorization check and
+	// this request body being parsed.
+	current, exists := c.store.Account(a.Name)
+	if !exists || !c.canManageAccount(r.Context(), actor, current) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "connection not found"})
+		return
+	}
+	a = current
+	if !labelPresent {
+		label = a.Label
+	}
+	if assignmentPresent {
+		targetID := a.ConnectionNamespaceID
+		if actor.Role == "operator" && requestedNamespaceID == "" && legacyNamespace != "" {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "select a delegated connection namespace by ID"})
+			return
+		}
+		if requestedNamespaceID != "" || legacyNamespace != "" {
+			namespace, err := c.resolveManagedConnectionNamespace(
+				r.Context(), actor, requestedNamespaceID, legacyNamespace,
+				actor.Role != "operator",
+			)
+			if err != nil {
+				writeConnectionNamespaceResolutionError(w, err)
+				return
+			}
+			targetID = namespace.ID
+		}
+		scope := a.ConnectionScope
+		if req.ConnectionScope != nil {
+			var scopeErr error
+			scope, scopeErr = normalizedConnectionScope(*req.ConnectionScope)
+			if scopeErr != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid connection scope"})
+				return
+			}
+		}
+		ownerSubject := a.OwnerSubject
+		if req.OwnerSubject != nil {
+			ownerSubject = strings.TrimSpace(*req.OwnerSubject)
+		}
+		if scope == ConnectionScopePersonal && ownerSubject == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ownerSubject is required for a personal connection"})
+			return
+		}
+		if scope != ConnectionScopePersonal {
+			ownerSubject = ""
+		}
+		if !connectionNamespaceAdministrator(actor) &&
+			(scope != a.ConnectionScope || ownerSubject != a.OwnerSubject) {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "only a workspace administrator may change connection scope"})
+			return
+		}
+		if targetID == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "connection namespace is required"})
+			return
+		}
+		target, found := c.connectionNamespaceStore()
+		if !found {
+			writeJSON(w, http.StatusNotImplemented, map[string]string{"error": "connection namespaces are not supported by this store"})
+			return
+		}
+		ns, found := target.ConnectionNamespace(r.Context(), targetID)
+		if !found || !c.canManageConnectionNamespace(actor, ns) {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "connection namespace access is not permitted"})
+			return
+		}
+		expectedRevision := a.Revision
+		if req.Revision != nil {
+			expectedRevision = *req.Revision
+		}
+		if expectedRevision < 1 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "revision must be positive"})
+			return
+		}
+		updated, err := c.gw.MoveAccountToConnectionNamespace(r.Context(), a.Name, a.IncarnationID, AccountConnectionAssignment{
+			ConnectionNamespaceID: ns.ID,
+			Scope:                 scope,
+			OwnerSubject:          ownerSubject,
+		}, expectedRevision)
+		if err != nil {
+			switch {
+			case errors.Is(err, ErrConnectionNamespaceRevision), errors.Is(err, ErrAccountIncarnation):
+				writeJSON(w, http.StatusConflict, map[string]string{"error": "connection changed; refresh and try again"})
+			case errors.Is(err, ErrConnectionNamespaceNotFound), errors.Is(err, ErrAccountNotFound):
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": "connection or namespace not found"})
+			case errors.Is(err, ErrInvalidConnectionScope):
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid connection assignment"})
+			default:
+				writeJSON(w, http.StatusBadGateway, map[string]string{"error": "could not move connection"})
+			}
+			return
+		}
+		a = updated
+	}
+	if labelPresent || req.ReadOnly != nil {
+		mutation := AccountPolicyMutation{ReadOnly: req.ReadOnly}
+		if labelPresent {
+			mutation.Label = &label
+		}
+		updated, err := c.store.UpdateAccountPolicy(r.Context(), a.Name, accountPolicyPrecondition(a), mutation)
+		if err != nil {
+			writeAccountPolicyMutationError(w, err, "could not update connection")
+			return
+		}
+		a = updated
+	}
+	// A namespace-only move changes account ownership metadata, not live tool
+	// identity or policy. Label/read-only fields always trigger reaggregation,
+	// even when their persisted values already match: that makes retrying a
+	// previous upstream failure repair the stale live cache.
+	if labelPresent || req.ReadOnly != nil {
+		if _, err := c.gw.ReplaceAccount(r.Context(), a.Name); err != nil {
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 			return
 		}
-		a.ReadOnly = *req.ReadOnly
 	}
-	// re-aggregate so tool titles reflect the new label and the registered
-	// toolset honors a flipped ReadOnly immediately
-	_, _ = c.gw.ReplaceAccount(r.Context(), id)
-	a.Label, a.Group = label, group
+	if persisted, found := c.store.Account(a.Name); found {
+		a = persisted
+	}
 	writeJSON(w, http.StatusOK, toDTO(a))
 }
 
 func (c *ConsoleAPI) handleConnect(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	a, ok := c.store.Account(id)
+	a, _, ok := c.managedAccount(w, r, id)
 	if !ok {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
 	// Optional body selects the connect path. No body / all-empty fields → DCR
@@ -994,17 +1810,32 @@ func (c *ConsoleAPI) handleOAuthCallback(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if _, _, err := c.conn.FinishConnect(r.Context(), state, code); err != nil {
-		http.Redirect(w, r, c.consoleURL+"/?connect=error", http.StatusFound)
+		http.Redirect(w, r, c.consoleURL+"/?connect="+oauthConnectReturnState(err), http.StatusFound)
 		return
 	}
 	http.Redirect(w, r, c.consoleURL+"/?connect=ok", http.StatusFound)
 }
 
+// oauthConnectReturnState maps only our durable stale-account outcomes to a
+// safe recovery instruction. It deliberately never exposes an upstream OAuth
+// provider response or credential detail in a browser redirect.
+func oauthConnectReturnState(err error) string {
+	switch {
+	case errors.Is(err, ErrConnectAccountDeleted),
+		errors.Is(err, ErrConnectAccountURLChanged),
+		errors.Is(err, ErrConnectAccountReplaced),
+		errors.Is(err, ErrConnectAccountMoved),
+		errors.Is(err, ErrAccountIncarnation):
+		return "changed"
+	default:
+		return "error"
+	}
+}
+
 func (c *ConsoleAPI) handleToken(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	a, ok := c.store.Account(id)
+	a, _, ok := c.managedAccount(w, r, id)
 	if !ok {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 		return
 	}
 	var req struct{ Token string }
@@ -1012,13 +1843,20 @@ func (c *ConsoleAPI) handleToken(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "token is required"})
 		return
 	}
-	a.AuthMode, a.BearerToken = "token", strings.TrimSpace(req.Token)
-	if err := c.store.Upsert(r.Context(), a); err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+	updated, err := c.store.SetBearerToken(r.Context(), a.Name, a.IncarnationID, strings.TrimSpace(req.Token), a.Revision)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrAccountNotFound):
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "connection not found"})
+		case errors.Is(err, ErrConnectionNamespaceRevision), errors.Is(err, ErrAccountIncarnation):
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "connection changed; refresh and try again"})
+		default:
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "could not save connection token"})
+		}
 		return
 	}
-	_, _ = c.gw.ReplaceAccount(r.Context(), id)
-	writeJSON(w, http.StatusOK, toDTO(a))
+	_, _ = c.gw.ReplaceAccount(r.Context(), updated.Name)
+	writeJSON(w, http.StatusOK, toDTO(updated))
 }
 
 // --- helpers ---

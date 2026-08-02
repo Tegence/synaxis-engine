@@ -1,6 +1,7 @@
 package oauthas
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -114,5 +115,40 @@ func TestConnectorEpochRevocation(t *testing.T) {
 	}
 	if !rootLeft {
 		t.Fatal("refresh grants for other resources must survive")
+	}
+}
+
+func TestRevokeAllInvalidatesWorkspaceAccessAndRefreshGrants(t *testing.T) {
+	s := New("https://gw.example.com", "pw", "secret-0123456789")
+	s.SetEpochLookup(func(path string) (string, bool) {
+		return "resource-epoch", path == "/mcp"
+	})
+
+	token, ok := s.signAccess("client-1", "https://gw.example.com/mcp")
+	if !ok || !s.validAccess(token, "/mcp") {
+		t.Fatal("pre-revocation token must be valid")
+	}
+	s.mu.Lock()
+	s.refresh["rt-root"] = refreshGrant{clientID: "client-1", resource: "/mcp"}
+	s.codes["code-root"] = authCode{clientID: "client-1", resource: "/mcp"}
+	s.mu.Unlock()
+
+	if err := s.RevokeAll(context.Background()); err != nil {
+		t.Fatalf("RevokeAll: %v", err)
+	}
+
+	if s.validAccess(token, "/mcp") {
+		t.Fatal("workspace-wide revocation must invalidate outstanding access tokens")
+	}
+	s.mu.Lock()
+	refreshCount := len(s.refresh)
+	codeCount := len(s.codes)
+	s.mu.Unlock()
+	if refreshCount != 0 || codeCount != 0 {
+		t.Fatalf("workspace-wide revocation left refresh=%d codes=%d", refreshCount, codeCount)
+	}
+	newToken, ok := s.signAccess("client-1", "https://gw.example.com/mcp")
+	if !ok || !s.validAccess(newToken, "/mcp") {
+		t.Fatal("legitimate members must be able to reauthorize after revocation")
 	}
 }

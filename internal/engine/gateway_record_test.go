@@ -160,6 +160,10 @@ func TestRecordingPerConnectorFlag(t *testing.T) {
 	if !ok {
 		t.Fatalf("no row attributed to connector rec: %+v", rows)
 	}
+	recConfig, _ := g.store.(ConnectorStore).VirtualConnector(ctx, "rec")
+	if rec.EndpointKind != endpointKindConnector || rec.EndpointGeneration != recConfig.Epoch {
+		t.Fatalf("recording connector row lost endpoint identity: %+v", rec)
+	}
 	if !strings.Contains(rec.Args, `"key":"val"`) || !strings.Contains(rec.Result, "got-upstream") {
 		t.Fatalf("recording connector must capture payloads: args=%q result=%q", rec.Args, rec.Result)
 	}
@@ -169,6 +173,10 @@ func TestRecordingPerConnectorFlag(t *testing.T) {
 	}
 	if norec.Args != "" || norec.Result != "" {
 		t.Fatalf("non-recording connector must stay summary-only: args=%q result=%q", norec.Args, norec.Result)
+	}
+	norecConfig, _ := g.store.(ConnectorStore).VirtualConnector(ctx, "norec")
+	if norec.EndpointKind != endpointKindConnector || norec.EndpointGeneration != norecConfig.Epoch {
+		t.Fatalf("summary connector row lost endpoint identity: %+v", norec)
 	}
 
 	// The connector Record flag must not leak onto the default /mcp endpoint.
@@ -316,6 +324,72 @@ func TestReplayMutatingRequiresForce(t *testing.T) {
 	}
 }
 
+func TestReplayRejectsDeletedOrCrossKindReusedEndpoint(t *testing.T) {
+	g, fs, saves := newRecorderGateway(t)
+	ctx := context.Background()
+	if err := g.UpsertConnector(ctx, VirtualConnector{
+		Slug: "shared", Label: "Connector",
+		Tools: map[string][]string{"linear": {"save_issue"}}, Record: true,
+	}); err != nil {
+		t.Fatalf("create connector: %v", err)
+	}
+	callConnectorTool(t, g, "shared", "linear__save_issue")
+	original := callRows(t, fs, "save_issue")[0]
+	if original.EndpointKind != endpointKindConnector || original.EndpointGeneration == "" {
+		t.Fatalf("original audit row lacks endpoint identity: %+v", original)
+	}
+	if atomic.LoadInt32(saves) != 1 {
+		t.Fatalf("setup dispatch count = %d, want 1", atomic.LoadInt32(saves))
+	}
+
+	if err := g.DeleteConnector(ctx, "shared"); err != nil {
+		t.Fatalf("delete connector: %v", err)
+	}
+	if _, err := g.CreateNamespace(ctx, Namespace{
+		Slug: "shared", Label: "Namespace reuse", Accounts: []string{"linear"},
+	}); err != nil {
+		t.Fatalf("reuse slug as namespace: %v", err)
+	}
+	if _, err := g.Replay(ctx, original.ID, true); err == nil ||
+		!strings.Contains(err.Error(), `connector "shared" was deleted or replaced`) {
+		t.Fatalf("replay across endpoint reuse = %v, want identity error", err)
+	}
+	if atomic.LoadInt32(saves) != 1 {
+		t.Fatal("identity-rejected replay dispatched upstream")
+	}
+}
+
+func TestReplayRejectsToolRemovedFromCurrentConnectorAllowlist(t *testing.T) {
+	g, fs, saves := newRecorderGateway(t)
+	ctx := context.Background()
+	if err := g.UpsertConnector(ctx, VirtualConnector{
+		Slug: "curated", Label: "Curated",
+		Tools: map[string][]string{"linear": {"save_issue"}}, Record: true,
+	}); err != nil {
+		t.Fatalf("create connector: %v", err)
+	}
+	callConnectorTool(t, g, "curated", "linear__save_issue")
+	original := callRows(t, fs, "save_issue")[0]
+	if atomic.LoadInt32(saves) != 1 {
+		t.Fatalf("setup dispatch count = %d, want 1", atomic.LoadInt32(saves))
+	}
+
+	// Upsert preserves the connector generation but removes this tool from its
+	// current authorization boundary.
+	if err := g.UpsertConnector(ctx, VirtualConnector{
+		Slug: "curated", Label: "Curated", Tools: map[string][]string{}, Record: true,
+	}); err != nil {
+		t.Fatalf("remove tool from connector: %v", err)
+	}
+	if _, err := g.Replay(ctx, original.ID, true); err == nil ||
+		!strings.Contains(err.Error(), "no longer exposes linear/save_issue") {
+		t.Fatalf("replay after allowlist removal = %v, want fail-closed error", err)
+	}
+	if atomic.LoadInt32(saves) != 1 {
+		t.Fatal("allowlist-rejected replay dispatched upstream")
+	}
+}
+
 func TestReplayErrors(t *testing.T) {
 	g, fs, _ := newRecorderGateway(t)
 	ctx := context.Background()
@@ -346,6 +420,24 @@ func TestReplayErrors(t *testing.T) {
 	}
 	if _, err := g.Replay(ctx, ghostID, true); err == nil || !strings.Contains(err.Error(), "ghost") {
 		t.Fatalf("missing account: want error naming the account, got %v", err)
+	}
+
+	// Legacy connector-attributed rows predate endpoint kind/generation. They
+	// cannot safely distinguish a current endpoint from a reused slug.
+	fs.LogCall(CallRecord{
+		Account: "linear", Tool: "get_issue", Connector: "legacy", OK: true, Args: `{"a":1}`,
+	})
+	rows, _ = fs.RecentCalls(ctx, 10)
+	var legacyID int64
+	for _, r := range rows {
+		if r.Connector == "legacy" {
+			legacyID = r.ID
+			break
+		}
+	}
+	if _, err := g.Replay(ctx, legacyID, true); err == nil ||
+		!strings.Contains(err.Error(), "no endpoint generation") {
+		t.Fatalf("legacy attributed replay = %v, want fail-closed generation error", err)
 	}
 }
 

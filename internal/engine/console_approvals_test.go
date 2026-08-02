@@ -52,7 +52,7 @@ func TestApprovalAPIListAndDecide(t *testing.T) {
 	}
 
 	// APPROVE ap1 — happy path.
-	rec, got := doJSON(t, mux, tok, http.MethodPost, "/api/approvals/ap1/approve", "")
+	rec, got := doJSON(t, mux, tok, http.MethodPost, "/api/approvals/ap1/approve", `{"note":"verified in Linear"}`)
 	if rec.Code != http.StatusOK || got["id"] != "ap1" || got["status"] != "approved" {
 		t.Fatalf("approve = %d %v", rec.Code, got)
 	}
@@ -72,18 +72,24 @@ func TestApprovalAPIListAndDecide(t *testing.T) {
 	for _, p := range list {
 		byID[p.ID] = p
 	}
-	if byID["ap1"].Status != "approved" || byID["ap1"].DecidedAt == nil {
+	if byID["ap1"].Status != "approved" || byID["ap1"].DecidedAt == nil ||
+		byID["ap1"].DecidedBy != "local-admin" || byID["ap1"].DecisionNote != "verified in Linear" {
 		t.Fatalf("ap1 decision not recorded: %+v", byID["ap1"])
 	}
 	if byID["ap2"].Status != "denied" {
 		t.Fatalf("ap2 decision not recorded: %+v", byID["ap2"])
 	}
 
-	// DOUBLE-DECIDE: already decided → 409 (both verbs).
-	rec, _ = doJSON(t, mux, tok, http.MethodPost, "/api/approvals/ap1/approve", "")
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("double approve = %d, want 409 (body %s)", rec.Code, rec.Body)
+	// DOUBLE-DECIDE: retrying the SAME decision is idempotent, so a flaky
+	// client can safely retry an approval click without turning it into a 409.
+	rec, got = doJSON(t, mux, tok, http.MethodPost, "/api/approvals/ap1/approve", `{"note":"retry ignored"}`)
+	if rec.Code != http.StatusOK || got["status"] != "approved" {
+		t.Fatalf("double approve = %d %v, want idempotent 200 approved", rec.Code, got)
 	}
+	if got["decided_by"] != "local-admin" || got["decision_note"] != "verified in Linear" {
+		t.Fatalf("idempotent response must preserve original decision metadata, got %v", got)
+	}
+	// A contradictory decision still conflicts and must not overwrite history.
 	rec, _ = doJSON(t, mux, tok, http.MethodPost, "/api/approvals/ap1/deny", "")
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("deny after approve = %d, want 409", rec.Code)

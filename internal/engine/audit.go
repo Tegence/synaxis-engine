@@ -20,9 +20,14 @@ type CallRecord struct {
 	Ms        int64     `json:"ms"`
 	Error     string    `json:"error,omitempty"`
 	Connector string    `json:"connector,omitempty"` // "" = default /mcp endpoint
-	Decision  string    `json:"decision,omitempty"`  // ""|approved|denied|expired|replay
-	Args      string    `json:"args,omitempty"`      // detail-only (never in list reads)
-	Result    string    `json:"result,omitempty"`    // detail-only (never in list reads)
+	// EndpointKind and EndpointGeneration bind a connector-attributed audit
+	// row to the exact endpoint incarnation that accepted the call. Replay
+	// rejects legacy/mismatched identity rather than following a reused slug.
+	EndpointKind       string `json:"endpointKind,omitempty"`
+	EndpointGeneration string `json:"endpointGeneration,omitempty"`
+	Decision           string `json:"decision,omitempty"` // ""|approved|denied|expired|replay
+	Args               string `json:"args,omitempty"`     // detail-only (never in list reads)
+	Result             string `json:"result,omitempty"`   // detail-only (never in list reads)
 
 	// Guard is the comma-joined response-guardrail markers applied to this
 	// call's result ("truncated", "redacted:N", "flagged:injection"). Tiny,

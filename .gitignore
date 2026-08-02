@@ -1,0 +1,22 @@
+# Local secrets. Keep the committed template available.
+.env
+.env.*
+!.env.example
+
+# Local file-store data.
+accounts.json
+accounts.json.*
+
+# Go binaries and test output.
+bin/
+/engine
+/server
+/notionauth
+*.test
+coverage.out
+coverage.html
+*.coverprofile
+
+# Editor and operating-system metadata.
+.gstack/
+.DS_Store

@@ -2,6 +2,7 @@ package engine
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -15,6 +16,20 @@ import (
 
 var toolAliasPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,128}$`)
 
+// writeAccountPolicyMutationError keeps a concurrent ownership transition
+// indistinguishable from any other stale console snapshot. In particular, a
+// former namespace manager must not learn the destination folder through an
+// error response after their authorization was revoked.
+func writeAccountPolicyMutationError(w http.ResponseWriter, err error, fallback string) {
+	if errors.Is(err, ErrAccountPolicyPrecondition) ||
+		errors.Is(err, ErrAccountIncarnation) ||
+		errors.Is(err, ErrConnectionNamespaceRevision) {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "connection changed; refresh and try again"})
+		return
+	}
+	writeJSON(w, http.StatusBadGateway, map[string]string{"error": fallback})
+}
+
 // handleToolPolicy persists one tool's model-visible alias/description and
 // enabled state. Connector allowlists keep using the stable upstream name.
 func (c *ConsoleAPI) handleToolPolicy(w http.ResponseWriter, r *http.Request) {
@@ -23,9 +38,8 @@ func (c *ConsoleAPI) handleToolPolicy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	accountID, toolName := r.PathValue("id"), r.PathValue("tool")
-	account, ok := c.store.Account(accountID)
+	account, _, ok := c.managedAccount(w, r, accountID)
 	if !ok {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "account not found"})
 		return
 	}
 	tools, err := c.gw.ListAccountTools(r.Context(), accountID)
@@ -99,12 +113,20 @@ func (c *ConsoleAPI) handleToolPolicy(w http.ResponseWriter, r *http.Request) {
 			disabled = appendUnique(disabled, toolName)
 		}
 	}
-	if err := c.store.SetDisabledTools(r.Context(), accountID, disabled); err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
-		return
+	overrides := copyAccount(account).ToolOverrides
+	if overrides == nil {
+		overrides = map[string]ToolOverride{}
 	}
-	if err := c.store.SetToolOverride(r.Context(), accountID, toolName, override); err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+	if override.Alias == "" && override.Description == "" {
+		delete(overrides, toolName)
+	} else {
+		overrides[toolName] = override
+	}
+	if _, err := c.store.UpdateAccountPolicy(r.Context(), accountID, accountPolicyPrecondition(account), AccountPolicyMutation{
+		DisabledTools: &disabled,
+		ToolOverrides: &overrides,
+	}); err != nil {
+		writeAccountPolicyMutationError(w, err, "could not update connection policy")
 		return
 	}
 	if _, err := c.gw.ReplaceAccount(r.Context(), accountID); err != nil {
@@ -183,13 +205,8 @@ func (c *ConsoleAPI) handleLogTriage(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid call id"})
 		return
 	}
-	rec, ok, err := c.gw.CallDetail(r.Context(), id)
-	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
-		return
-	}
+	rec, actor, ok := c.visibleCallRecord(w, r, id)
 	if !ok {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "call not found"})
 		return
 	}
 	if !strings.Contains(rec.Guard, "flagged:injection") {
@@ -206,13 +223,14 @@ func (c *ConsoleAPI) handleLogTriage(w http.ResponseWriter, r *http.Request) {
 	var triage string
 	switch req.Action {
 	case "block":
-		account, exists := c.store.Account(rec.Account)
-		if !exists {
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "account no longer exists"})
+		account, found := c.store.Account(rec.Account)
+		if !found || !c.canManageAccount(r.Context(), actor, account) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "connection not found"})
 			return
 		}
-		if err := c.store.SetDisabledTools(r.Context(), rec.Account, appendUnique(account.DisabledTools, rec.Tool)); err != nil {
-			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		disabled := appendUnique(account.DisabledTools, rec.Tool)
+		if _, err := c.store.UpdateAccountPolicy(r.Context(), rec.Account, accountPolicyPrecondition(account), AccountPolicyMutation{DisabledTools: &disabled}); err != nil {
+			writeAccountPolicyMutationError(w, err, "could not block tool")
 			return
 		}
 		if _, err := c.gw.ReplaceAccount(r.Context(), rec.Account); err != nil {
@@ -221,6 +239,13 @@ func (c *ConsoleAPI) handleLogTriage(w http.ResponseWriter, r *http.Request) {
 		}
 		triage = "blocked"
 	case "require_approval":
+		if !connectionNamespaceAdministrator(actor) {
+			// Connector approval policy changes a shared delivery endpoint,
+			// potentially for several credential namespaces.  Keep that
+			// workspace-wide policy decision with administrators.
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "workspace administration is required"})
+			return
+		}
 		if !c.connectorsSupported(w) {
 			return
 		}
@@ -261,13 +286,14 @@ func (c *ConsoleAPI) handleLogTriage(w http.ResponseWriter, r *http.Request) {
 }
 
 type portableAccount struct {
-	Name          string                  `json:"name"`
-	DisplayName   string                  `json:"displayName"`
-	Group         string                  `json:"group,omitempty"`
-	URL           string                  `json:"url"`
-	ReadOnly      bool                    `json:"readOnly"`
-	DisabledTools []string                `json:"disabledTools,omitempty"`
-	ToolOverrides map[string]ToolOverride `json:"toolOverrides,omitempty"`
+	Name                string                  `json:"name"`
+	DisplayName         string                  `json:"displayName"`
+	ConnectionNamespace string                  `json:"connectionNamespace,omitempty"`
+	Group               string                  `json:"group,omitempty"` // legacy alias
+	URL                 string                  `json:"url"`
+	ReadOnly            bool                    `json:"readOnly"`
+	DisabledTools       []string                `json:"disabledTools,omitempty"`
+	ToolOverrides       map[string]ToolOverride `json:"toolOverrides,omitempty"`
 }
 
 type portableConnector struct {
@@ -281,14 +307,24 @@ type portableConnector struct {
 	DisableInjectionScan bool                `json:"disableInjectionScan"`
 }
 
+type portableNamespace struct {
+	Slug    string   `json:"slug"`
+	Label   string   `json:"label"`
+	Members []string `json:"members"`
+}
+
 type portableConfig struct {
 	Version    int                 `json:"version"`
 	Issuer     string              `json:"issuer,omitempty"`
 	Accounts   []portableAccount   `json:"accounts"`
 	Connectors []portableConnector `json:"connectors"`
+	Namespaces []portableNamespace `json:"namespaces,omitempty"`
 }
 
 func (c *ConsoleAPI) handlePortableConfig(w http.ResponseWriter, r *http.Request) {
+	if _, ok := c.requireConnectionNamespaceAdministrator(w, r); !ok {
+		return
+	}
 	if r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
@@ -300,7 +336,8 @@ func (c *ConsoleAPI) handlePortableConfig(w http.ResponseWriter, r *http.Request
 			label = account.Name
 		}
 		config.Accounts = append(config.Accounts, portableAccount{
-			Name: account.Name, DisplayName: label, Group: account.Group, URL: account.URL,
+			Name: account.Name, DisplayName: label,
+			ConnectionNamespace: account.Group, Group: account.Group, URL: account.URL,
 			ReadOnly: account.ReadOnly, DisabledTools: account.DisabledTools, ToolOverrides: account.ToolOverrides,
 		})
 	}
@@ -318,6 +355,18 @@ func (c *ConsoleAPI) handlePortableConfig(w http.ResponseWriter, r *http.Request
 			})
 		}
 	}
+	if c.nsStore != nil {
+		namespaces, err := c.nsStore.Namespaces(r.Context())
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+			return
+		}
+		for _, ns := range namespaces {
+			config.Namespaces = append(config.Namespaces, portableNamespace{
+				Slug: ns.Slug, Label: ns.Label, Members: append([]string(nil), ns.Accounts...),
+			})
+		}
+	}
 	writeJSON(w, http.StatusOK, config)
 }
 
@@ -325,6 +374,9 @@ func (c *ConsoleAPI) handlePortableConfig(w http.ResponseWriter, r *http.Request
 // Existing account credentials are preserved; new accounts import disconnected
 // and can be authorized afterward. Unmentioned resources are never deleted.
 func (c *ConsoleAPI) handlePortableConfigImport(w http.ResponseWriter, r *http.Request) {
+	if _, ok := c.requireConnectionNamespaceAdministrator(w, r); !ok {
+		return
+	}
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
@@ -341,8 +393,12 @@ func (c *ConsoleAPI) handlePortableConfigImport(w http.ResponseWriter, r *http.R
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unsupported config version"})
 		return
 	}
-	if len(config.Accounts) > 250 || len(config.Connectors) > 250 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "config exceeds the 250 account/connector limit"})
+	if len(config.Namespaces) > 0 && c.nsStore == nil {
+		writeJSON(w, http.StatusNotImplemented, map[string]string{"error": "namespaces not supported by this store"})
+		return
+	}
+	if len(config.Accounts) > 250 || len(config.Connectors) > 250 || len(config.Namespaces) > 250 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "config exceeds the 250 account/connector/namespace limit"})
 		return
 	}
 
@@ -366,8 +422,27 @@ func (c *ConsoleAPI) handlePortableConfigImport(w http.ResponseWriter, r *http.R
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "displayName is required for account " + strconv.Quote(account.Name)})
 			return
 		}
+		if strings.TrimSpace(account.ConnectionNamespace) != "" &&
+			strings.TrimSpace(account.Group) != "" &&
+			strings.TrimSpace(account.ConnectionNamespace) != strings.TrimSpace(account.Group) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "connectionNamespace and group must match for account " + strconv.Quote(account.Name)})
+			return
+		}
 		if err := upstreamoauth.ValidateUpstreamURL(strings.TrimSpace(account.URL)); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "account " + strconv.Quote(account.Name) + " must use a valid https URL"})
+			return
+		}
+		if existing, ok := c.store.Account(account.Name); ok &&
+			accountHasStoredCredentials(existing) &&
+			!equalAccountURL(existing.URL, account.URL) {
+			// Portable config intentionally contains no credentials. Never let it
+			// retarget credentials already held by this Engine to another origin or
+			// path; the operator must disconnect/re-authorize the account instead.
+			// Keep the response generic because either URL may itself contain
+			// sensitive query material in a legacy record.
+			writeJSON(w, http.StatusConflict, map[string]string{
+				"error": "cannot change the URL of connected account " + strconv.Quote(account.Name) + "; disconnect it first",
+			})
 			return
 		}
 		aliases := map[string]string{}
@@ -387,6 +462,35 @@ func (c *ConsoleAPI) handlePortableConfigImport(w http.ResponseWriter, r *http.R
 			aliases[effective] = tool
 		}
 	}
+	seenNamespaces := map[string]bool{}
+	for i, namespace := range config.Namespaces {
+		if namespace.Slug == "" || slugify(namespace.Slug) != namespace.Slug {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("namespaces[%d].slug must be normalized", i)})
+			return
+		}
+		if seenNamespaces[namespace.Slug] {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "duplicate namespace " + strconv.Quote(namespace.Slug)})
+			return
+		}
+		seenNamespaces[namespace.Slug] = true
+		if strings.TrimSpace(namespace.Label) == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "label is required for namespace " + strconv.Quote(namespace.Slug)})
+			return
+		}
+		for _, account := range normalizedNamespaceAccounts(namespace.Members) {
+			if !knownAccounts[account] {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "namespace " + strconv.Quote(namespace.Slug) + " references unknown account " + strconv.Quote(account)})
+				return
+			}
+		}
+		if c.connStore != nil {
+			if _, exists := c.connStore.VirtualConnector(r.Context(), namespace.Slug); exists {
+				writeJSON(w, http.StatusConflict, map[string]string{"error": "namespace " + strconv.Quote(namespace.Slug) + " conflicts with an existing connector"})
+				return
+			}
+		}
+	}
+
 	seenConnectors := map[string]bool{}
 	for i, connector := range config.Connectors {
 		if connector.Slug == "" || slugify(connector.Slug) != connector.Slug {
@@ -398,6 +502,16 @@ func (c *ConsoleAPI) handlePortableConfigImport(w http.ResponseWriter, r *http.R
 			return
 		}
 		seenConnectors[connector.Slug] = true
+		if seenNamespaces[connector.Slug] {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "endpoint slug " + strconv.Quote(connector.Slug) + " is used by both a connector and namespace"})
+			return
+		}
+		if c.nsStore != nil {
+			if _, exists := c.nsStore.Namespace(r.Context(), connector.Slug); exists {
+				writeJSON(w, http.StatusConflict, map[string]string{"error": "connector " + strconv.Quote(connector.Slug) + " conflicts with an existing namespace"})
+				return
+			}
+		}
 		if strings.TrimSpace(connector.Label) == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "label is required for connector " + strconv.Quote(connector.Slug)})
 			return
@@ -424,24 +538,95 @@ func (c *ConsoleAPI) handlePortableConfigImport(w http.ResponseWriter, r *http.R
 
 	var warnings []string
 	for _, imported := range config.Accounts {
-		account, exists := c.store.Account(imported.Name)
-		if !exists {
-			account = Account{Name: imported.Name, AuthMode: "oauth"}
+		update := PortableAccountConfig{
+			Label: strings.TrimSpace(imported.DisplayName), URL: strings.TrimSpace(imported.URL),
+			ReadOnly: imported.ReadOnly, DisabledTools: append([]string(nil), imported.DisabledTools...),
+			ToolOverrides: imported.ToolOverrides,
 		}
-		account.Label = strings.TrimSpace(imported.DisplayName)
-		account.Group = strings.TrimSpace(imported.Group)
-		account.URL = strings.TrimSpace(imported.URL)
-		account.ReadOnly = imported.ReadOnly
-		account.DisabledTools = append([]string(nil), imported.DisabledTools...)
-		account.ToolOverrides = imported.ToolOverrides
-		if err := c.store.Upsert(r.Context(), account); err != nil {
-			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		account, exists := c.store.Account(imported.Name)
+		if exists {
+			// Existing accounts must retain the ownership boundary that is
+			// current at commit time. A portable export has no stable namespace
+			// ID, so replaying its legacy Group against a newer account snapshot
+			// could otherwise undo a concurrent move.
+			updater, ok := c.store.(PortableAccountConfigStore)
+			if !ok {
+				writeJSON(w, http.StatusNotImplemented, map[string]string{"error": "portable updates are not supported by this store"})
+				return
+			}
+			var err error
+			account, err = updater.UpdatePortableAccountConfig(r.Context(), imported.Name, update)
+			if err != nil {
+				switch {
+				case errors.Is(err, ErrConnectAccountURLChanged):
+					writeJSON(w, http.StatusConflict, map[string]string{"error": "cannot change the URL of connected account " + strconv.Quote(imported.Name) + "; disconnect it first"})
+				case errors.Is(err, ErrAccountNotFound):
+					writeJSON(w, http.StatusConflict, map[string]string{"error": "connection changed while importing; retry the import"})
+				default:
+					writeJSON(w, http.StatusBadGateway, map[string]string{"error": "could not update account configuration"})
+				}
+				return
+			}
+		} else {
+			group := strings.TrimSpace(imported.ConnectionNamespace)
+			if group == "" {
+				group = strings.TrimSpace(imported.Group)
+			}
+			account = Account{
+				Name: imported.Name, AuthMode: "oauth", Group: group,
+				Label: update.Label, URL: update.URL, ReadOnly: update.ReadOnly,
+				DisabledTools: update.DisabledTools, ToolOverrides: update.ToolOverrides,
+			}
+			// Create rather than Upsert so a concurrent connection is never
+			// replaced by the import's stale, credential-free snapshot.
+			if err := c.store.Create(r.Context(), account); err != nil {
+				if errors.Is(err, ErrAccountExists) {
+					writeJSON(w, http.StatusConflict, map[string]string{"error": "connection changed while importing; retry the import"})
+				} else {
+					writeJSON(w, http.StatusBadGateway, map[string]string{"error": "could not create account configuration"})
+				}
+				return
+			}
+			var found bool
+			account, found = c.store.Account(imported.Name)
+			if !found {
+				writeJSON(w, http.StatusBadGateway, map[string]string{"error": "account could not be read after import"})
+				return
+			}
+		}
+		if c.store.Token(account.Name) != "" || c.store.RefreshToken(account.Name) != "" {
+			if _, err := c.gw.ReplaceAccount(r.Context(), account.Name); err != nil {
+				warnings = append(warnings, account.Name+": "+err.Error())
+			}
+		} else {
+			current, ok := c.store.Account(account.Name)
+			if ok {
+				c.gw.RemoveAccount(account.Name, current.IncarnationID)
+			}
+		}
+	}
+	for _, imported := range config.Namespaces {
+		if c.nsStore == nil {
+			writeJSON(w, http.StatusNotImplemented, map[string]string{"error": "namespaces not supported by this store"})
 			return
 		}
-		c.gw.RemoveAccount(account.Name)
-		if c.store.Token(account.Name) != "" || c.store.RefreshToken(account.Name) != "" {
-			if _, err := c.gw.AddAccount(r.Context(), account.Name); err != nil {
-				warnings = append(warnings, account.Name+": "+err.Error())
+		members := normalizedNamespaceAccounts(imported.Members)
+		if current, ok := c.nsStore.Namespace(r.Context(), imported.Slug); ok {
+			if _, err := c.gw.UpdateNamespace(r.Context(), Namespace{
+				Slug: imported.Slug, Label: strings.TrimSpace(imported.Label), Accounts: members,
+			}, NamespacePrecondition{
+				Generation: current.Epoch,
+				Revision:   current.Revision,
+			}); err != nil {
+				writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+				return
+			}
+		} else {
+			if _, err := c.gw.CreateNamespace(r.Context(), Namespace{
+				Slug: imported.Slug, Label: strings.TrimSpace(imported.Label), Accounts: members,
+			}); err != nil {
+				writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+				return
 			}
 		}
 	}
@@ -459,8 +644,14 @@ func (c *ConsoleAPI) handlePortableConfigImport(w http.ResponseWriter, r *http.R
 		warnings = []string{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"accountsImported": len(config.Accounts), "connectorsImported": len(config.Connectors), "warnings": warnings,
+		"accountsImported": len(config.Accounts), "connectorsImported": len(config.Connectors),
+		"namespacesImported": len(config.Namespaces), "warnings": warnings,
 	})
+}
+
+func accountHasStoredCredentials(account Account) bool {
+	return account.BearerToken != "" || account.AccessToken != "" ||
+		account.RefreshToken != "" || account.ClientSecret != ""
 }
 
 func appendUnique(items []string, value string) []string {

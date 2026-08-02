@@ -23,7 +23,8 @@ func TestRingPayloadListVsDetail(t *testing.T) {
 	s := &FileStore{}
 	s.LogCall(CallRecord{
 		Account: "acct1", Tool: "save_issue", OK: true, Ms: 42,
-		Connector: "eng", Decision: "approved",
+		Connector: "eng", EndpointKind: endpointKindConnector,
+		EndpointGeneration: "connector-generation", Decision: "approved",
 		Args:   `{"id":"42"}`,
 		Result: `{"ok":true}`,
 	})
@@ -45,6 +46,9 @@ func TestRingPayloadListVsDetail(t *testing.T) {
 	if c.Connector != "eng" || c.Decision != "approved" || c.Account != "acct1" || c.Tool != "save_issue" || !c.OK || c.Ms != 42 {
 		t.Fatalf("summary fields mismatch: %+v", c)
 	}
+	if c.EndpointKind != endpointKindConnector || c.EndpointGeneration != "connector-generation" {
+		t.Fatalf("endpoint identity missing from summary: %+v", c)
+	}
 	if c.Args != "" || c.Result != "" {
 		t.Fatalf("list read must NOT include payloads, got args=%q result=%q", c.Args, c.Result)
 	}
@@ -56,6 +60,9 @@ func TestRingPayloadListVsDetail(t *testing.T) {
 	}
 	if d.Args != `{"id":"42"}` || d.Result != `{"ok":true}` {
 		t.Fatalf("detail payload mismatch: args=%q result=%q", d.Args, d.Result)
+	}
+	if d.EndpointKind != endpointKindConnector || d.EndpointGeneration != "connector-generation" {
+		t.Fatalf("endpoint identity missing from detail: %+v", d)
 	}
 
 	// Unknown ID is a clean miss, not an error.

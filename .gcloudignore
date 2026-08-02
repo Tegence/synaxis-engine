@@ -1,0 +1,27 @@
+# VCS and CI metadata are not part of the container build context.
+.git
+.gitignore
+.github
+.gstack/
+
+# Local secrets and file-store data must never be uploaded.
+.env
+.env.*
+accounts.json
+accounts.json.*
+
+# Local build and test output.
+bin/
+/engine
+/server
+/notionauth
+*.test
+coverage.out
+coverage.html
+*.coverprofile
+
+# Documentation and local metadata are not needed by the Docker build.
+*.md
+.DS_Store
+cloudbuild.engine.yaml
+.gcloudignore

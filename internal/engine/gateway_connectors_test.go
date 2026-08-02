@@ -2,12 +2,15 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"sort"
 	"testing"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+
+	"narthex/backend/internal/upstreamoauth"
 )
 
 // newConnectorTestGateway builds a Gateway over a FileStore (which satisfies
@@ -87,6 +90,46 @@ func TestConnectorFilteringBareVsPrefixed(t *testing.T) {
 	}
 }
 
+func TestSameProviderAccountsKeepDistinctToolNamespaces(t *testing.T) {
+	g := newConnectorTestGateway(t, map[string][]string{
+		"notion_work":     {"search", "fetch"},
+		"notion_personal": {"search", "fetch"},
+	})
+	ctx := context.Background()
+	workAccount, ok := g.store.Account("notion_work")
+	if !ok {
+		t.Fatal("work account missing")
+	}
+	if err := g.store.SetMeta(ctx, "notion_work", "Notion · Work", workAccount.Group); err != nil {
+		t.Fatalf("label work account: %v", err)
+	}
+	personalAccount, ok := g.store.Account("notion_personal")
+	if !ok {
+		t.Fatal("personal account missing")
+	}
+	if err := g.store.SetMeta(ctx, "notion_personal", "Notion · Personal", personalAccount.Group); err != nil {
+		t.Fatalf("label personal account: %v", err)
+	}
+	g.Aggregate(ctx)
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	work := g.cached["notion_work"]
+	personal := g.cached["notion_personal"]
+	if len(work) != 2 || len(personal) != 2 {
+		t.Fatalf("cached tool counts = %d/%d; want 2/2", len(work), len(personal))
+	}
+	if work[0].tool.Name == personal[0].tool.Name {
+		t.Fatalf("same-provider tool collision: %q", work[0].tool.Name)
+	}
+	if work[0].tool.Name != "notion_work__search" || personal[0].tool.Name != "notion_personal__search" {
+		t.Fatalf("tool identities = %q/%q; want account-prefix names", work[0].tool.Name, personal[0].tool.Name)
+	}
+	if work[0].tool.Title != "Notion · Work · search" || personal[0].tool.Title != "Notion · Personal · search" {
+		t.Fatalf("tool titles = %q/%q; want account labels", work[0].tool.Title, personal[0].tool.Title)
+	}
+}
+
 func TestConnectorEmptyAllowlistAndUnknownAccount(t *testing.T) {
 	g := newConnectorTestGateway(t, map[string][]string{
 		"linear": {"get_issue"},
@@ -151,6 +194,55 @@ func TestConnectorRebuildOnReplaceAccount(t *testing.T) {
 	g.mu.Unlock()
 	if before != after {
 		t.Fatal("connector MCPServer instance was replaced; must stay stable for in-flight sessions")
+	}
+}
+
+func TestReplaceAccountFailureKeepsLastKnownGoodToolsAndEndpoints(t *testing.T) {
+	g := newConnectorTestGateway(t, map[string][]string{
+		"linear": {"get_issue", "old_tool"},
+	})
+	ctx := context.Background()
+	g.Aggregate(ctx)
+	if err := g.UpsertConnector(ctx, VirtualConnector{
+		Slug: "curated", Tools: map[string][]string{"linear": {"get_issue", "old_tool"}},
+	}); err != nil {
+		t.Fatalf("upsert connector: %v", err)
+	}
+	ns, err := g.CreateNamespace(ctx, Namespace{
+		Slug: "all_tools", Label: "All tools", Accounts: []string{"linear"},
+	})
+	if err != nil {
+		t.Fatalf("create endpoint bundle: %v", err)
+	}
+
+	g.mu.Lock()
+	beforeCached := append([]cachedTool(nil), g.cached["linear"]...)
+	beforeRoot := append([]string(nil), g.byAcct["linear"]...)
+	g.mu.Unlock()
+	g.listTools = func(context.Context, Account) ([]mcp.Tool, error) {
+		return nil, errors.New("temporary upstream failure")
+	}
+
+	if _, err := g.ReplaceAccount(ctx, "linear"); err == nil {
+		t.Fatal("ReplaceAccount succeeded despite failed upstream list")
+	}
+	g.mu.Lock()
+	afterCached := append([]cachedTool(nil), g.cached["linear"]...)
+	afterRoot := append([]string(nil), g.byAcct["linear"]...)
+	g.mu.Unlock()
+	if !eq(afterRoot, beforeRoot) || len(afterCached) != len(beforeCached) {
+		t.Fatalf("failed replacement changed root cache: names %v -> %v, cached %d -> %d",
+			beforeRoot, afterRoot, len(beforeCached), len(afterCached))
+	}
+	if got := connectorNames(t, g, "curated"); !eq(got, []string{"linear__get_issue", "linear__old_tool"}) {
+		t.Fatalf("failed replacement changed curated endpoint: %v", got)
+	}
+	if got := connectorNames(t, g, "all_tools"); !eq(got, []string{"linear__get_issue", "linear__old_tool"}) {
+		t.Fatalf("failed replacement changed bundle endpoint: %v", got)
+	}
+	stored, ok := g.store.(NamespaceStore).Namespace(ctx, "all_tools")
+	if !ok || stored.Epoch != ns.Epoch || !sameStrings(stored.Accounts, []string{"linear"}) {
+		t.Fatalf("failed replacement changed endpoint membership: %+v ok=%v", stored, ok)
 	}
 }
 
@@ -254,5 +346,136 @@ func TestConnectorStats(t *testing.T) {
 	}
 	if _, err := g.ConnectorStats(ctx, "missing"); err == nil {
 		t.Fatal("expected error for unknown slug")
+	}
+}
+
+func TestStaleAccountHandlerCannotUseReplacementCredentials(t *testing.T) {
+	ctx := context.Background()
+	g := newConnectorTestGateway(t, map[string][]string{"notion": {"search"}})
+	first, _ := g.store.Account("notion")
+	first.URL = "https://notion.example/mcp"
+	first.BearerToken = "first-token"
+	if err := g.store.Upsert(ctx, first); err != nil {
+		t.Fatalf("seed first account: %v", err)
+	}
+	first, _ = g.store.Account("notion")
+	if count := g.Aggregate(ctx); count != 1 {
+		t.Fatalf("aggregate count = %d", count)
+	}
+	g.mu.Lock()
+	staleHandler := g.cached[first.Name][0].handler
+	g.mu.Unlock()
+
+	if err := g.store.Delete(ctx, first.Name, first.IncarnationID, first.Revision); err != nil {
+		t.Fatalf("delete first account: %v", err)
+	}
+	if err := g.store.Create(ctx, Account{
+		Name: first.Name, URL: first.URL, AuthMode: "token", BearerToken: "replacement-secret",
+	}); err != nil {
+		t.Fatalf("create replacement: %v", err)
+	}
+	replacement, _ := g.store.Account(first.Name)
+	if replacement.IncarnationID == first.IncarnationID {
+		t.Fatal("test replacement reused the first incarnation")
+	}
+	staleUpstream := g.upstreamFor(first)
+	if staleUpstream.Available() || staleUpstream.Token() != "" {
+		t.Fatal("stale upstream resolved the replacement account or its credential")
+	}
+
+	result, err := staleHandler(ctx, mcp.CallToolRequest{})
+	if err != nil {
+		t.Fatalf("stale handler protocol error: %v", err)
+	}
+	if result == nil || !result.IsError {
+		t.Fatalf("stale handler result = %+v, want fail-closed tool error", result)
+	}
+}
+
+func TestStaleAggregationAndRemovalCannotOverwriteReplacementProjection(t *testing.T) {
+	ctx := context.Background()
+	g := newConnectorTestGateway(t, map[string][]string{"notion": {}})
+	first, _ := g.store.Account("notion")
+	started := make(chan struct{})
+	release := make(chan struct{})
+	g.listTools = func(_ context.Context, account Account) ([]mcp.Tool, error) {
+		if account.IncarnationID == first.IncarnationID {
+			close(started)
+			<-release
+			return []mcp.Tool{mcp.NewTool(account.Name + "__old_tool")}, nil
+		}
+		return []mcp.Tool{mcp.NewTool(account.Name + "__new_tool")}, nil
+	}
+
+	staleResult := make(chan error, 1)
+	go func() {
+		_, err := g.AddAccount(ctx, first.Name)
+		staleResult <- err
+	}()
+	<-started
+	if err := g.store.Delete(ctx, first.Name, first.IncarnationID, first.Revision); err != nil {
+		t.Fatalf("delete first account: %v", err)
+	}
+	if err := g.store.Create(ctx, Account{
+		Name: first.Name, URL: first.URL, AuthMode: "token", BearerToken: "replacement",
+	}); err != nil {
+		t.Fatalf("create replacement: %v", err)
+	}
+	replacement, _ := g.store.Account(first.Name)
+	if _, err := g.AddAccount(ctx, replacement.Name); err != nil {
+		t.Fatalf("aggregate replacement: %v", err)
+	}
+	close(release)
+	if err := <-staleResult; !errors.Is(err, ErrAccountIncarnation) {
+		t.Fatalf("stale aggregation error = %v, want ErrAccountIncarnation", err)
+	}
+
+	// A delayed teardown for the deleted row must not unregister the replacement
+	// that now owns the same model-visible tool prefix.
+	g.RemoveAccount(first.Name, first.IncarnationID)
+	g.mu.Lock()
+	projected := g.projectedIncarnations[first.Name]
+	rootNames := append([]string(nil), g.byAcct[first.Name]...)
+	cached := append([]cachedTool(nil), g.cached[first.Name]...)
+	g.mu.Unlock()
+	if projected != replacement.IncarnationID || len(rootNames) != 1 || rootNames[0] != "notion__new_tool" ||
+		len(cached) != 1 || cached[0].accountIncarnationID != replacement.IncarnationID {
+		t.Fatalf("replacement projection was overwritten/removed: projected=%q root=%v cached=%+v", projected, rootNames, cached)
+	}
+}
+
+func TestRefreshAccountCannotPersistIntoReplacementIncarnation(t *testing.T) {
+	ctx := context.Background()
+	g := newConnectorTestGateway(t, map[string][]string{"notion": {}})
+	first, _ := g.store.Account("notion")
+	first.URL = "https://notion.example/mcp"
+	first.AuthMode = "oauth"
+	first.ClientID = "first-client"
+	first.RefreshToken = "first-refresh"
+	first.AccessToken = "first-access"
+	first.TokenEndpoint = "https://notion.example/token"
+	if err := g.store.Upsert(ctx, first); err != nil {
+		t.Fatalf("seed OAuth account: %v", err)
+	}
+	first, _ = g.store.Account(first.Name)
+	g.refreshTokens = func(context.Context, *upstreamoauth.Metadata, string, string, string) (*upstreamoauth.Tokens, error) {
+		if err := g.store.Delete(ctx, first.Name, first.IncarnationID, first.Revision); err != nil {
+			t.Fatalf("delete during refresh: %v", err)
+		}
+		if err := g.store.Create(ctx, Account{
+			Name: first.Name, URL: first.URL, AuthMode: "token", BearerToken: "replacement-secret",
+		}); err != nil {
+			t.Fatalf("create replacement during refresh: %v", err)
+		}
+		return &upstreamoauth.Tokens{AccessToken: "stale-access", RefreshToken: "stale-refresh"}, nil
+	}
+
+	if err := g.refreshAccount(ctx, first.Name, first.IncarnationID); !errors.Is(err, ErrAccountIncarnation) {
+		t.Fatalf("refresh error = %v, want ErrAccountIncarnation", err)
+	}
+	replacement, ok := g.store.Account(first.Name)
+	if !ok || replacement.IncarnationID == first.IncarnationID || replacement.AuthMode != "token" ||
+		replacement.BearerToken != "replacement-secret" || replacement.AccessToken != "" || replacement.RefreshToken != "" {
+		t.Fatalf("stale refresh mutated replacement: %+v, ok=%v", replacement, ok)
 	}
 }

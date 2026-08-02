@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -250,6 +251,104 @@ func TestApprovalApprovePathDispatchesUpstream(t *testing.T) {
 	// Deciding again must fail — the wait is gone.
 	if err := g.Decide(context.Background(), id, "denied"); err == nil {
 		t.Fatal("second decide on the same id must error")
+	}
+}
+
+func approvalMoveTarget(t *testing.T, g *Gateway) (Account, ConnectionNamespace) {
+	t.Helper()
+	store, ok := g.store.(*FileStore)
+	if !ok {
+		t.Fatal("approval test gateway must use FileStore")
+	}
+	account, found := store.Account("linear")
+	if !found {
+		t.Fatal("approval test account missing")
+	}
+	target, err := store.CreateConnectionNamespace(context.Background(), ConnectionNamespace{
+		Label: "Private", CreatedBy: "usr_owner",
+	})
+	if err != nil {
+		t.Fatalf("create move target: %v", err)
+	}
+	return account, target
+}
+
+// TestApprovalMoveCancelsPendingBeforeDecision verifies the common TOCTOU:
+// a namespace manager opens an approval row, then an administrator moves that
+// credential into a different (here personal) ownership boundary. The move
+// atomically cancels the pending row, so a stale Approve cannot release it.
+func TestApprovalMoveCancelsPendingBeforeDecision(t *testing.T) {
+	g, saves := newApprovalTestGateway(t)
+	account, target := approvalMoveTarget(t, g)
+	done := make(chan string, 1)
+	go func() { done <- callConnectorTool(t, g, "work", "linear__save_issue") }()
+
+	id := waitPendingID(t, g)
+	parked := approvalRecord(t, g, id)
+	if parked.AccountIncarnationID != account.IncarnationID || parked.AccountRevision != account.Revision || parked.ConnectionNamespaceID != account.ConnectionNamespaceID {
+		t.Fatalf("pending ownership binding = %+v, want current account %+v", parked, account)
+	}
+	if _, err := g.MoveAccountToConnectionNamespace(context.Background(), account.Name, account.IncarnationID, AccountConnectionAssignment{
+		ConnectionNamespaceID: target.ID,
+		Scope:                 ConnectionScopePersonal,
+		OwnerSubject:          "usr_private",
+	}, account.Revision); err != nil {
+		t.Fatalf("move account: %v", err)
+	}
+	if cancelled := approvalRecord(t, g, id); cancelled.Status != ApprovalCancelled {
+		t.Fatalf("pending status after move = %+v, want cancelled", cancelled)
+	}
+	if err := g.Decide(context.Background(), id, ApprovalApproved); !errors.Is(err, ErrApprovalNotPending) {
+		t.Fatalf("stale approve after move = %v, want ErrApprovalNotPending", err)
+	}
+
+	resp := <-done
+	if !strings.Contains(resp, "approval cancelled") || strings.Contains(resp, "saved-upstream") {
+		t.Fatalf("moved pending call response = %s; want a cancelled, undispatched result", resp)
+	}
+	if got := atomic.LoadInt32(saves); got != 0 {
+		t.Fatalf("moved pending call dispatched %d times, want 0", got)
+	}
+}
+
+// TestApprovedCallCannotDispatchAfterConcurrentOwnershipMove covers the
+// narrower ordering where an approval commits first and the ownership move
+// commits while the request is between the handler's first validation and the
+// upstream dial. The revision-bound credential lookup is the final guard: the
+// old closure may finish, but it cannot send a request using the new owner's
+// credential.
+func TestApprovedCallCannotDispatchAfterConcurrentOwnershipMove(t *testing.T) {
+	g, saves := newApprovalTestGateway(t)
+	account, target := approvalMoveTarget(t, g)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	g.beforeAccountDispatch = func() {
+		close(entered)
+		<-release
+	}
+
+	done := make(chan string, 1)
+	go func() { done <- callConnectorTool(t, g, "work", "linear__save_issue") }()
+	id := waitPendingID(t, g)
+	if err := g.Decide(context.Background(), id, ApprovalApproved); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	<-entered
+	if _, err := g.MoveAccountToConnectionNamespace(context.Background(), account.Name, account.IncarnationID, AccountConnectionAssignment{
+		ConnectionNamespaceID: target.ID,
+		Scope:                 ConnectionScopePersonal,
+		OwnerSubject:          "usr_private",
+	}, account.Revision); err != nil {
+		t.Fatalf("move account after approve: %v", err)
+	}
+	close(release)
+
+	resp := <-done
+	if strings.Contains(resp, "saved-upstream") {
+		t.Fatalf("approved stale call reached upstream after move: %s", resp)
+	}
+	if got := atomic.LoadInt32(saves); got != 0 {
+		t.Fatalf("approved stale call dispatched %d times, want 0", got)
 	}
 }
 

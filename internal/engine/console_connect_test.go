@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -20,6 +21,7 @@ type fakeConnector struct {
 	startCalled bool
 	authURL     string
 	startErr    error
+	finishErr   error
 }
 
 func (f *fakeConnector) StartConnect(_ context.Context, _, _, _, _, _ string, sc *StaticCreds) (string, error) {
@@ -33,7 +35,7 @@ func (f *fakeConnector) StartConnect(_ context.Context, _, _, _, _, _ string, sc
 }
 
 func (f *fakeConnector) FinishConnect(_ context.Context, _, _ string) (string, int, error) {
-	return "", 0, nil
+	return "", 0, f.finishErr
 }
 
 // newConnectConsole builds a ConsoleAPI with a fakeConnector injected via the
@@ -206,5 +208,19 @@ func TestConnectUnknownAccount(t *testing.T) {
 	}
 	if fake.startCalled {
 		t.Error("StartConnect must not be called for an unknown account")
+	}
+}
+
+func TestOAuthCallbackExplainsWhenConnectionChangedDuringConsent(t *testing.T) {
+	mux, _, fake := newConnectConsole(t)
+	fake.finishErr = fmt.Errorf("store: %w", ErrConnectAccountMoved)
+	req := httptest.NewRequest(http.MethodGet, "/api/oauth/callback?code=provider-code&state=state", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status = %d; want 302", rec.Code)
+	}
+	if got, want := rec.Header().Get("Location"), "http://localhost:3000/?connect=changed"; got != want {
+		t.Fatalf("redirect = %q; want %q", got, want)
 	}
 }

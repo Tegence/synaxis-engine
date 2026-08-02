@@ -1,7 +1,9 @@
 package engine
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -116,6 +118,52 @@ func TestConsoleHostedModeDisablesLocalLoginButKeepsMachineAuth(t *testing.T) {
 	}
 	if payload["localLoginEnabled"] {
 		t.Fatalf("hosted auth status must report local login disabled: %v", payload)
+	}
+}
+
+func TestConsoleMachineAdminCanRevokeWorkspaceOAuth(t *testing.T) {
+	const adminToken = "platform-machine-secret"
+	revokeCalls := 0
+	mux := newAuthTestConsole(
+		WithAdminToken(adminToken),
+		WithOAuthRevoker(func(context.Context) error {
+			revokeCalls++
+			return nil
+		}),
+	)
+
+	if rec := requestStatus(mux, http.MethodPost, "/api/oauth/revoke-all", "", ""); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("uncredentialed revoke = %d, want 401", rec.Code)
+	}
+	if rec := requestStatus(mux, http.MethodGet, "/api/oauth/revoke-all", adminToken, ""); rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET revoke = %d, want 405", rec.Code)
+	}
+	if rec := requestStatus(mux, http.MethodPost, "/api/oauth/revoke-all", adminToken, ""); rec.Code != http.StatusNoContent {
+		t.Fatalf("machine revoke = %d, body %s", rec.Code, rec.Body)
+	}
+	if revokeCalls != 1 {
+		t.Fatalf("revoke calls = %d, want 1", revokeCalls)
+	}
+}
+
+func TestConsoleOAuthRevocationFailureIsFailClosed(t *testing.T) {
+	const adminToken = "platform-machine-secret"
+	mux := newAuthTestConsole(
+		WithAdminToken(adminToken),
+		WithOAuthRevoker(func(ctx context.Context) error {
+			if ctx == nil {
+				t.Fatal("revoker received nil request context")
+			}
+			return errors.New("generation store unavailable")
+		}),
+	)
+
+	rec := requestStatus(mux, http.MethodPost, "/api/oauth/revoke-all", adminToken, "")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("failed revoke = %d, want 503; body %s", rec.Code, rec.Body)
+	}
+	if strings.Contains(rec.Body.String(), "generation store unavailable") {
+		t.Fatalf("failed revoke leaked internal storage error: %s", rec.Body)
 	}
 }
 

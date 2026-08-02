@@ -3,7 +3,10 @@ package engine
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -24,16 +27,28 @@ import (
 type Gateway struct {
 	store AccountStore
 	mcp   *server.MCPServer
-	audit AuditSink // optional; records every tool call
+	audit AuditSink  // optional; records every tool call
+	usage *UsageGate // optional; nil keeps self-hosted Engines quota-unlimited
 
 	mu         sync.Mutex
-	byAcct     map[string][]string         // account name -> registered (prefixed) tool names
-	cached     map[string][]cachedTool     // account name -> tools (post-rewrite) + handlers
-	connectors map[string]*connectorServer // slug -> per-connector MCP server
-	refreshMu  map[string]*sync.Mutex      // per-account refresh serialization
-	alertState map[string]bool             // account -> currently-down (alert dedup)
-	webhook    string                      // optional alert webhook URL
-	consoleURL string                      // linked in approval webhook messages
+	endpointMu sync.Mutex              // serializes connector/namespace slug mutations
+	byAcct     map[string][]string     // account name -> registered (prefixed) tool names
+	cached     map[string][]cachedTool // account name -> tools (post-rewrite) + handlers
+	// projectedIncarnations binds every name-keyed live cache/root projection to
+	// the immutable account row that produced it. Delete/recreate may reuse the
+	// visible tool prefix, but stale aggregation/removal work may not cross this
+	// boundary.
+	projectedIncarnations map[string]string
+	connectors            map[string]*connectorServer // slug -> per-connector MCP server
+	// clientEndpoints is deliberately separate from connectors: the path
+	// namespace is /mcp/clients/{slug}, not the shared /mcp/{slug} namespace.
+	// Each endpoint is bound to one durable MCPClient subject and includes only
+	// the connection-namespace grants held by that registration.
+	clientEndpoints map[string]*connectorServer // slug -> subject-bound MCP server
+	refreshMu       map[string]*sync.Mutex      // per-account refresh serialization
+	alertState      map[string]bool             // account -> currently-down (alert dedup)
+	webhook         string                      // optional alert webhook URL
+	consoleURL      string                      // linked in approval webhook messages
 
 	// revokeResource, when wired (SetTokenRevoker), tells the OAuth AS to drop
 	// refresh grants for a deleted connector's resource path.
@@ -50,15 +65,41 @@ type Gateway struct {
 
 	// listTools is a test seam; nil means "dial the upstream" (production).
 	listTools func(ctx context.Context, a Account) ([]mcp.Tool, error)
+	// healthProbeTimeout bounds one control-plane tools/list observation. It is
+	// intentionally separate from an MCP tool invocation timeout: health must
+	// degrade quickly without shortening legitimate provider work.
+	healthProbeTimeout time.Duration
+	healthProbeMu      sync.Mutex
+	// healthProbes tracks the underlying work rather than its caller contexts.
+	// A cancellation-ignorant transport must not accumulate one stranded
+	// goroutine per dashboard poll. The key includes an opaque credential /
+	// upstream-config generation so a successful reauthorization can supersede
+	// a stranded old probe. Per account identity, the small fixed limit below
+	// keeps repeated reconfigurations from becoming a goroutine storm too.
+	healthProbes map[string]healthProbeFlight
+	// refreshTokens is a test seam; nil uses upstreamoauth.Refresh.
+	refreshTokens func(context.Context, *upstreamoauth.Metadata, string, string, string) (*upstreamoauth.Tokens, error)
+	// beforeAccountDispatch is a test seam used to deterministically exercise
+	// ownership-move races after a handler has passed its first snapshot check
+	// but before it can dial the upstream.
+	beforeAccountDispatch func()
 }
 
 // cachedTool is one registered tool (prefixed name, rewritten title) plus the
 // exact handler closure registered on the main /mcp server — connector servers
 // reuse it so audit/refresh behavior is identical on every endpoint.
 type cachedTool struct {
-	tool       mcp.Tool
-	sourceName string // stable upstream bare name; tool.Name may be an operator alias
-	handler    server.ToolHandlerFunc
+	tool                 mcp.Tool
+	sourceName           string // stable upstream bare name; tool.Name may be an operator alias
+	accountIncarnationID string
+	// accountRevision binds this cached dispatch closure to the credential's
+	// ownership generation.  A namespace/scope/owner move keeps the stable
+	// account name and incarnation intentionally, but increments Revision; an
+	// old handler must therefore fail closed rather than send a request using
+	// the newly reassigned credential.
+	accountRevision int64
+	accountURL      string
+	handler         server.ToolHandlerFunc
 }
 
 // SetAlertWebhook configures where account-down/recovered alerts are POSTed.
@@ -66,11 +107,15 @@ func (g *Gateway) SetAlertWebhook(url string) { g.webhook = url }
 
 func NewGateway(store AccountStore, mcpServer *server.MCPServer) *Gateway {
 	return &Gateway{
-		store:      store,
-		mcp:        mcpServer,
-		byAcct:     map[string][]string{},
-		cached:     map[string][]cachedTool{},
-		connectors: map[string]*connectorServer{},
+		store:                 store,
+		mcp:                   mcpServer,
+		byAcct:                map[string][]string{},
+		cached:                map[string][]cachedTool{},
+		projectedIncarnations: map[string]string{},
+		connectors:            map[string]*connectorServer{},
+		clientEndpoints:       map[string]*connectorServer{},
+		healthProbeTimeout:    defaultHealthProbeTimeout,
+		healthProbes:          map[string]healthProbeFlight{},
 	}
 }
 
@@ -106,29 +151,76 @@ func (g *Gateway) CallDetail(ctx context.Context, id int64) (CallRecord, bool, e
 
 // AccountHealth is a live per-account status for the console.
 type AccountHealth struct {
-	UUID      string `json:"uuid"` // = account name (the console keys by this)
-	Status    string `json:"status"`
-	Detail    string `json:"detail,omitempty"`
+	UUID   string `json:"uuid"` // = account name (the console keys by this)
+	Status string `json:"status"`
+	Detail string `json:"detail,omitempty"`
+	// Recovery is a stable, safe action identifier for the management UI.
+	// It deliberately carries no provider response or transport diagnostic.
+	// Current values are "connect", "reauthorize", and "retry".
+	Recovery  string `json:"recovery,omitempty"`
 	ToolCount int    `json:"toolCount"`
 	LatencyMs int64  `json:"latencyMs"`
 	CheckedAt string `json:"checkedAt"`
+
+	// internalErr is retained only while the in-process watcher evaluates the
+	// result. It must never leave the Engine: upstream error strings can expose
+	// implementation details and occasionally provider-controlled content.
+	internalErr error
 }
+
+const (
+	healthStatusOK          = "ok"
+	healthStatusNeedsAuth   = "needs_auth"
+	healthStatusAuthExpired = "auth_expired"
+	healthStatusTimeout     = "timeout"
+	healthStatusUnreachable = "unreachable"
+
+	healthRecoveryConnect     = "connect"
+	healthRecoveryReauthorize = "reauthorize"
+	healthRecoveryRetry       = "retry"
+
+	// A health check is a control-plane observation, not a tool call. Keep its
+	// budget well below the platform proxy timeout and the user-configurable
+	// MCP call ceiling so one unavailable provider cannot hold the console or
+	// watcher hostage.
+	defaultHealthProbeTimeout = 10 * time.Second
+)
 
 // upstreamFor builds a live Upstream for an account, wiring Token + Refresh
 // against the store (refreshed tokens are persisted, and a rotated refresh
 // token is re-read from the store on each refresh).
 func (g *Gateway) upstreamFor(a Account) *Upstream {
+	incarnationID := a.IncarnationID
+	revision := a.Revision
+	credential := func() (string, error) {
+		current, ok := g.store.Account(a.Name)
+		if !ok || incarnationID == "" || revision < 1 || current.IncarnationID != incarnationID || current.Revision != revision || !equalAccountSnapshotURL(current.URL, a.URL) {
+			return "", ErrAccountIncarnation
+		}
+		if current.AuthMode == "token" {
+			return current.BearerToken, nil
+		}
+		return current.AccessToken, nil
+	}
 	up := &Upstream{
-		Name:  a.Name,
-		URL:   a.URL,
-		Token: func() string { return g.store.Token(a.Name) },
+		Name:       a.Name,
+		URL:        a.URL,
+		Credential: credential,
+		Available: func() bool {
+			_, err := credential()
+			return err == nil
+		},
+		Token: func() string {
+			token, _ := credential()
+			return token
+		},
 	}
 	if a.AuthMode == "oauth" && a.RefreshToken != "" {
 		name := a.Name
 		// Both reactive (on-401) and proactive (refresh-ahead) refresh route
 		// through refreshAccount, which serializes per account so two refreshes
 		// never burn the same rotating token (the bug that revokes the family).
-		up.Refresh = func(ctx context.Context) error { return g.refreshAccount(ctx, name) }
+		up.Refresh = func(ctx context.Context) error { return g.refreshAccount(ctx, name, incarnationID) }
 	}
 	return up
 }
@@ -149,36 +241,34 @@ func (g *Gateway) refreshLock(name string) *sync.Mutex {
 
 // refreshAccount refreshes one OAuth account's tokens and persists them, under
 // a per-account lock. Used by both the on-401 path and refresh-ahead.
-func (g *Gateway) refreshAccount(ctx context.Context, name string) error {
+func (g *Gateway) refreshAccount(ctx context.Context, name, expectedIncarnationID string) error {
 	mu := g.refreshLock(name)
 	mu.Lock()
 	defer mu.Unlock()
 	a, ok := g.store.Account(name)
-	if !ok {
-		return fmt.Errorf("account %q not found", name)
+	if !ok || expectedIncarnationID == "" || a.IncarnationID != expectedIncarnationID {
+		return ErrAccountIncarnation
 	}
 	if a.AuthMode != "oauth" || a.RefreshToken == "" {
 		return nil
 	}
 	meta := &upstreamoauth.Metadata{TokenEndpoint: a.TokenEndpoint, Resource: a.Resource}
-	nt, err := upstreamoauth.Refresh(ctx, meta, a.RefreshToken, a.ClientID, a.ClientSecret)
+	refresh := g.refreshTokens
+	if refresh == nil {
+		refresh = upstreamoauth.Refresh
+	}
+	nt, err := refresh(ctx, meta, a.RefreshToken, a.ClientID, a.ClientSecret)
 	if err != nil {
 		return err
 	}
-	return g.store.UpdateTokens(name, nt.AccessToken, nt.RefreshToken)
+	return g.store.UpdateTokens(ctx, name, expectedIncarnationID, nt.AccessToken, nt.RefreshToken)
 }
 
 // aggregateAccount connects to one account, lists its tools, and registers each
 // (prefixed) tool with a handler that routes tools/call back to that upstream.
 func (g *Gateway) aggregateAccount(ctx context.Context, a Account) (int, error) {
 	up := g.upstreamFor(a)
-	var tools []mcp.Tool
-	var err error
-	if g.listTools != nil { // test seam
-		tools, err = g.listTools(ctx, a)
-	} else {
-		tools, err = up.ListTools(ctx)
-	}
+	tools, err := g.listAccountTools(ctx, a)
 	if err != nil {
 		return 0, err
 	}
@@ -187,6 +277,9 @@ func (g *Gateway) aggregateAccount(ctx context.Context, a Account) (int, error) 
 		label = a.Name
 	}
 	disabled := toSet(a.DisabledTools)
+	// names is the aggregate /mcp projection. Personal accounts are still
+	// cached below so a subject-bound client endpoint can expose them to its
+	// owner, but their names are intentionally never registered on root.
 	names := make([]string, 0, len(tools))
 	cached := make([]cachedTool, 0, len(tools))
 	for _, t := range tools {
@@ -218,61 +311,119 @@ func (g *Gateway) aggregateAccount(ctx context.Context, a Account) (int, error) 
 		}
 		t.Title = label + " · " + disp
 		t.Annotations.Title = t.Title
-		upRef, bareName, acct := up, bare, a.Name
-		handler := server.ToolHandlerFunc(func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			start := time.Now()
-			res, err := upRef.CallTool(ctx, bareName, req.GetArguments())
-			// Response guardrails — CONNECTOR endpoints only. The default
-			// /mcp endpoint never injects an auditScope, so sc is nil there
-			// and the result passes through raw (guards are a connector
-			// feature by design). Order matters: redact → cap → injection
-			// scan runs BEFORE the audit row below, so recorded payloads
-			// never contain what redaction removed. Protocol errors (err !=
-			// nil → res unusable) skip guards; isError tool results are
-			// guarded like any other (their Error field isn't touched — only
-			// text content).
-			var guard string
-			if sc := auditScopeFrom(ctx); sc != nil && sc.guards != nil && err == nil {
-				res, guard = applyGuards(res, *sc.guards)
-			}
-			if g.audit != nil {
-				rec := CallRecord{
-					Account: acct, Tool: bareName, OK: err == nil,
-					Ms:    time.Since(start).Milliseconds(),
-					Guard: guard, // post-guard markers; "" on /mcp or when nothing fired
-				}
-				if err != nil {
-					rec.Error = err.Error()
-				}
-				// This closure is shared byte-for-byte between /mcp and every
-				// connector server; the endpoint identity (connector slug,
-				// approval decision, record flag) is layered on by the scope
-				// wrapper via ctx. No scope = the default /mcp endpoint.
-				record := g.recordDefault
-				if sc := auditScopeFrom(ctx); sc != nil {
-					rec.Connector, rec.Decision, record = sc.connector, sc.decision, sc.record
-				}
-				if record {
-					rec.Args = marshalPayload(req.GetArguments())
-					if res != nil {
-						rec.Result = marshalPayload(res)
-					}
-				}
-				g.audit.LogCall(rec)
-			}
-			return res, err
-		})
-		g.mcp.AddTool(t, handler)
+		handler := g.accountToolHandler(a, up, bare)
 		names = append(names, t.Name)
 		// Cache tool + the SAME closure so connector endpoints dispatch (and
 		// audit) identically without re-dialing the upstream.
-		cached = append(cached, cachedTool{tool: t, sourceName: bare, handler: handler})
+		cached = append(cached, cachedTool{
+			tool: t, sourceName: bare, accountIncarnationID: a.IncarnationID, accountRevision: a.Revision, accountURL: a.URL, handler: handler,
+		})
 	}
+	// Only replace the live registration after the upstream list and all local
+	// rewrites have succeeded. A transient upstream failure must leave the last
+	// known-good account cache (and every endpoint built from it) intact.
 	g.mu.Lock()
-	g.byAcct[a.Name] = names
+	current, live := g.store.Account(a.Name)
+	if !live || a.IncarnationID == "" || a.Revision < 1 || current.IncarnationID != a.IncarnationID || current.Revision != a.Revision || !equalAccountSnapshotURL(current.URL, a.URL) {
+		g.mu.Unlock()
+		return 0, ErrAccountIncarnation
+	}
+	if old := g.byAcct[a.Name]; len(old) > 0 {
+		g.mcp.DeleteTools(old...)
+	}
+	rootNames := names
+	if a.IsPersonal() {
+		rootNames = nil
+	} else {
+		for _, ct := range cached {
+			g.mcp.AddTool(ct.tool, ct.handler)
+		}
+	}
+	g.byAcct[a.Name] = rootNames
 	g.cached[a.Name] = cached
+	g.projectedIncarnations[a.Name] = a.IncarnationID
 	g.mu.Unlock()
-	return len(names), nil // count REGISTERED (enabled), not total
+	return len(rootNames), nil // count tools registered on shared root, not cached personal tools
+}
+
+// accountToolHandler builds the dispatch closure shared by root, connector,
+// and subject-bound client projections. Keeping it separate from aggregation
+// lets an ownership-only move rebind cached tools to the new Account.Revision
+// without re-listing an otherwise healthy upstream.
+func (g *Gateway) accountToolHandler(a Account, upRef *Upstream, bareName string) server.ToolHandlerFunc {
+	acct := a.Name
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if !g.accountSnapshotLive(acct, a.IncarnationID, a.Revision, a.URL) {
+			return mcp.NewToolResultError("this connection changed; refresh the MCP tool list"), nil
+		}
+		if beforeDispatch := g.beforeAccountDispatch; beforeDispatch != nil {
+			beforeDispatch()
+		}
+		start := time.Now()
+		meta := UsageCallMeta{Account: acct, Tool: bareName}
+		if sc := auditScopeFrom(ctx); sc != nil {
+			meta.Connector = sc.connector
+		}
+		execution := g.executeUpstream(
+			ctx,
+			meta,
+			req.GetArguments(),
+			func(callCtx context.Context) (*mcp.CallToolResult, error) {
+				return upRef.CallTool(callCtx, bareName, req.GetArguments())
+			},
+		)
+		res, err := execution.result, execution.callErr
+		if execution.usageErr != nil {
+			res, err = UsageToolResult(execution.usageErr), nil
+		}
+		// Response guardrails — CONNECTOR endpoints only. The default /mcp
+		// endpoint never injects an auditScope, so sc is nil there and the result
+		// passes through raw. Order matters: redact → cap → injection scan runs
+		// BEFORE the audit row below, so recorded payloads never contain what
+		// redaction removed. Protocol errors skip guards; isError tool results are
+		// guarded like any other (their Error field isn't touched — only text).
+		var guard string
+		if sc := auditScopeFrom(ctx); sc != nil && sc.guards != nil && err == nil {
+			res, guard = applyGuards(res, *sc.guards)
+		}
+		if g.audit != nil {
+			rec := CallRecord{
+				Account: acct, Tool: bareName, OK: err == nil,
+				Ms:    time.Since(start).Milliseconds(),
+				Guard: guard, // post-guard markers; "" on /mcp or when nothing fired
+			}
+			if err != nil {
+				rec.Error = err.Error()
+			}
+			// This closure is shared byte-for-byte between /mcp and every
+			// connector server; the endpoint identity (connector slug, approval
+			// decision, record flag) is layered on by the scope wrapper via ctx.
+			// No scope = the default /mcp endpoint.
+			record := g.recordDefault
+			if sc := auditScopeFrom(ctx); sc != nil {
+				rec.Connector = sc.connector
+				rec.EndpointKind = sc.kind
+				rec.EndpointGeneration = sc.generation
+				rec.Decision, record = sc.decision, sc.record
+			}
+			if record {
+				rec.Args = marshalPayload(req.GetArguments())
+				if res != nil {
+					rec.Result = marshalPayload(res)
+				}
+			}
+			g.audit.LogCall(rec)
+		}
+		return res, err
+	}
+}
+
+func (g *Gateway) accountSnapshotLive(name, expectedIncarnationID string, expectedRevision int64, expectedURL string) bool {
+	if expectedIncarnationID == "" || expectedRevision < 1 {
+		return false
+	}
+	current, ok := g.store.Account(name)
+	return ok && current.IncarnationID == expectedIncarnationID && current.Revision == expectedRevision && equalAccountSnapshotURL(current.URL, expectedURL)
 }
 
 // readOnlyTool reports whether a tool is safe to expose on a read-only
@@ -375,13 +526,7 @@ func (g *Gateway) ListAccountTools(ctx context.Context, name string) ([]ToolInfo
 	if !ok {
 		return nil, fmt.Errorf("account %q not found", name)
 	}
-	var tools []mcp.Tool
-	var err error
-	if g.listTools != nil {
-		tools, err = g.listTools(ctx, a)
-	} else {
-		tools, err = g.upstreamFor(a).ListTools(ctx)
-	}
+	tools, err := g.listAccountTools(ctx, a)
 	if err != nil {
 		return nil, err
 	}
@@ -408,27 +553,228 @@ func (g *Gateway) ListAccountTools(ctx context.Context, name string) ([]ToolInfo
 	return out, nil
 }
 
-// RemoveAccount unregisters an account's tools from the live MCP server.
-func (g *Gateway) RemoveAccount(name string) {
+// removeAccountLive unregisters an account without recursively rebuilding
+// endpoints. Callers that need the full projection update call
+// RefreshConnectors after batching removals.
+func (g *Gateway) removeAccountLive(name, expectedIncarnationID string) bool {
 	g.mu.Lock()
+	defer g.mu.Unlock()
+	if expectedIncarnationID == "" || g.projectedIncarnations[name] != expectedIncarnationID {
+		return false
+	}
 	names := g.byAcct[name]
-	delete(g.byAcct, name)
-	delete(g.cached, name)
-	g.mu.Unlock()
 	if len(names) > 0 {
 		g.mcp.DeleteTools(names...)
 	}
+	delete(g.byAcct, name)
+	delete(g.cached, name)
+	delete(g.projectedIncarnations, name)
+	return true
+}
+
+// removeRootProjectionLive removes only an account's shared /mcp projection.
+// It intentionally retains the cached tool definitions: a personal account
+// can still be served through an authorized /mcp/clients/{slug} endpoint.
+// Actual connection deletion continues to use removeAccountLive above.
+func (g *Gateway) removeRootProjectionLive(account Account) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	current, ok := g.store.Account(account.Name)
+	if !ok || account.IncarnationID == "" || current.IncarnationID != account.IncarnationID || !current.IsPersonal() {
+		return false
+	}
+	names := g.byAcct[account.Name]
+	if len(names) > 0 {
+		g.mcp.DeleteTools(names...)
+	}
+	delete(g.byAcct, account.Name)
+	if projected := g.projectedIncarnations[account.Name]; projected != "" && projected != account.IncarnationID {
+		// The visible name was reused and only a stale prior incarnation is
+		// cached. Personal endpoints must rebuild from the replacement instead.
+		delete(g.cached, account.Name)
+		delete(g.projectedIncarnations, account.Name)
+	}
+	return true
+}
+
+// RemoveAccount unregisters an account's tools from the live MCP server.
+func (g *Gateway) RemoveAccount(name, expectedIncarnationID string) {
+	g.removeAccountLive(name, expectedIncarnationID)
 	g.RefreshConnectors(context.Background())
 }
 
 // ReplaceAccount re-aggregates one account (after a token/meta change) so its
-// live tools — and their labels — reflect the current store.
+// live tools — and their labels — reflect the current store. AddAccount lists
+// and prepares the replacement before swapping it in, so a failed upstream
+// list leaves the previous live cache and endpoint memberships untouched.
 func (g *Gateway) ReplaceAccount(ctx context.Context, name string) (int, error) {
-	g.RemoveAccount(name)
 	return g.AddAccount(ctx, name)
 }
 
-// Health live-checks every account (concurrently) by listing its tools.
+// listAccountTools is the one live tool-discovery path shared by aggregation,
+// curation, and health. Keeping the test seam here lets health exercise the
+// same provider behavior as the production path.
+func (g *Gateway) listAccountTools(ctx context.Context, a Account) ([]mcp.Tool, error) {
+	if g.listTools != nil {
+		return g.listTools(ctx, a)
+	}
+	return g.upstreamFor(a).ListTools(ctx)
+}
+
+type healthProbeResult struct {
+	tools []mcp.Tool
+	err   error
+}
+
+var errHealthProbeInFlight = errors.New("health probe is already in progress")
+
+// Keep at most one normal live probe plus one prior-generation probe for an
+// account. The latter is important when an upstream library has ignored its
+// context forever: a credential or endpoint repair must still be able to
+// prove the repaired account healthy. We cannot safely terminate arbitrary
+// third-party goroutines, so this fixed cap prevents repeated repairs from
+// creating unbounded background work.
+const maxHealthProbesPerAccount = 2
+
+type healthProbeFlight struct {
+	accountKey string
+}
+
+func healthProbeAccountKey(a Account) string {
+	// An account replacement gets a new incarnation and must not inherit a
+	// stranded probe from the deleted credential. Older local stores may not
+	// have an incarnation yet, in which case the name remains the best key.
+	if a.IncarnationID == "" {
+		return a.Name
+	}
+	return a.Name + "\x00" + a.IncarnationID
+}
+
+func healthProbeKey(a Account) string {
+	// Do not retain credentials directly in an in-flight key. The digest covers
+	// every upstream dial/refresh input so an OAuth completion, token rotation,
+	// or endpoint reconfiguration gets a distinct health generation even where
+	// a compatibility store intentionally leaves Account.Revision unchanged.
+	h := sha256.New()
+	for _, value := range [...]string{
+		a.URL,
+		a.AuthMode,
+		a.ClientID,
+		a.ClientSecret,
+		a.AccessToken,
+		a.RefreshToken,
+		a.TokenEndpoint,
+		a.Resource,
+		a.Scope,
+		a.BearerToken,
+	} {
+		_, _ = h.Write([]byte(value))
+		_, _ = h.Write([]byte{0})
+	}
+	return healthProbeAccountKey(a) + "\x00" + hex.EncodeToString(h.Sum(nil))
+}
+
+func (g *Gateway) beginHealthProbe(a Account) (release func(), started bool) {
+	key := healthProbeKey(a)
+	accountKey := healthProbeAccountKey(a)
+	g.healthProbeMu.Lock()
+	defer g.healthProbeMu.Unlock()
+	if g.healthProbes == nil {
+		g.healthProbes = map[string]healthProbeFlight{}
+	}
+	if _, exists := g.healthProbes[key]; exists {
+		return nil, false
+	}
+	active := 0
+	for _, flight := range g.healthProbes {
+		if flight.accountKey == accountKey {
+			active++
+		}
+	}
+	if active >= maxHealthProbesPerAccount {
+		return nil, false
+	}
+	g.healthProbes[key] = healthProbeFlight{accountKey: accountKey}
+	return func() {
+		g.healthProbeMu.Lock()
+		delete(g.healthProbes, key)
+		g.healthProbeMu.Unlock()
+	}, true
+}
+
+// listAccountToolsForHealth creates a cancellation boundary around provider
+// discovery. Well-behaved transports observe ctx themselves; the result
+// channel additionally lets the Engine control plane move on when a provider
+// library ignores cancellation. The buffered result makes a late return safe
+// without leaving that goroutine blocked on a send.
+func (g *Gateway) listAccountToolsForHealth(ctx context.Context, a Account) ([]mcp.Tool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	release, started := g.beginHealthProbe(a)
+	if !started {
+		return nil, errHealthProbeInFlight
+	}
+	result := make(chan healthProbeResult, 1)
+	go func() {
+		tools, err := g.listAccountTools(ctx, a)
+		// Release before waking the caller. The registry represents active
+		// provider work, which ends once listAccountTools returns; doing this
+		// first also makes a completed recovery generation immediately visible
+		// to a subsequent poll.
+		release()
+		result <- healthProbeResult{tools: tools, err: err}
+	}()
+	select {
+	case result := <-result:
+		return result.tools, result.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (g *Gateway) accountHealthProbeTimeout() time.Duration {
+	if g.healthProbeTimeout > 0 {
+		return g.healthProbeTimeout
+	}
+	return defaultHealthProbeTimeout
+}
+
+// healthPresentation is the complete public contract for a failed health
+// probe. Never pass an upstream error string through this function: it may be
+// provider-controlled and is not safe for a browser or an alert webhook.
+func healthPresentation(status string) (normalized, detail, recovery string) {
+	switch status {
+	case healthStatusOK:
+		return healthStatusOK, "", ""
+	case healthStatusNeedsAuth:
+		return healthStatusNeedsAuth, "This connection has not been authorized yet.", healthRecoveryConnect
+	case healthStatusAuthExpired:
+		return healthStatusAuthExpired, "This connection needs to be authorized again.", healthRecoveryReauthorize
+	case healthStatusTimeout:
+		return healthStatusTimeout, "The provider did not respond before the health check timed out.", healthRecoveryRetry
+	case healthStatusUnreachable:
+		return healthStatusUnreachable, "The provider could not be reached. Check its service and try again.", healthRecoveryRetry
+	default:
+		// Treat an unexpected state as unavailable rather than echoing an
+		// arbitrary error/status supplied by an integration.
+		return healthStatusUnreachable, "The provider could not be reached. Check its service and try again.", healthRecoveryRetry
+	}
+}
+
+func classifyHealthProbeError(err error, probeCtx context.Context) string {
+	if errors.Is(err, errHealthProbeInFlight) || errors.Is(err, context.DeadlineExceeded) || errors.Is(probeCtx.Err(), context.DeadlineExceeded) {
+		return healthStatusTimeout
+	}
+	if isUnauthorized(err) {
+		return healthStatusAuthExpired
+	}
+	return healthStatusUnreachable
+}
+
+// Health live-checks every account concurrently, with an independent bounded
+// context for each provider. A slow or cancellation-ignorant upstream becomes
+// one timeout row; it cannot block healthy accounts or the watcher loop.
 func (g *Gateway) Health(ctx context.Context) []AccountHealth {
 	accts := g.store.Accounts()
 	out := make([]AccountHealth, len(accts))
@@ -440,15 +786,18 @@ func (g *Gateway) Health(ctx context.Context) []AccountHealth {
 			started := time.Now()
 			h := AccountHealth{UUID: a.Name, CheckedAt: started.UTC().Format(time.RFC3339)}
 			if a.AuthMode == "oauth" && a.AccessToken == "" && a.RefreshToken == "" {
-				h.Status, h.Detail = "needs_auth", "not connected yet"
-			} else if tools, err := g.upstreamFor(a).ListTools(ctx); err != nil {
-				if isUnauthorized(err) {
-					h.Status, h.Detail = "auth_expired", "re-connect needed"
-				} else {
-					h.Status, h.Detail = "error", err.Error()
-				}
+				h.Status, h.Detail, h.Recovery = healthPresentation(healthStatusNeedsAuth)
 			} else {
-				h.Status, h.ToolCount = "ok", len(tools)
+				probeCtx, cancel := context.WithTimeout(ctx, g.accountHealthProbeTimeout())
+				tools, err := g.listAccountToolsForHealth(probeCtx, a)
+				if err != nil {
+					h.internalErr = err
+					h.Status, h.Detail, h.Recovery = healthPresentation(classifyHealthProbeError(err, probeCtx))
+				} else {
+					h.Status, h.Detail, h.Recovery = healthPresentation(healthStatusOK)
+					h.ToolCount = len(tools)
+				}
+				cancel()
 			}
 			h.LatencyMs = time.Since(started).Milliseconds()
 			out[i] = h
@@ -474,17 +823,82 @@ func (g *Gateway) Aggregate(ctx context.Context) int {
 	return total
 }
 
-// AddAccount registers a single account's tools at runtime (after a connect).
+// AddAccount registers a single account's tools at runtime. It intentionally
+// resolves the account at call time for ordinary console changes.
 func (g *Gateway) AddAccount(ctx context.Context, name string) (int, error) {
 	a, ok := g.store.Account(name)
 	if !ok {
 		return 0, fmt.Errorf("account %q not found", name)
 	}
+	return g.addAccountSnapshot(ctx, a)
+}
+
+// AddAccountForIncarnation is the OAuth-completion variant of AddAccount. A
+// provider callback has already proved and updated one exact account row; if
+// that row was deleted and recreated before tools are registered, fail closed
+// instead of treating the replacement as a successful completion.
+func (g *Gateway) AddAccountForIncarnation(ctx context.Context, name, expectedIncarnationID string) (int, error) {
+	a, ok := g.store.Account(name)
+	if !ok || expectedIncarnationID == "" || a.IncarnationID != expectedIncarnationID {
+		return 0, ErrAccountIncarnation
+	}
+	return g.addAccountSnapshot(ctx, a)
+}
+
+func (g *Gateway) addAccountSnapshot(ctx context.Context, a Account) (int, error) {
 	n, err := g.aggregateAccount(ctx, a)
 	if err == nil {
 		g.RefreshConnectors(ctx)
 	}
 	return n, err
+}
+
+// rebindCachedAccount updates only the closure identity for an ownership-only
+// account move. Tool discovery, aliases, and policy are unchanged by that
+// operation, so re-listing an upstream here would make an already-committed
+// move depend on an unrelated network round trip. Returning false means the
+// cache was absent or no longer represented expectedPreviousRevision; callers
+// should then fall back to a full aggregation.
+func (g *Gateway) rebindCachedAccount(a Account, expectedPreviousRevision int64) bool {
+	if a.IncarnationID == "" || a.Revision < 1 || expectedPreviousRevision < 1 {
+		return false
+	}
+	up := g.upstreamFor(a)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	current, live := g.store.Account(a.Name)
+	if !live || current.IncarnationID != a.IncarnationID || current.Revision != a.Revision || !equalAccountSnapshotURL(current.URL, a.URL) {
+		return false
+	}
+	cached, cachedOK := g.cached[a.Name]
+	if !cachedOK {
+		return false
+	}
+	for _, tool := range cached {
+		if tool.accountIncarnationID == "" || tool.accountIncarnationID != a.IncarnationID || tool.accountRevision != expectedPreviousRevision || !equalAccountSnapshotURL(tool.accountURL, a.URL) {
+			return false
+		}
+	}
+
+	if old := g.byAcct[a.Name]; len(old) > 0 {
+		g.mcp.DeleteTools(old...)
+	}
+	updated := make([]cachedTool, 0, len(cached))
+	rootNames := make([]string, 0, len(cached))
+	for _, tool := range cached {
+		tool.accountRevision = a.Revision
+		tool.accountURL = a.URL
+		tool.handler = g.accountToolHandler(a, up, tool.sourceName)
+		updated = append(updated, tool)
+		if !a.IsPersonal() {
+			g.mcp.AddTool(tool.tool, tool.handler)
+			rootNames = append(rootNames, tool.tool.Name)
+		}
+	}
+	g.cached[a.Name] = updated
+	g.byAcct[a.Name] = rootNames
+	g.projectedIncarnations[a.Name] = a.IncarnationID
+	return true
 }
 
 // StartWatch runs the background reliability loop: refresh-ahead for OAuth
@@ -513,7 +927,7 @@ func (g *Gateway) tick(ctx context.Context) {
 	refreshed := 0
 	for _, a := range g.store.Accounts() {
 		if a.AuthMode == "oauth" && a.RefreshToken != "" {
-			if err := g.refreshAccount(ctx, a.Name); err != nil {
+			if err := g.refreshAccount(ctx, a.Name, a.IncarnationID); err != nil {
 				log.Printf("engine: refresh-ahead %q: %v", a.Name, err)
 			} else {
 				refreshed++
@@ -524,6 +938,11 @@ func (g *Gateway) tick(ctx context.Context) {
 		log.Printf("engine: refresh-ahead refreshed %d oauth account(s)", refreshed)
 	}
 	for _, h := range g.Health(ctx) { // health sweep covers token accounts too
+		if h.internalErr != nil && !errors.Is(h.internalErr, errHealthProbeInFlight) {
+			// Preserve the real cause only in Engine-controlled diagnostics.
+			// Browser responses and outbound alerts use healthPresentation below.
+			log.Printf("engine: health probe account=%q status=%s err=%v", h.UUID, h.Status, h.internalErr)
+		}
 		g.evalAlert(h)
 	}
 	g.purgeAudit(ctx)
@@ -552,17 +971,25 @@ func (g *Gateway) purgeAudit(ctx context.Context) {
 
 // evalAlert fires only on a state change, so a sustained outage alerts once.
 func (g *Gateway) evalAlert(h AccountHealth) {
+	status, detail, recovery := healthPresentation(h.Status)
 	g.mu.Lock()
 	if g.alertState == nil {
 		g.alertState = map[string]bool{}
 	}
 	was := g.alertState[h.UUID]
-	now := h.Status != "ok"
+	now := status != healthStatusOK
 	g.alertState[h.UUID] = now
 	g.mu.Unlock()
 	switch {
 	case now && !was:
-		g.fireAlert(fmt.Sprintf("⚠️ Synaxis: account %q is DOWN (%s) — %s", h.UUID, h.Status, h.Detail))
+		// Do not interpolate h.Detail here. AccountHealth is public and may be
+		// assembled by callers/tests; outbound alerts must remain safe even if a
+		// future caller accidentally supplies an upstream error string.
+		message := fmt.Sprintf("⚠️ Synaxis: account %q needs attention (%s). %s", h.UUID, status, detail)
+		if recovery != "" {
+			message += fmt.Sprintf(" Recommended recovery: %s.", recovery)
+		}
+		g.fireAlert(message)
 	case !now && was:
 		g.fireAlert(fmt.Sprintf("✅ Synaxis: account %q recovered", h.UUID))
 	}

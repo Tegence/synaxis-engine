@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/mark3labs/mcp-go/mcp"
 )
 
 func TestToolPolicyPersistsAliasDescriptionAndEnabledState(t *testing.T) {
@@ -144,6 +146,11 @@ func TestFlaggedTriagePersistsAndAppliesPolicy(t *testing.T) {
 
 func TestPortableConfigExportAndMergeImport(t *testing.T) {
 	mux, tok, g := newConnectorConsole(t, map[string][]string{"linear": {"get_issue"}, "notion": {"search"}})
+	linearSeed, _ := g.store.Account("linear")
+	linearSeed.URL = "https://mcp.linear.app/mcp"
+	if err := g.store.Upsert(context.Background(), linearSeed); err != nil {
+		t.Fatalf("seed portable account URL: %v", err)
+	}
 	rec, _ := doJSON(t, mux, tok, http.MethodGet, "/api/config", "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GET config = %d, body %s", rec.Code, rec.Body)
@@ -191,6 +198,151 @@ func TestPortableConfigExportAndMergeImport(t *testing.T) {
 	connector, ok := connectorStore.VirtualConnector(context.Background(), "research")
 	if !ok || !connector.Record || connector.MaxResultBytes != 32768 {
 		t.Fatalf("imported connector = %+v", connector)
+	}
+}
+
+func TestPortableConfigImportKeepsCurrentOwnershipAfterMove(t *testing.T) {
+	mux, tok, g := newConnectorConsole(t, map[string][]string{"notion": {"search"}})
+	ctx := context.Background()
+	store := g.store.(*FileStore)
+	before, ok := store.Account("notion")
+	if !ok {
+		t.Fatal("seed account missing")
+	}
+	before.URL = "https://notion.example/mcp"
+	if err := store.Upsert(ctx, before); err != nil {
+		t.Fatalf("seed portable account URL: %v", err)
+	}
+	before, ok = store.Account("notion")
+	if !ok {
+		t.Fatal("seed account missing after URL update")
+	}
+	target, err := store.CreateConnectionNamespace(ctx, ConnectionNamespace{Label: "Target workspace"})
+	if err != nil {
+		t.Fatalf("create target namespace: %v", err)
+	}
+	if _, err := g.MoveAccountToConnectionNamespace(ctx, before.Name, before.IncarnationID, AccountConnectionAssignment{
+		ConnectionNamespaceID: target.ID,
+		Scope:                 ConnectionScopeShared,
+	}, before.Revision); err != nil {
+		t.Fatalf("move account after export snapshot: %v", err)
+	}
+
+	// A config exported before the move contains only the legacy, display
+	// namespace. Importing it must update policy metadata, never restore that
+	// old ownership boundary.
+	payload := fmt.Sprintf(`{"version":1,"accounts":[{"name":"notion","displayName":"Imported Notion","connectionNamespace":%q,"group":%q,"url":%q,"readOnly":true,"disabledTools":["write"]}],"connectors":[]}`,
+		before.Group, before.Group, before.URL)
+	rec, _ := doJSON(t, mux, tok, http.MethodPost, "/api/config/import", payload)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST stale ownership import = %d, body %s", rec.Code, rec.Body)
+	}
+	after, ok := store.Account("notion")
+	if !ok {
+		t.Fatal("account missing after import")
+	}
+	if after.ConnectionNamespaceID != target.ID || after.ConnectionScope != ConnectionScopeShared || after.Group != target.Label {
+		t.Fatalf("import restored stale ownership: before=%+v after=%+v", before, after)
+	}
+	if after.Label != "Imported Notion" || !after.ReadOnly || !toSet(after.DisabledTools)["write"] || after.BearerToken != "t" {
+		t.Fatalf("import did not apply safe metadata or preserve credentials: %+v", after)
+	}
+}
+
+func TestPortableConfigImportRejectsCredentialRetargeting(t *testing.T) {
+	tests := []struct {
+		name       string
+		authMode   string
+		secret     string
+		credential func(*Account, string)
+	}{
+		{
+			name: "bearer token", authMode: "token", secret: "bearer-do-not-leak",
+			credential: func(account *Account, secret string) { account.BearerToken = secret },
+		},
+		{
+			name: "OAuth access token", authMode: "oauth", secret: "access-do-not-leak",
+			credential: func(account *Account, secret string) { account.AccessToken = secret },
+		},
+		{
+			name: "OAuth refresh token", authMode: "oauth", secret: "refresh-do-not-leak",
+			credential: func(account *Account, secret string) { account.RefreshToken = secret },
+		},
+		{
+			name: "OAuth client secret", authMode: "oauth", secret: "client-do-not-leak",
+			credential: func(account *Account, secret string) { account.ClientSecret = secret },
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mux, tok, g := newConnectorConsole(t, map[string][]string{"secure": {"read"}})
+			account, _ := g.store.Account("secure")
+			account.URL = "https://trusted.example/mcp?tenant=one"
+			account.AuthMode = tc.authMode
+			account.BearerToken = ""
+			tc.credential(&account, tc.secret)
+			if err := g.store.Upsert(context.Background(), account); err != nil {
+				t.Fatalf("seed credential-bearing account: %v", err)
+			}
+			upstreamLists := 0
+			g.listTools = func(context.Context, Account) ([]mcp.Tool, error) {
+				upstreamLists++
+				return nil, nil
+			}
+
+			payload := `{"version":1,"accounts":[{"name":"secure","displayName":"Secure","url":"https://attacker.example/mcp?tenant=one","readOnly":true}],"connectors":[]}`
+			rec, got := doJSON(t, mux, tok, http.MethodPost, "/api/config/import", payload)
+			if rec.Code != http.StatusConflict {
+				t.Fatalf("retarget import = %d, body %s", rec.Code, rec.Body)
+			}
+			if !strings.Contains(got["error"].(string), "disconnect") {
+				t.Fatalf("retarget error = %v", got)
+			}
+			if strings.Contains(rec.Body.String(), tc.secret) || strings.Contains(rec.Body.String(), "tenant=one") {
+				t.Fatalf("retarget error leaked stored secret material: %s", rec.Body)
+			}
+			if upstreamLists != 0 {
+				t.Fatalf("rejected retarget dialed attacker-controlled upstream %d times", upstreamLists)
+			}
+			stored, _ := g.store.Account("secure")
+			if stored.URL != account.URL || stored.ReadOnly != account.ReadOnly {
+				t.Fatalf("rejected import mutated account: %+v", stored)
+			}
+		})
+	}
+}
+
+func TestPortableConfigImportAcceptsLegacyGroupOnly(t *testing.T) {
+	mux, tok, g := newConnectorConsole(t, nil)
+	payload := `{"version":1,"accounts":[{"name":"legacy_notion","displayName":"Legacy Notion","group":"Lelapa","url":"https://mcp.example/mcp","readOnly":false}],"connectors":[]}`
+	rec, _ := doJSON(t, mux, tok, http.MethodPost, "/api/config/import", payload)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("legacy group-only import = %d, body %s", rec.Code, rec.Body)
+	}
+	account, ok := g.store.Account("legacy_notion")
+	if !ok || account.Group != "Lelapa" {
+		t.Fatalf("legacy group-only account = %+v ok=%v", account, ok)
+	}
+}
+
+func TestPortableConfigImportAcceptsCanonicalCredentialURLMatch(t *testing.T) {
+	mux, tok, g := newConnectorConsole(t, map[string][]string{"secure": {"read"}})
+	account, _ := g.store.Account("secure")
+	account.URL = "https://MCP.EXAMPLE:443"
+	account.BearerToken = "preserved-secret"
+	if err := g.store.Upsert(context.Background(), account); err != nil {
+		t.Fatalf("seed credential-bearing account: %v", err)
+	}
+
+	payload := `{"version":1,"accounts":[{"name":"secure","displayName":"Secure","url":"https://mcp.example/","readOnly":true}],"connectors":[]}`
+	rec, _ := doJSON(t, mux, tok, http.MethodPost, "/api/config/import", payload)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("canonical URL import = %d, body %s", rec.Code, rec.Body)
+	}
+	stored, _ := g.store.Account("secure")
+	if stored.URL != "https://mcp.example/" || stored.BearerToken != "preserved-secret" {
+		t.Fatalf("canonical URL import = %+v", stored)
 	}
 }
 

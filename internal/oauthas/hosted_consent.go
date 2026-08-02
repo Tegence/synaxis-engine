@@ -1,32 +1,44 @@
 package oauthas
 
 import (
+	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/ed25519"
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 )
 
 const (
-	hostedConsentTTL        = 5 * time.Minute
-	maxPendingConsents      = 2048
-	hostedAssertionType     = "synaxis-engine-consent+jwt"
-	hostedRequestTokenLimit = 512
-	hostedAssertionLimit    = 8 << 10
+	hostedConsentTTL            = 5 * time.Minute
+	hostedAssertionType         = "synaxis-engine-consent+jwt"
+	hostedRequestPlaintextLimit = 4 << 10
+	hostedRequestTokenLimit     = 6 << 10
+	hostedAssertionLimit        = 8 << 10
+	hostedRequestVersion        = "v2"
+	hostedRequestKeyDomain      = "synaxis-hosted-consent-request-key|v2"
+	hostedRequestAADDomain      = "synaxis-hosted-consent-request|v2|"
+	hostedRequestBootSaltSize   = 32
+	hostedRequestDerivedKeySize = 32
 )
 
+var errHostedRequestTooLarge = errors.New("hosted consent request is too large")
+
 // authorizationRequest is the exact OAuth request the Engine approved for
-// consent. In hosted mode it stays inside the Engine; the browser receives
-// only an opaque, short-lived HMAC token that identifies this record.
+// consent. In hosted mode the browser receives only an opaque, short-lived
+// authenticated-encrypted representation of this request.
 type authorizationRequest struct {
 	clientID     string
 	redirectURI  string
@@ -35,10 +47,11 @@ type authorizationRequest struct {
 	scope        string
 	resourceRaw  string
 	resourcePath string
+	generation   string
 }
 
 func (r authorizationRequest) withinLimits() bool {
-	return len(r.clientID) <= 256 &&
+	return len(r.clientID) <= maxClientIDLength &&
 		len(r.redirectURI) <= 2048 &&
 		len(r.state) <= 2048 &&
 		len(r.challenge) <= 128 &&
@@ -52,9 +65,44 @@ type hostedConsent struct {
 	publicKey ed25519.PublicKey
 }
 
-type pendingConsent struct {
-	request authorizationRequest
-	expires time.Time
+type hostedRequestPayload struct {
+	ClientID     string `json:"client_id"`
+	RedirectURI  string `json:"redirect_uri"`
+	State        string `json:"state"`
+	Challenge    string `json:"challenge"`
+	Scope        string `json:"scope"`
+	ResourceRaw  string `json:"resource_raw"`
+	ResourcePath string `json:"resource_path"`
+	Generation   string `json:"generation"`
+	ExpiresAt    int64  `json:"expires_at"`
+}
+
+// newHostedRequestAEAD derives an ephemeral per-process key from the stable
+// Engine secret and fresh boot entropy. The boot salt is deliberately not
+// persisted or encoded into request tokens, so consent requests cannot cross
+// an Engine restart even though access tokens and dynamic registrations can.
+func newHostedRequestAEAD(secret []byte) cipher.AEAD {
+	bootSalt := make([]byte, hostedRequestBootSaltSize)
+	if _, err := io.ReadFull(rand.Reader, bootSalt); err != nil {
+		panic("oauthas: generate hosted consent boot salt: " + err.Error())
+	}
+	kdf := hmac.New(sha256.New, secret)
+	_, _ = kdf.Write([]byte(hostedRequestKeyDomain))
+	_, _ = kdf.Write([]byte{0})
+	_, _ = kdf.Write(bootSalt)
+	key := kdf.Sum(nil)
+	if len(key) != hostedRequestDerivedKeySize {
+		panic("oauthas: derive hosted consent key")
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		panic("oauthas: initialize hosted consent cipher: " + err.Error())
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		panic("oauthas: initialize hosted consent AEAD: " + err.Error())
+	}
+	return aead
 }
 
 // ConfigureHostedConsent delegates /authorize approval to a generic external
@@ -136,24 +184,46 @@ func (s *Server) authorizedResource(raw string) (string, bool) {
 func (s *Server) beginHostedConsent(w http.ResponseWriter, r *http.Request, request authorizationRequest) {
 	now := s.now()
 	expires := now.Add(hostedConsentTTL)
-	id := randToken(24)
-	token := s.hostedRequestToken(id, expires.Unix())
 
-	s.mu.Lock()
-	s.cleanupHostedStateLocked(now)
-	if len(s.pendingConsents) >= maxPendingConsents {
-		s.mu.Unlock()
-		oauthErr(w, http.StatusServiceUnavailable, "temporarily_unavailable", "too many pending consent requests")
+	s.mu.RLock()
+	if request.generation == "" || request.generation != s.tokenGeneration {
+		s.mu.RUnlock()
+		s.redirectErr(w, r, request.redirectURI, request.state, "invalid_request", "authorization request was revoked")
 		return
 	}
-	s.pendingConsents[id] = pendingConsent{request: request, expires: expires}
-	s.mu.Unlock()
+	s.mu.RUnlock()
+
+	token, err := s.hostedRequestToken(request, expires)
+	if err != nil {
+		if errors.Is(err, errHostedRequestTooLarge) {
+			s.redirectErr(w, r, request.redirectURI, request.state, "invalid_request", "authorization request is too large")
+			return
+		}
+		oauthErr(w, http.StatusServiceUnavailable, "temporarily_unavailable", "could not create consent request")
+		return
+	}
+
+	// Sealing does not hold the revocation barrier because entropy collection
+	// must never stall RevokeAll. Recheck immediately before delivery; a revoke
+	// after this point still makes the embedded generation unusable.
+	s.mu.RLock()
+	current := request.generation != "" && request.generation == s.tokenGeneration
+	s.mu.RUnlock()
+	if !current {
+		s.redirectErr(w, r, request.redirectURI, request.state, "invalid_request", "authorization request was revoked")
+		return
+	}
 
 	consentURL := *s.hosted.url
 	q := consentURL.Query()
 	q.Set("request", token)
 	q.Set("engine_issuer", s.issuer)
 	q.Set("completion_url", s.issuer+"/authorize/complete")
+	// Platform uses this narrow, non-authoritative path hint to choose the
+	// membership permission for the consent screen. The Engine retains the
+	// encrypted request as authority and verifies the signed role against this
+	// exact resource before it creates a code.
+	q.Set("resource_path", request.resourcePath)
 	consentURL.RawQuery = q.Encode()
 
 	w.Header().Set("Cache-Control", "no-store")
@@ -161,31 +231,98 @@ func (s *Server) beginHostedConsent(w http.ResponseWriter, r *http.Request, requ
 	http.Redirect(w, r, consentURL.String(), http.StatusFound)
 }
 
-func (s *Server) hostedRequestToken(id string, expires int64) string {
-	exp := strconv.FormatInt(expires, 10)
-	signingInput := "v1." + exp + "." + id
-	signature := s.sign("hosted-consent-request|" + s.issuer + "|" + signingInput)
-	return signingInput + "." + signature
+func (s *Server) hostedRequestToken(request authorizationRequest, expires time.Time) (string, error) {
+	payload := hostedRequestPayload{
+		ClientID:     request.clientID,
+		RedirectURI:  request.redirectURI,
+		State:        request.state,
+		Challenge:    request.challenge,
+		Scope:        request.scope,
+		ResourceRaw:  request.resourceRaw,
+		ResourcePath: request.resourcePath,
+		Generation:   request.generation,
+		ExpiresAt:    expires.Unix(),
+	}
+	var plaintext bytes.Buffer
+	encoder := json.NewEncoder(&plaintext)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(payload); err != nil {
+		return "", fmt.Errorf("encode hosted consent request: %w", err)
+	}
+	encodedPlaintext := bytes.TrimSuffix(plaintext.Bytes(), []byte{'\n'})
+	if len(encodedPlaintext) == 0 || len(encodedPlaintext) > hostedRequestPlaintextLimit {
+		return "", errHostedRequestTooLarge
+	}
+
+	nonce := make([]byte, s.hostedRequestAEAD.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return "", fmt.Errorf("generate hosted consent nonce: %w", err)
+	}
+	sealed := make([]byte, len(nonce), len(nonce)+len(encodedPlaintext)+s.hostedRequestAEAD.Overhead())
+	copy(sealed, nonce)
+	sealed = s.hostedRequestAEAD.Seal(
+		sealed,
+		nonce,
+		encodedPlaintext,
+		[]byte(hostedRequestAADDomain+s.issuer),
+	)
+	token := hostedRequestVersion + "." + base64.RawURLEncoding.EncodeToString(sealed)
+	if len(token) > hostedRequestTokenLimit {
+		return "", errHostedRequestTooLarge
+	}
+	return token, nil
 }
 
-func (s *Server) verifyHostedRequestToken(token string) (string, error) {
+func (s *Server) verifyHostedRequestToken(token string) (authorizationRequest, time.Time, error) {
 	if len(token) == 0 || len(token) > hostedRequestTokenLimit {
-		return "", errors.New("invalid hosted consent request")
+		return authorizationRequest{}, time.Time{}, errors.New("invalid hosted consent request")
 	}
 	parts := strings.Split(token, ".")
-	if len(parts) != 4 || parts[0] != "v1" || !validOpaqueID(parts[2]) {
-		return "", errors.New("invalid hosted consent request")
+	if len(parts) != 2 || parts[0] != hostedRequestVersion || parts[1] == "" {
+		return authorizationRequest{}, time.Time{}, errors.New("invalid hosted consent request")
 	}
-	expires, err := strconv.ParseInt(parts[1], 10, 64)
-	if err != nil || s.now().Unix() >= expires {
-		return "", errors.New("hosted consent request expired")
+	sealed, err := base64.RawURLEncoding.Strict().DecodeString(parts[1])
+	if err != nil || len(sealed) <= s.hostedRequestAEAD.NonceSize()+s.hostedRequestAEAD.Overhead() {
+		return authorizationRequest{}, time.Time{}, errors.New("invalid hosted consent request")
 	}
-	signingInput := strings.Join(parts[:3], ".")
-	expected := s.sign("hosted-consent-request|" + s.issuer + "|" + signingInput)
-	if subtle.ConstantTimeCompare([]byte(parts[3]), []byte(expected)) != 1 {
-		return "", errors.New("invalid hosted consent request")
+	nonce := sealed[:s.hostedRequestAEAD.NonceSize()]
+	plaintext, err := s.hostedRequestAEAD.Open(
+		nil,
+		nonce,
+		sealed[s.hostedRequestAEAD.NonceSize():],
+		[]byte(hostedRequestAADDomain+s.issuer),
+	)
+	if err != nil || len(plaintext) == 0 || len(plaintext) > hostedRequestPlaintextLimit {
+		return authorizationRequest{}, time.Time{}, errors.New("invalid hosted consent request")
 	}
-	return parts[2], nil
+
+	var payload hostedRequestPayload
+	decoder := json.NewDecoder(bytes.NewReader(plaintext))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil {
+		return authorizationRequest{}, time.Time{}, errors.New("invalid hosted consent request")
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return authorizationRequest{}, time.Time{}, errors.New("invalid hosted consent request")
+	}
+	request := authorizationRequest{
+		clientID:     payload.ClientID,
+		redirectURI:  payload.RedirectURI,
+		state:        payload.State,
+		challenge:    payload.Challenge,
+		scope:        payload.Scope,
+		resourceRaw:  payload.ResourceRaw,
+		resourcePath: payload.ResourcePath,
+		generation:   payload.Generation,
+	}
+	now := s.now()
+	expires := time.Unix(payload.ExpiresAt, 0)
+	if !request.withinLimits() || request.generation == "" ||
+		!now.Before(expires) || expires.After(now.Add(hostedConsentTTL)) {
+		return authorizationRequest{}, time.Time{}, errors.New("hosted consent request expired or invalid")
+	}
+	return request, expires, nil
 }
 
 type hostedAssertionHeader struct {
@@ -194,8 +331,20 @@ type hostedAssertionHeader struct {
 }
 
 type hostedApprovalClaims struct {
-	Audience      string `json:"aud"`
-	EngineIssuer  string `json:"engine_issuer"`
+	Audience     string `json:"aud"`
+	EngineIssuer string `json:"engine_issuer"`
+	// ResourcePath must be signed by Platform and exactly match the sealed
+	// request.  The browser-visible query parameter is only a display hint; it
+	// is never sufficient authority for a delegated client endpoint.
+	ResourcePath string `json:"resource_path"`
+	// Subject is supplied exclusively by the Platform-signed approval. It is
+	// optional for legacy shared resources, but required by the Engine callback
+	// before a client-bound endpoint can be authorized.
+	Subject string `json:"sub,omitempty"`
+	// Role is the Platform workspace role that approved the request. The
+	// Engine validates it against the resource class; a browser cannot upgrade
+	// an operator's personal-client approval into broad root MCP access.
+	Role          string `json:"role,omitempty"`
 	RequestSHA256 string `json:"request_sha256"`
 	JTI           string `json:"jti"`
 	ExpiresAt     int64  `json:"exp"`
@@ -241,6 +390,9 @@ func (s *Server) verifyHostedApproval(assertion, requestToken string) (hostedApp
 	expectedHash := base64.RawURLEncoding.EncodeToString(requestHash[:])
 	if claims.Audience != s.issuer ||
 		claims.EngineIssuer != s.issuer ||
+		claims.ResourcePath == "" ||
+		(claims.Subject != "" && !validHostedSubject(claims.Subject)) ||
+		(claims.Role != "" && !validHostedRole(claims.Role)) ||
 		subtle.ConstantTimeCompare([]byte(claims.RequestSHA256), []byte(expectedHash)) != 1 ||
 		!validOpaqueID(claims.JTI) ||
 		claims.ExpiresAt <= now.Unix() ||
@@ -248,6 +400,29 @@ func (s *Server) verifyHostedApproval(assertion, requestToken string) (hostedApp
 		return hostedApprovalClaims{}, errors.New("invalid hosted consent approval")
 	}
 	return claims, nil
+}
+
+func validHostedRole(role string) bool {
+	switch role {
+	case "owner", "admin", "operator", "viewer":
+		return true
+	default:
+		return false
+	}
+}
+
+func validHostedSubject(subject string) bool {
+	if len(subject) == 0 || len(subject) > 200 || strings.TrimSpace(subject) != subject {
+		return false
+	}
+	for _, c := range subject {
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '@' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func validOpaqueID(id string) bool {
@@ -285,16 +460,8 @@ func (s *Server) handleHostedConsentComplete(w http.ResponseWriter, r *http.Requ
 	requestToken := r.PostForm.Get("request")
 	assertion := r.PostForm.Get("assertion")
 
-	id, err := s.verifyHostedRequestToken(requestToken)
+	request, requestExpires, err := s.verifyHostedRequestToken(requestToken)
 	if err != nil {
-		oauthErr(w, http.StatusBadRequest, "invalid_request", "invalid or expired consent request")
-		return
-	}
-
-	s.mu.Lock()
-	pending, exists := s.pendingConsents[id]
-	s.mu.Unlock()
-	if !exists || !s.now().Before(pending.expires) {
 		oauthErr(w, http.StatusBadRequest, "invalid_request", "invalid or expired consent request")
 		return
 	}
@@ -304,18 +471,35 @@ func (s *Server) handleHostedConsentComplete(w http.ResponseWriter, r *http.Requ
 		oauthErr(w, http.StatusUnauthorized, "invalid_approval", "approval assertion rejected")
 		return
 	}
-	if !s.revalidateHostedRequest(pending.request) {
+	if claims.ResourcePath != request.resourcePath {
+		oauthErr(w, http.StatusUnauthorized, "invalid_approval", "approval assertion rejected")
+		return
+	}
+	if err := s.syncTokenGeneration(r.Context()); err != nil {
+		oauthErr(w, http.StatusServiceUnavailable, "temporarily_unavailable", "authorization state unavailable")
+		return
+	}
+	if !s.revalidateHostedRequest(request) {
 		oauthErr(w, http.StatusBadRequest, "invalid_request", "authorization request is no longer valid")
 		return
 	}
 
-	// Consume both the request and the Platform assertion jti atomically. The
-	// second check closes the race between two simultaneous completion POSTs.
+	// Reserve the consent request before handing the client-bound authorization
+	// decision to durable Engine state. This avoids binding two different
+	// Platform users during a concurrent approval race while also keeping store
+	// I/O outside oauthas's global generation lock.
 	now := s.now()
+	requestHash := sha256.Sum256([]byte(requestToken))
+	requestReplayKey := base64.RawURLEncoding.EncodeToString(requestHash[:])
 	s.mu.Lock()
 	s.cleanupHostedStateLocked(now)
-	pending, exists = s.pendingConsents[id]
-	if !exists || !now.Before(pending.expires) {
+	if !now.Before(time.Unix(claims.ExpiresAt, 0)) {
+		s.mu.Unlock()
+		oauthErr(w, http.StatusUnauthorized, "invalid_approval", "approval assertion rejected")
+		return
+	}
+	if request.generation == "" || request.generation != s.tokenGeneration ||
+		!now.Before(requestExpires) {
 		s.mu.Unlock()
 		oauthErr(w, http.StatusBadRequest, "invalid_request", "invalid or expired consent request")
 		return
@@ -325,22 +509,106 @@ func (s *Server) handleHostedConsentComplete(w http.ResponseWriter, r *http.Requ
 		oauthErr(w, http.StatusConflict, "approval_replayed", "approval assertion has already been used")
 		return
 	}
-	delete(s.pendingConsents, id)
-	s.usedApprovalJTIs[claims.JTI] = time.Unix(claims.ExpiresAt, 0)
+	if _, replayed := s.usedConsentRequests[requestReplayKey]; replayed {
+		s.mu.Unlock()
+		oauthErr(w, http.StatusConflict, "approval_replayed", "consent request has already been decided")
+		return
+	}
+	if _, inFlight := s.hostedInFlightRequests[requestReplayKey]; inFlight {
+		s.mu.Unlock()
+		oauthErr(w, http.StatusConflict, "approval_replayed", "consent request is already being decided")
+		return
+	}
+	s.hostedInFlightRequests[requestReplayKey] = struct{}{}
 	s.mu.Unlock()
 
+	// A denial has no client-bound side effect. An approval is checked by the
+	// Engine callback before code issuance. For client-bound resources, that
+	// callback is mandatory; for a shared resource it provides defense in depth
+	// when a current hosted Engine has been configured with role-aware consent.
+	if claims.Approved && s.hostedConsentAuthorizer != nil {
+		if claims.Subject == "" || claims.Role == "" {
+			s.mu.Lock()
+			delete(s.hostedInFlightRequests, requestReplayKey)
+			s.mu.Unlock()
+			oauthErr(w, http.StatusForbidden, "access_denied", "the resource owner is not permitted to authorize this client")
+			return
+		}
+		if err := s.hostedConsentAuthorizer(r.Context(), claims.Subject, claims.Role, request.clientID, request.resourcePath); err != nil {
+			s.mu.Lock()
+			delete(s.hostedInFlightRequests, requestReplayKey)
+			s.mu.Unlock()
+			oauthErr(w, http.StatusForbidden, "access_denied", "the resource owner is not permitted to authorize this client")
+			return
+		}
+	} else if claims.Approved && clientBoundResource(request.resourcePath) {
+		s.mu.Lock()
+		delete(s.hostedInFlightRequests, requestReplayKey)
+		s.mu.Unlock()
+		oauthErr(w, http.StatusForbidden, "access_denied", "the resource owner is not permitted to authorize this client")
+		return
+	}
+
+	// Consume the Platform assertion jti and sealed request hash, then create
+	// the code under the generation barrier. Anonymous begins carry no
+	// server-side pending state; replay records are created only after a valid
+	// Platform signature and expire with the sealed request.
+	s.mu.Lock()
+	releaseInFlight := func() {
+		delete(s.hostedInFlightRequests, requestReplayKey)
+		s.mu.Unlock()
+	}
+	// The first reservation wins, but Revocation or a natural request expiry may
+	// have happened while the durable authorizer ran. Revalidate every state
+	// prerequisite before minting a code.
+	now = s.now()
+	if !now.Before(time.Unix(claims.ExpiresAt, 0)) ||
+		request.generation == "" || request.generation != s.tokenGeneration ||
+		!now.Before(requestExpires) {
+		releaseInFlight()
+		oauthErr(w, http.StatusBadRequest, "invalid_request", "invalid or expired consent request")
+		return
+	}
+	if _, replayed := s.usedApprovalJTIs[claims.JTI]; replayed {
+		releaseInFlight()
+		oauthErr(w, http.StatusConflict, "approval_replayed", "approval assertion has already been used")
+		return
+	}
+	if _, replayed := s.usedConsentRequests[requestReplayKey]; replayed {
+		releaseInFlight()
+		oauthErr(w, http.StatusConflict, "approval_replayed", "consent request has already been decided")
+		return
+	}
+	code := ""
+	if claims.Approved {
+		var created bool
+		code, created = s.createAuthorizationCodeLocked(request)
+		if !created {
+			releaseInFlight()
+			oauthErr(w, http.StatusBadRequest, "invalid_request", "authorization request was revoked")
+			return
+		}
+	}
+	s.usedApprovalJTIs[claims.JTI] = requestExpires
+	s.usedConsentRequests[requestReplayKey] = requestExpires
+
 	if !claims.Approved {
+		releaseInFlight()
 		s.redirectErr(
 			w,
 			r,
-			pending.request.redirectURI,
-			pending.request.state,
+			request.redirectURI,
+			request.state,
 			"access_denied",
 			"the resource owner denied the request",
 		)
 		return
 	}
-	s.completeAuthorization(w, r, pending.request)
+	releaseInFlight()
+	// Delivery stays outside the barrier. If revocation wins before the client
+	// receives this response, the code has already been cleared and cannot be
+	// redeemed.
+	s.redirectAuthorizationCode(w, r, request, code)
 }
 
 func (s *Server) revalidateHostedRequest(request authorizationRequest) bool {
@@ -351,25 +619,29 @@ func (s *Server) revalidateHostedRequest(request authorizationRequest) bool {
 	if !ok || resource != request.resourcePath {
 		return false
 	}
-	if _, ok := s.epochFor(resource); !ok {
+	s.mu.RLock()
+	if request.generation == "" || request.generation != s.tokenGeneration {
+		s.mu.RUnlock()
 		return false
 	}
-	s.mu.Lock()
-	client, ok := s.clients[request.clientID]
-	s.mu.Unlock()
+	if _, ok := s.epochForLocked(resource); !ok {
+		s.mu.RUnlock()
+		return false
+	}
+	s.mu.RUnlock()
 	_, validRedirect := validClientRedirectURI(request.redirectURI)
-	return ok && validRedirect && client.redirectURIs[request.redirectURI]
+	return validRedirect && s.clientAllowsRedirect(request.clientID, request.redirectURI)
 }
 
 func (s *Server) cleanupHostedStateLocked(now time.Time) {
-	for id, pending := range s.pendingConsents {
-		if !now.Before(pending.expires) {
-			delete(s.pendingConsents, id)
-		}
-	}
 	for jti, expires := range s.usedApprovalJTIs {
 		if !now.Before(expires) {
 			delete(s.usedApprovalJTIs, jti)
+		}
+	}
+	for requestHash, expires := range s.usedConsentRequests {
+		if !now.Before(expires) {
+			delete(s.usedConsentRequests, requestHash)
 		}
 	}
 }

@@ -12,15 +12,21 @@ not engine dependencies.
 
 ## Included capabilities
 
-- MCP Streamable HTTP at `/mcp` and curated `/mcp/{connector}` endpoints
+- MCP Streamable HTTP at `/mcp`, reusable `/mcp/{endpoint}` whole-connection
+  bundles, curated `/mcp/{connector}` endpoints, and subject-bound
+  `/mcp/clients/{client}` endpoints
 - MCP-facing OAuth authorization server with DCR, PKCE, audience binding, and
   refresh grants
 - OAuth client support for upstream MCP providers, including discovery,
   dynamic or static client registration, PKCE, refresh, and SSRF protections
-- multiple accounts from the same provider with stable tool namespaces
+- multiple independently credentialed connections from the same provider,
+  organized in owning namespaces with stable tool prefixes
+- provider-agnostic, many-to-many endpoint membership without credential
+  duplication
 - live tool curation, aliases, descriptions, and conservative read-only policy
 - virtual connectors with per-tool approvals and token-epoch revocation
-- response redaction, result size caps, and prompt-injection flagging
+- connector-only response redaction, result size caps, and prompt-injection
+  flagging
 - summary audit records, optional encrypted payload recording, and replay
 - encrypted Postgres credential storage or a local JSON store for development
 - proactive health checks, credential refresh, and operational alerts
@@ -30,21 +36,38 @@ These capabilities are part of the Apache-2.0 engine. A hosted plan may govern
 use of the managed Synaxis service, but it does not remove functionality from
 self-hosted engine builds.
 
-## Run locally
+## Secure development quickstart
 
 Requirements:
 
 - Go 1.25.5 or newer
 - optional Postgres for durable production storage
 
+Run these commands from `backend/` in the private monorepo, or from the
+standalone Engine repository root after export:
+
 ```bash
-cp .env.example .env
+go mod download
+umask 077
+ENGINE_ISSUER=http://localhost:8080 \
+ENGINE_DEVELOPMENT_MODE=true \
 go run ./cmd/engine
 ```
 
-The development defaults listen on `http://localhost:8080`. Add
-`http://localhost:8080/mcp` to an MCP client after completing the engine's
-consent flow.
+The Engine prints a fresh temporary console/consent password and keeps its
+ephemeral signing secret in memory. Confirm startup with
+`curl http://localhost:8080/healthz`, then add `http://localhost:8080/mcp` to
+an MCP client and complete consent with the printed password. The development
+server listens on all interfaces, so keep it behind a local firewall and never
+forward port 8080 from an untrusted network. The generated password and signing
+secret change on restart.
+
+Development mode is an explicit local sandbox, not a shortcut for a persistent
+deployment. For self-hosting, supply unique `ENGINE_PASSWORD` and
+`ENGINE_SECRET` values, enable `ENGINE_LOCAL_ADMIN_AUTH_ENABLED=true` only when
+you need password login, and use Postgres plus `ENGINE_ENCRYPTION_KEY` before
+storing real provider credentials. Local `.env` files and the default
+`accounts.json` store are ignored by Git, Docker, and Cloud Build.
 
 Build the container:
 
@@ -52,8 +75,9 @@ Build the container:
 docker build -t synaxis-engine .
 docker run --rm -p 8080:8080 \
   -e ENGINE_ISSUER=http://localhost:8080 \
-  -e ENGINE_PASSWORD=change-me \
-  -e ENGINE_SECRET=change-me-with-at-least-32-random-characters \
+  -e ENGINE_PASSWORD='<unique-random-password>' \
+  -e ENGINE_SECRET='<at-least-32-random-characters>' \
+  -e ENGINE_LOCAL_ADMIN_AUTH_ENABLED=true \
   synaxis-engine
 ```
 
@@ -70,6 +94,14 @@ Protected management routes accept either:
 - a self-hosted session obtained from `POST /api/login`; or
 - a machine credential configured as `SYNAXIS_ADMIN_TOKEN`.
 
+Password login is **off by default** for a configured self-hosted Engine, so
+an unattended process does not publish `/api/login` or legacy `/admin/*`
+forms behind a repository-known credential. To use the local console on a
+self-hosted deployment, set unique `ENGINE_PASSWORD` and `ENGINE_SECRET`
+values and explicitly set `ENGINE_LOCAL_ADMIN_AUTH_ENABLED=true`. Legacy
+`/admin/connect` and `/admin/token` compatibility forms additionally require
+`SYNAXIS_ENABLE_LEGACY_ADMIN=true`.
+
 `ENGINE_ADMIN_TOKEN` is a migration alias. When both are present,
 `SYNAXIS_ADMIN_TOKEN` wins. The machine token grants broad engine management
 access and must be random, held in a secret manager, rotated, and never sent to
@@ -79,11 +111,73 @@ The hosted Synaxis frontend authenticates to Synaxis Platform, not directly to
 an engine. Platform resolves the workspace and attaches the relevant
 per-engine machine credential server-side.
 
+## Management API
+
+`GET /healthz`, `GET /readyz`, `GET /api/auth`, and the state-validated
+`GET /api/oauth/callback` are public. `POST /api/login` exists only when local
+admin authentication is explicitly enabled. Every other `/api/*` route below
+requires either a local session bearer token or `SYNAXIS_ADMIN_TOKEN`. Hosted
+requests also carry a signed Platform actor assertion; the Engine applies the
+actor's role, subject, and connection-namespace grants after machine
+authentication.
+
+| Methods | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/gateway`, `/api/health` | MCP endpoint metadata and per-connection health |
+| `GET` | `/api/logs`, `/api/logs/{id}` | Summary audit rows and one recorded call |
+| `POST` | `/api/logs/{id}/replay`, `/api/logs/{id}/triage` | Replay a recorded call or persist a triage decision |
+| `GET, POST` | `/api/servers` | List or create credential-bearing connections |
+| `PATCH, DELETE` | `/api/servers/{id}` | Update policy/ownership metadata or delete a connection |
+| `POST` | `/api/servers/{id}/connect` | Start upstream OAuth |
+| `PUT` | `/api/servers/{id}/token` | Store a bearer token for a token-auth connection |
+| `GET, PUT` | `/api/servers/{id}/tools` | Read or replace the connection's enabled-tool set |
+| `PUT` | `/api/servers/{id}/tools/{tool}` | Update one tool's alias, description, or enabled policy |
+| `GET, POST` | `/api/connection-namespaces` | List visible credential folders or create a shared folder |
+| `GET, PATCH, DELETE` | `/api/connection-namespaces/{id}` | Read, rename, or delete a credential folder |
+| `GET, PUT` | `/api/connection-namespaces/{id}/managers` | Read or replace delegated manager subjects |
+| `PUT, DELETE` | `/api/connection-namespaces/{id}/managers/{subject}` | Grant or revoke one manager subject |
+| `GET, POST` | `/api/mcp-clients` | List or register subject-bound MCP clients |
+| `GET, PATCH` | `/api/mcp-clients/{id}` | Read or rename an MCP client registration |
+| `PUT` | `/api/mcp-clients/{id}/namespaces` | Replace an MCP client's connection-namespace grants |
+| `POST` | `/api/mcp-clients/{id}/oauth-client/reset` | Clear a stale DCR binding and rotate the endpoint epoch |
+| `POST` | `/api/mcp-clients/{id}/revoke` | Revoke a scoped MCP client and its resource tokens |
+| `GET, POST` | `/api/connectors` | List or create curated virtual connectors |
+| `PUT, DELETE` | `/api/connectors/{slug}` | Update or delete a virtual connector |
+| `GET, POST` | `/api/endpoints` | List or create whole-connection endpoint bundles |
+| `GET, PUT, DELETE` | `/api/endpoints/{slug}` | Read, update, or delete an endpoint bundle |
+| `PUT, DELETE` | `/api/endpoints/{slug}/accounts/{account}` | Add or remove an endpoint-bundle member |
+| `POST` | `/api/guardrails/test` | Test content against the connector guard pipeline |
+| `GET` | `/api/config` | Export secret-free configuration |
+| `POST` | `/api/config/import` | Validate and merge a secret-free configuration export |
+| `GET` | `/api/approvals` | List parked-call records |
+| `POST` | `/api/approvals/{id}/approve`, `/api/approvals/{id}/deny` | Decide a parked call |
+| `POST` | `/api/oauth/revoke-all` | Revoke all MCP-facing OAuth grants |
+| `GET` | `/api/activation` | Return the privacy-limited connection count described below |
+| `GET` | `/api/usage` | Read sanitized usage |
+| `PUT` | `/api/usage/grant` | Install a signed hosted allowance |
+
+The legacy `/api/namespaces*` route family remains an exact compatibility alias
+for `/api/endpoints*`; it does not address credential-owning connection
+namespaces.
+
+### Activation snapshot
+
+`GET /api/activation` returns only `{"connectionCount": <number>}`. It does
+not return connection names, provider URLs, credential state, namespace
+membership, or tool metadata. In hosted mode, the route accepts only the
+signed Platform **service** actor, never a browser member actor, even when that
+member is an owner or admin. A self-hosted Engine without a Platform actor
+verifier may read it through normal management authentication. The narrow
+contract lets a control plane measure first-connection activation without
+copying credential metadata out of the Engine trust boundary.
+
 ## Hosted OAuth consent contract
 
 Self-hosted Engine uses its password consent form by default. A hosted Engine
 can delegate only the human consent decision to a control plane without
-learning about users, workspaces, subscriptions, or tenants:
+receiving Platform profiles, membership records, subscriptions, tenant slugs,
+or billing data. It receives only the opaque subject, role, and resource facts
+needed to authorize the request:
 
 1. Configure both `ENGINE_CONSENT_URL` and
    `ENGINE_CONSENT_PUBLIC_KEY`. The key is the base64 encoding of the
@@ -109,6 +203,9 @@ learning about users, workspaces, subscriptions, or tenants:
    {
      "aud": "https://exact-engine.example",
      "engine_issuer": "https://exact-engine.example",
+     "resource_path": "/mcp/clients/my-codex",
+     "sub": "opaque-member-id",
+     "role": "operator",
      "request_sha256": "<base64url-no-padding SHA-256 of the exact request token>",
      "jti": "<unique 16-128 character base64url identifier>",
      "exp": 1785153780,
@@ -116,10 +213,13 @@ learning about users, workspaces, subscriptions, or tenants:
    }
    ```
 
-   `aud` and `engine_issuer` must both exactly equal `ENGINE_ISSUER`. `exp`
-   must be in the future and no more than five minutes ahead. Set
-   `approved` explicitly to `true` or `false`; a signed `false` is a normal
-   OAuth denial.
+   `aud` and `engine_issuer` must both exactly equal `ENGINE_ISSUER`, and
+   `resource_path` must exactly match the resource sealed into the Engine's
+   request token. Current hosted approvals also include the authenticated
+   member's opaque `sub` and role; Engine rechecks both against the resource
+   class before issuing a code. `exp` must be in the future and no more than
+   five minutes ahead. Set `approved` explicitly to `true` or `false`; a
+   signed `false` is a normal OAuth denial.
 5. Platform returns an `application/x-www-form-urlencoded` browser POST to the
    supplied completion URL with exactly `request=<opaque-token>` and
    `assertion=<compact-jws>`. Platform must never attach the Engine machine
@@ -135,11 +235,209 @@ request fields to Platform. Requests and assertion IDs are single-use. Engine
 rejects completion parameters that try to supply or replace a redirect URI,
 resource, PKCE challenge, or state.
 
-Hosted deployments should also set
-`ENGINE_LOCAL_ADMIN_AUTH_ENABLED=false` and
-`SYNAXIS_ENABLE_LEGACY_ADMIN=false`. This removes the password login/session
-path and compatibility forms while preserving server-to-server access through
-`SYNAXIS_ADMIN_TOKEN`.
+Hosted deployments force `ENGINE_LOCAL_ADMIN_AUTH_ENABLED=false` and
+`SYNAXIS_ENABLE_LEGACY_ADMIN=false`, even if an inherited environment attempts
+to enable them. This removes the password login/session path and compatibility
+forms while preserving server-to-server access through `SYNAXIS_ADMIN_TOKEN`.
+
+### Hosted management actor contract
+
+Hosted management requests require both the machine bearer credential and an
+Ed25519 JWS in `X-Synaxis-Actor-Assertion`. The JWS type is
+`synaxis-engine-actor+jwt`; its claims bind the opaque `workspace_id`,
+`user_id`, and `role` to the Engine audience, exact HTTP `method`, normalized
+`path`, and base64url SHA-256 `body_sha256`, with `iss`, `iat`, `exp`, and
+`jti`. Assertions live for at most two minutes, accept at most ten seconds of
+clock skew, and cannot carry a query string or be reused for another method,
+path, or body.
+
+Member assertions use `owner`, `admin`, `operator`, or `viewer`; Engine
+handlers then enforce their own namespace and connection rules. The reserved
+`service` actor is accepted only as `platform-service` on
+`POST /api/oauth/revoke-all`, `PUT /api/usage/grant`, `GET /api/usage`, and
+`GET /api/activation`. It cannot mutate connections or approvals.
+
+## Hosted usage contract
+
+Self-hosted Engines are quota-unlimited. A hosted provisioner enables the
+generic usage boundary by setting `SYNAXIS_WORKSPACE_ID` and the positive
+`SYNAXIS_PROVISION_GENERATION`; this requires Postgres and the existing
+`ENGINE_CONSENT_PUBLIC_KEY`.
+
+Before exposing MCP traffic, Platform sends an authenticated
+`PUT /api/usage/grant` with `{"grant":"<compact-jws>"}`. The Ed25519 JWT uses
+`{"alg":"EdDSA","typ":"synaxis-engine-usage-grant+jwt"}` and these claims:
+
+```json
+{
+  "iss": "synaxis-platform",
+  "aud": "synaxis-engine",
+  "workspace_id": "opaque-workspace-id",
+  "engine_generation": 7,
+  "period_start": "2026-07-30T00:00:00Z",
+  "period_end": "2026-08-30T00:00:00Z",
+  "revision": 3,
+  "plan_id": "starter-v1",
+  "status": "active",
+  "limits": {
+    "calls": 10000,
+    "runtime_seconds": 28800,
+    "transfer_bytes": 2147483648,
+    "concurrency": 4,
+    "rate_per_minute": 60,
+    "burst": 10,
+    "max_call_seconds": 120
+  },
+  "iat": 1785369600,
+  "exp": 1788048000
+}
+```
+
+Trial grants cap calls/runtime/transfer at 2,000, 7,200 seconds, and 512 MiB.
+Paid grants cap them at 10,000, 28,800 seconds, and 2 GiB. Signed grants may
+include audited operator extensions to those three metered totals.
+Concurrency, rate, burst, and per-call deadline remain hard Engine safety
+ceilings of 4, 60/minute, 10, and 120 seconds.
+
+Admission and settlement use durable usage-period and reservation rows, not
+the asynchronous audit log. An interrupted reservation retains its concurrency
+slot until its signed call deadline, then recovery charges that bounded runtime
+and releases it. `GET /api/usage` returns only sanitized aggregate usage with
+`mode: "enforced"` and the same snake_case inner limit/counter keys carried by
+the grant. Both routes require the normal management bearer credential.
+
+All MCP endpoints independently enforce a 1 MiB complete request cap, a 2 MiB
+complete tool-result cap, and a maximum 120-second upstream deadline. Discovery,
+authentication, health checks, and denied approvals do not consume a call.
+Upstream errors, timeouts, approved calls, and explicit replays do.
+
+The Engine's supported upstream transport is MCP Streamable HTTP. Both its
+`application/json` and per-request `text/event-stream` response bodies are
+bounded before MCP decoding at the 2 MiB result limit plus 64 KiB of protocol
+framing. The decoded result is still checked against the exact 2 MiB public
+cap. Legacy persistent-SSE and stdio upstream clients are not instantiated.
+
+## Namespaces, connections, and endpoint bundles
+
+A **namespace** is an owning folder inside one Engine workspace. A
+**connection** is one upstream provider account, one credential set, one
+refresh lifecycle, and one immutable tool prefix, and it belongs to exactly one
+namespace. A provider definition supplies reusable URL, authentication, and
+method metadata; it does not own a user's credential. The same provider can
+therefore be connected repeatedly:
+
+```text
+Lelapa
+└── Notion (credential A)   → lelapa_notion__notion-search
+
+Personal
+└── Notion (credential B)   → personal_notion__notion-search
+```
+
+Both connections expose the same core Notion methods, but their tool prefixes
+and handler closures route every call through different stored credentials.
+The console suggests `<namespace>_<provider>` and appends a suffix for a
+collision; the management API also accepts an explicit globally unique
+`toolPrefix`. Existing prefixes are never silently rewritten when a connection
+label is renamed or its owning namespace changes.
+
+An **endpoint bundle** is a separate, provider-agnostic delivery resource. It
+references eligible shared or service connections from any namespaces and is
+served as an audience-bound MCP resource at
+`<ENGINE_ISSUER>/mcp/<slug>`. One connection can be a member of multiple
+endpoint bundles without copying credentials:
+
+```text
+Client delivery  → Lelapa / Notion, Lelapa / GitHub
+Research tools   → Lelapa / Notion
+```
+
+Inside every endpoint, tools retain their `<tool-prefix>__<tool>` identities.
+Adding or removing a connection therefore does not rename tools or require
+another upstream OAuth flow. Deleting an endpoint revokes only that MCP
+resource and leaves member connections, credentials, namespace folders, and
+the root `/mcp` aggregate intact.
+
+Membership edits intentionally keep the endpoint generation stable, so
+already-authorized clients see its current contents immediately. Mutations
+carry both the opaque generation and current revision; stale tabs cannot
+modify a deleted-and-recreated endpoint that reuses a slug. Audit rows retain
+endpoint kind and generation, so replay fails closed after deletion or
+replacement. Endpoint-bundle and curated-connector slugs share the
+`/mcp/<slug>` URL space and must be unique.
+
+The preferred CRUD surface is `/api/endpoints*`. The former
+`/api/namespaces*` routes remain behaviorally identical compatibility aliases
+for endpoint bundles. On connection payloads, `connectionNamespace` is the
+owning folder and `toolPrefix` is the routing identity. Legacy clients may keep
+sending `group` for the folder and `namespace` for the tool prefix. Stored
+accounts, credentials, prefixes, endpoint URLs, and OAuth grants require no
+destructive migration.
+
+### Connection scopes and access control
+
+Connection namespaces own credentials; they are not MCP delivery endpoints.
+Each account carries one durable namespace ID and one explicit scope:
+
+- `shared` is eligible for the root aggregate, endpoint bundles, curated
+  connectors, and scoped MCP clients that have the owning namespace grant.
+- `personal` requires an `owner_subject`. It is excluded from `/mcp`, endpoint
+  bundles, and virtual connectors, and can appear only on a subject-bound MCP
+  client whose subject exactly matches the account owner.
+- `service` is a non-personal automation classification. It currently follows
+  the same namespace-management and shared-delivery rules as `shared`; it does
+  not create an additional authorization boundary by itself.
+
+In hosted mode, owners and admins can read and manage every namespace. An
+operator can read and manage only their own personal connections and shared
+namespaces carrying an explicit manager grant. The Platform service actor is
+restricted to its small control-route allowlist and cannot use namespace
+management routes. Only workspace administrators may create or delete shared
+namespaces or change their manager grants. `created_by` is audit attribution,
+not permanent authority, and an administrator may revoke the creator's manager
+grant. Unauthorized namespace and account lookups return `404` to avoid
+becoming an enumeration channel.
+
+Namespace and account mutations use opaque IDs, immutable account incarnation
+IDs, and compare-and-swap revisions. A stale tab or delayed OAuth callback
+therefore cannot write policy or credentials across a move, delete/recreate,
+or concurrent manager revocation.
+
+## Subject-bound MCP client endpoints
+
+`/mcp/clients/{slug}` is a separate path namespace from shared
+`/mcp/{slug}` endpoints. An MCP client registration contains a stable endpoint
+slug, one Platform subject, and a set of connection-namespace IDs. It contains
+no bearer credential. The first approved OAuth consent binds the registration
+to one DCR client ID; replacing that binding requires an explicit reset.
+
+Owners and admins may authorize shared root and connector resources. Operators
+may authorize only a subject-bound MCP client registered to their exact
+subject. A scoped endpoint projects shared/service connections from its granted
+namespaces plus personal connections owned by the same subject. The Engine
+rechecks that boundary from durable state before listing tools and immediately
+before every tool call.
+
+Changing namespace grants, moving an account across an endpoint boundary,
+resetting the OAuth binding, or revoking the client rotates its endpoint epoch.
+Tokens, authorization codes, and refresh grants minted for the prior epoch then
+fail closed. Slugs and tool prefixes remain stable.
+
+## Connector-only response guardrails
+
+Response redaction, result-size caps, and prompt-injection scanning run only on
+curated virtual connectors. The pipeline is
+`redact -> size cap -> injection scan -> audit`, and recorded payloads contain
+the post-guard result. Replays through a surviving connector apply that
+connector's current rules.
+
+The root `/mcp` aggregate is an intentional raw passthrough. Whole-connection
+endpoint bundles and `/mcp/clients/{slug}` subject-bound endpoints are also raw
+with respect to connector response guardrails. Account-level tool disabling,
+read-only filtering, OAuth resource binding, namespace ACLs, request/result
+hard caps, and audit logging still apply on their respective surfaces. Do not
+describe an endpoint bundle or scoped MCP client as redacted unless a future
+explicit policy layer adds that behavior.
 
 ## Configuration
 
@@ -149,13 +447,16 @@ The complete example is in [`.env.example`](.env.example). Important values:
 | --- | --- |
 | `PORT` / `ENGINE_PORT` | HTTP listen port |
 | `ENGINE_ISSUER` | Canonical public origin used in OAuth metadata and MCP URLs |
-| `ENGINE_PASSWORD` | Local/self-hosted console and consent password |
-| `ENGINE_SECRET` | HMAC key for OAuth and local console tokens |
+| `ENGINE_DEVELOPMENT_MODE` | Explicit local-only opt-in; generates ephemeral credentials and enables local login, never use for a hosted workspace |
+| `ENGINE_PASSWORD` | Required unique local/self-hosted console and consent password unless explicit development mode generates one |
+| `ENGINE_SECRET` | Required unique HMAC key for OAuth and local console tokens unless explicit development mode generates one |
 | `ENGINE_CONSENT_URL` | Optional generic Platform consent page; must be paired with `ENGINE_CONSENT_PUBLIC_KEY` |
 | `ENGINE_CONSENT_PUBLIC_KEY` | Base64 raw Ed25519 public key used to verify hosted approval assertions |
-| `ENGINE_LOCAL_ADMIN_AUTH_ENABLED` | Enables password `/api/login` and local session tokens; defaults to `true`, hosted engines set `false` |
+| `SYNAXIS_WORKSPACE_ID` | Optional opaque hosted workspace binding; enables durable usage enforcement |
+| `SYNAXIS_PROVISION_GENERATION` | Positive hosted deployment generation bound into every signed usage grant |
+| `ENGINE_LOCAL_ADMIN_AUTH_ENABLED` | Enables password `/api/login` and local session tokens; defaults to `false` outside explicit development mode; hosted engines force `false` |
 | `SYNAXIS_ADMIN_TOKEN` | Optional trusted control-plane credential |
-| `SYNAXIS_ENABLE_LEGACY_ADMIN` | Enables password-bearing `/admin/*` compatibility forms; hosted engines set `false` |
+| `SYNAXIS_ENABLE_LEGACY_ADMIN` | Enables password-bearing `/admin/*` compatibility forms; defaults to `false`, hosted engines force `false` |
 | `DATABASE_URL` | Optional Postgres connection string |
 | `ENGINE_ENCRYPTION_KEY` | Base64 32-byte AES-GCM key for stored secrets |
 | `CONSOLE_URL` | Browser destination after upstream OAuth |
@@ -173,17 +474,31 @@ go test -race ./internal/engine/
 go test ./...
 ```
 
+The exported repository runs the same commands in `.github/workflows/ci.yml`.
+In the private monorepo, also verify the public boundary and a clean standalone
+export from the repository root:
+
+```bash
+scripts/check-engine-boundary.sh
+export_dir="$(mktemp -d)"
+scripts/export-engine.sh "$export_dir"
+(cd "$export_dir" && go test ./...)
+```
+
 ## Architecture boundary
 
 Engine code must not import private Synaxis Platform or Web packages. It may
-define and serve generic, tenant-blind control operations. Platform concepts
-such as users, organizations, memberships, subscriptions, entitlements,
-workspace slugs, custom domains, and provisioning jobs do not belong in this
-module.
+define and serve generic control operations and enforce signed actor and usage
+claims bound to opaque workspace/deployment identifiers. Platform concepts
+such as user profiles, organizations, membership records, subscriptions,
+entitlements, workspace slugs, custom domains, and provisioning jobs do not
+belong in this module.
 
 One hosted workspace runs one isolated engine process and datastore. Until the
-engine's in-memory OAuth and approval state is made durable or coordinated,
-production deployments must use one maximum application instance.
+Engine's OAuth and pending-connect state, plus each live approval waiter and
+request, is made durable or coordinated, production deployments must use one
+maximum application instance. Approval records and decisions themselves are
+durable with PostgreSQL.
 
 ## License
 

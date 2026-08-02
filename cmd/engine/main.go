@@ -9,6 +9,7 @@ package main
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -30,12 +31,24 @@ func main() {
 	// Cloud Run provides PORT; ENGINE_PORT is the local override.
 	port := envOr("PORT", envOr("ENGINE_PORT", "8080"))
 	issuer := envOr("ENGINE_ISSUER", "http://localhost:"+port)
-	password := envOr("ENGINE_PASSWORD", "spike-dev-password")
-	secret := envOr("ENGINE_SECRET", "spike-dev-secret-change-me-0123456789")
+	security, err := startupSecurityConfigFromEnv()
+	if err != nil {
+		log.Fatalf("engine: startup security configuration: %v", err)
+	}
+	password := security.password
+	secret := security.secret
 	adminToken := adminTokenFromEnv()
-	legacyAdmin := legacyAdminEnabledFromEnv()
-	localAdminAuth := localAdminAuthEnabledFromEnv()
+	legacyAdmin := security.legacyAdmin
+	localAdminAuth := security.localAdminAuth
 	accountsPath := envOr("ACCOUNTS_PATH", "accounts.json")
+	if security.generatedPassword {
+		// Development mode intentionally avoids a compiled-in credential. This
+		// value is useful only on the local terminal that launched the Engine.
+		log.Printf("engine: DEVELOPMENT MODE generated temporary ENGINE_PASSWORD=%q", password)
+	}
+	if security.generatedSecret {
+		log.Printf("engine: DEVELOPMENT MODE generated an ephemeral ENGINE_SECRET; sessions and OAuth grants will reset on restart")
+	}
 
 	// --- MCP server (Claude-facing) ---
 	s := server.NewMCPServer("synaxis-engine", "0.1.0", server.WithToolCapabilities(true))
@@ -66,13 +79,14 @@ func main() {
 		} else {
 			log.Printf("engine: WARNING token encryption DISABLED (set ENGINE_ENCRYPTION_KEY)")
 		}
-		// A pending approval row from a previous run can never be decided — its
-		// in-process waiter died with that instance. Expire them so the console
-		// doesn't show permanently stuck rows.
-		if n, err := pg.ExpireOrphanedPending(context.Background()); err != nil {
-			log.Printf("engine: expire orphaned pending approvals: %v", err)
-		} else if n > 0 {
-			log.Printf("engine: expired %d orphaned pending approval(s) from a previous run", n)
+		// Recover according to the persisted lifecycle. Calls whose deadline
+		// genuinely elapsed are expired; still-live rows are explicitly cancelled
+		// because their original MCP request died with the previous process and
+		// generic tool calls must never be replayed from stored arguments.
+		if recovery, err := pg.RecoverPendingApprovals(context.Background(), time.Now()); err != nil {
+			log.Printf("engine: recover interrupted pending approvals: %v", err)
+		} else if recovery.Expired > 0 || recovery.Cancelled > 0 {
+			log.Printf("engine: recovered pending approvals: expired=%d cancelled=%d", recovery.Expired, recovery.Cancelled)
 		}
 		store = pg
 		log.Printf("engine: using Postgres account store")
@@ -122,6 +136,16 @@ func main() {
 
 	// --- OAuth AS protecting the MCP endpoint ---
 	as := oauthas.New(issuer, password, secret)
+	generationStore, ok := store.(oauthas.TokenGenerationStore)
+	if !ok {
+		log.Fatalf("engine: account store does not support durable OAuth token generations")
+	}
+	generationCtx, generationCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	err = as.ConfigureTokenGeneration(generationCtx, generationStore)
+	generationCancel()
+	if err != nil {
+		log.Fatalf("engine: initialize durable OAuth token generation: %v", err)
+	}
 	consentURL, consentPublicKey, err := hostedConsentConfigFromEnv()
 	if err != nil {
 		log.Fatalf("engine: hosted consent configuration: %v", err)
@@ -132,23 +156,65 @@ func main() {
 		}
 		log.Printf("engine: hosted OAuth consent delegation enabled")
 	}
-	// Bind access tokens to the connector GENERATION serving their resource
-	// path: /mcp is the stable aggregate surface; /mcp/{slug} resolves to the
-	// live connector's epoch (fails closed for slugs that don't exist — no
-	// pre-authorization — and deleting/recreating a slug rotates the epoch,
-	// which invalidates every previously issued token for that path).
+	actorVerifier, err := hostedActorVerifierFromEnv(consentPublicKey, issuer)
+	if err != nil {
+		log.Fatalf("engine: hosted actor assertion configuration: %v", err)
+	}
+	if actorVerifier != nil {
+		if adminToken == "" {
+			log.Fatalf("engine: hosted actor assertions require SYNAXIS_ADMIN_TOKEN")
+		}
+		// A hosted Engine has one management entrypoint: the Platform proxy.
+		// Never leave password/session or legacy query-string administration as a
+		// configuration-dependent bypass around the signed actor boundary.
+		localAdminAuth = false
+		legacyAdmin = false
+		log.Printf("engine: hosted Platform actor assertions enabled")
+	}
+	usageCtx, usageCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	usageGate, err := hostedUsageGateFromEnv(usageCtx, store, consentPublicKey)
+	usageCancel()
+	if err != nil {
+		log.Fatalf("engine: hosted usage configuration: %v", err)
+	}
+	if usageGate != nil {
+		gw.SetUsageGate(usageGate)
+		log.Printf(
+			"engine: hosted usage enforcement enabled for workspace %s generation %d",
+			usageGate.Identity().WorkspaceID,
+			usageGate.Identity().EngineGeneration,
+		)
+	}
+	// Bind access tokens to the resource serving their path: /mcp is the
+	// aggregate surface; /mcp/{slug} resolves to a live shared endpoint; and
+	// /mcp/clients/{slug} is the separate subject-bound client namespace.
+	// Client routes additionally perform a durable OAuth-client binding check
+	// for every access/code/refresh use below, so revocation and reset fail
+	// closed even before a replica has refreshed its endpoint projection.
 	as.SetEpochLookup(func(path string) (string, bool) {
 		if path == "/mcp" {
 			return "narthex-root", true
+		}
+		if slug, ok := strings.CutPrefix(path, "/mcp/clients/"); ok && slug != "" && !strings.Contains(slug, "/") {
+			return gw.MCPClientEpoch(slug)
 		}
 		if slug, ok := strings.CutPrefix(path, "/mcp/"); ok && slug != "" && !strings.Contains(slug, "/") {
 			return gw.ConnectorEpoch(slug)
 		}
 		return "", false
 	})
+	as.SetClientResourceAuthorizer(gw.MCPClientAllowsOAuthClient)
+	as.SetHostedConsentAuthorizer(gw.AuthorizeMCPConsent)
+	// Self-hosted Engines have the same subject-bound delivery model, with their
+	// established local administrator as the single durable identity. This keeps
+	// a personal connection private even when Claude or Codex connects directly
+	// to an open-source Engine.
+	as.SetLocalConsentAuthorizer(gw.AuthorizeMCPConsent)
 	// Deleting a connector also drops its refresh grants at the AS.
 	gw.SetTokenRevoker(as.RevokeResource)
-	mcpHandler := server.NewStreamableHTTPServer(s, server.WithEndpointPath("/mcp"))
+	mcpHandler := engine.LimitMCPRequestBody(
+		server.NewStreamableHTTPServer(s, server.WithEndpointPath("/mcp")),
+	)
 
 	mux := http.NewServeMux()
 	as.Routes(mux)
@@ -164,7 +230,22 @@ func main() {
 			fmt.Fprintf(w, `{"error":"unknown connector %q"}`, r.PathValue("slug"))
 			return
 		}
-		h.ServeHTTP(w, r)
+		engine.LimitMCPRequestBody(h).ServeHTTP(w, r)
+	})))
+
+	// --- subject-bound AI-client endpoints: these deliberately live outside
+	// the shared /mcp/{slug} namespace. Each route is rebuilt from durable
+	// connection-folder ownership immediately before it serves, and oauthas
+	// confirms its OAuth DCR client binding on every authenticated call. ---
+	mux.Handle("/mcp/clients/{slug}", as.RequireAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h, ok := gw.MCPClientHandler(r.PathValue("slug"))
+		if !ok {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprintf(w, `{"error":"unknown MCP client %q"}`, r.PathValue("slug"))
+			return
+		}
+		engine.LimitMCPRequestBody(h).ServeHTTP(w, r)
 	})))
 
 	// --- console management API (folded in; same process as /mcp so account
@@ -173,6 +254,15 @@ func main() {
 	consoleOrigin := envOr("CONSOLE_ORIGIN", consoleURL)
 	gw.SetConsoleURL(consoleURL) // linked in approval webhook messages
 	conn := engine.NewConnector(store, gw)
+	consoleOptions := []engine.ConsoleOption{
+		engine.WithAdminToken(adminToken),
+		engine.WithLocalAdminAuth(localAdminAuth),
+		engine.WithOAuthRevoker(as.RevokeAll),
+		engine.WithUsageGate(usageGate),
+	}
+	if actorVerifier != nil {
+		consoleOptions = append(consoleOptions, engine.WithPlatformActorVerifier(actorVerifier))
+	}
 	console := engine.NewConsoleAPI(
 		store,
 		gw,
@@ -182,20 +272,39 @@ func main() {
 		issuer,
 		consoleURL,
 		consoleOrigin,
-		engine.WithAdminToken(adminToken),
-		engine.WithLocalAdminAuth(localAdminAuth),
+		consoleOptions...,
 	)
 	console.Routes(mux)
 	log.Printf("engine: machine control authentication enabled=%v local_admin_auth=%v", adminToken != "", localAdminAuth)
 
-	// --- legacy admin forms (bootstrap; superseded by the console /api) ---
-	// GET /admin/connect?name=&label=&group=&url=&password=  → bounces the
+	registerLegacyAdminRoutes(mux, legacyAdmin, password, issuer, conn, store, gw)
+
+	httpServer := &http.Server{Addr: ":" + port, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	log.Printf("synaxis engine on :%s — issuer %s legacy_admin=%v", port, issuer, legacyAdmin)
+	if err := httpServer.ListenAndServe(); err != nil {
+		log.Fatalf("engine: %v", err)
+	}
+}
+
+// registerLegacyAdminRoutes deliberately registers nothing until a caller has
+// explicitly opted in. Returning 404 instead of serving a password form makes
+// the compatibility surface invisible on an unattended Engine.
+func registerLegacyAdminRoutes(
+	mux *http.ServeMux,
+	enabled bool,
+	password string,
+	issuer string,
+	conn *engine.Connector,
+	store engine.AccountStore,
+	gw *engine.Gateway,
+) {
+	if !enabled {
+		return
+	}
+
+	// GET /admin/connect?name=&label=&group=&url=&password= bounces the
 	// browser to the upstream's OAuth; the callback stores + aggregates.
 	mux.HandleFunc("/admin/connect", func(w http.ResponseWriter, r *http.Request) {
-		if !legacyAdmin {
-			http.NotFound(w, r)
-			return
-		}
 		q := r.URL.Query()
 		if q.Get("password") != password {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -214,10 +323,6 @@ func main() {
 		http.Redirect(w, r, authURL, http.StatusFound)
 	})
 	mux.HandleFunc("/admin/oauth/callback", func(w http.ResponseWriter, r *http.Request) {
-		if !legacyAdmin {
-			http.NotFound(w, r)
-			return
-		}
 		q := r.URL.Query()
 		if e := q.Get("error"); e != "" {
 			http.Error(w, "oauth error: "+e, http.StatusBadRequest)
@@ -232,13 +337,9 @@ func main() {
 		fmt.Fprintf(w, `<html><body style="font-family:system-ui;max-width:480px;margin:14vh auto;color:#222"><h2>Connected: %s</h2><p>Aggregated %d tools into Synaxis Engine. You can close this tab.</p></body></html>`, name, n)
 	})
 
-	// --- token-auth connect (e.g. GitHub PAT): no OAuth, just store the token ---
-	// GET shows a form; POST stores the account and aggregates it.
+	// Token-auth connect (e.g. GitHub PAT): GET shows a form; POST stores the
+	// account and aggregates it. It is intentionally a compatibility-only route.
 	mux.HandleFunc("/admin/token", func(w http.ResponseWriter, r *http.Request) {
-		if !legacyAdmin {
-			http.NotFound(w, r)
-			return
-		}
 		if r.Method == http.MethodGet {
 			w.Header().Set("Content-Type", "text/html")
 			fmt.Fprint(w, tokenFormHTML)
@@ -270,12 +371,6 @@ func main() {
 		}
 		fmt.Fprintf(w, `<html><body style="font-family:system-ui;max-width:480px;margin:14vh auto;color:#222"><h2>Connected: %s</h2><p>Aggregated %d tools into Synaxis Engine. You can close this tab.</p></body></html>`, name, n)
 	})
-
-	httpServer := &http.Server{Addr: ":" + port, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
-	log.Printf("synaxis engine on :%s — issuer %s legacy_admin=%v", port, issuer, legacyAdmin)
-	if err := httpServer.ListenAndServe(); err != nil {
-		log.Fatalf("engine: %v", err)
-	}
 }
 
 func envOr(key, fallback string) string {
@@ -289,8 +384,97 @@ func adminTokenFromEnv() string {
 	return envOr("SYNAXIS_ADMIN_TOKEN", os.Getenv("ENGINE_ADMIN_TOKEN"))
 }
 
+// startupSecurityConfig keeps password-based administration fail-closed. A
+// self-hosted Engine should be useful as an MCP runtime without silently
+// publishing a browser login or legacy form protected by a source-known
+// credential. Development mode is the only convenience exception, and even
+// there credentials are generated per process rather than compiled in.
+type startupSecurityConfig struct {
+	password          string
+	secret            string
+	legacyAdmin       bool
+	localAdminAuth    bool
+	development       bool
+	hosted            bool
+	generatedPassword bool
+	generatedSecret   bool
+}
+
+func startupSecurityConfigFromEnv() (startupSecurityConfig, error) {
+	config := startupSecurityConfig{
+		password: os.Getenv("ENGINE_PASSWORD"),
+		secret:   os.Getenv("ENGINE_SECRET"),
+		hosted:   strings.TrimSpace(os.Getenv("SYNAXIS_WORKSPACE_ID")) != "",
+	}
+
+	development, err := boolEnv("ENGINE_DEVELOPMENT_MODE", false)
+	if err != nil {
+		return startupSecurityConfig{}, err
+	}
+	if config.hosted && development {
+		return startupSecurityConfig{}, errors.New("ENGINE_DEVELOPMENT_MODE cannot be enabled for a hosted workspace")
+	}
+	config.development = development
+
+	if strings.TrimSpace(config.password) == "" && development {
+		password, err := generatedStartupCredential(24)
+		if err != nil {
+			return startupSecurityConfig{}, fmt.Errorf("generate development password: %w", err)
+		}
+		config.password = password
+		config.generatedPassword = true
+	}
+	if strings.TrimSpace(config.secret) == "" && development {
+		secret, err := generatedStartupCredential(32)
+		if err != nil {
+			return startupSecurityConfig{}, fmt.Errorf("generate development secret: %w", err)
+		}
+		config.secret = secret
+		config.generatedSecret = true
+	}
+	if strings.TrimSpace(config.password) == "" {
+		return startupSecurityConfig{}, errors.New("ENGINE_PASSWORD is required; set a unique value or explicitly enable ENGINE_DEVELOPMENT_MODE for local development")
+	}
+	if strings.TrimSpace(config.secret) == "" {
+		return startupSecurityConfig{}, errors.New("ENGINE_SECRET is required; set a unique value or explicitly enable ENGINE_DEVELOPMENT_MODE for local development")
+	}
+
+	// Standard self-hosted startup exposes neither password login nor legacy
+	// query/form administration. Development mode may expose the local console
+	// for a generated password; legacy forms still require their own opt-in.
+	config.localAdminAuth = localAdminAuthEnabledWithDefault(development)
+	config.legacyAdmin = legacyAdminEnabledFromEnv()
+	if config.hosted {
+		// Hosted Engine management is always the signed Platform actor plus
+		// machine token boundary. Do not allow env drift to add a local bypass.
+		config.localAdminAuth = false
+		config.legacyAdmin = false
+	}
+	return config, nil
+}
+
+func generatedStartupCredential(bytes int) (string, error) {
+	raw := make([]byte, bytes)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(raw), nil
+}
+
+func boolEnv(key string, fallback bool) (bool, error) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback, nil
+	}
+	value, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("%s must be a boolean", key)
+	}
+	return value, nil
+}
+
 func legacyAdminEnabledFromEnv() bool {
-	raw := envOr("SYNAXIS_ENABLE_LEGACY_ADMIN", envOr("ENGINE_ENABLE_LEGACY_ADMIN", "true"))
+	raw := envOr("SYNAXIS_ENABLE_LEGACY_ADMIN", envOr("ENGINE_ENABLE_LEGACY_ADMIN", "false"))
 	enabled, err := strconv.ParseBool(raw)
 	if err != nil {
 		return false
@@ -299,7 +483,15 @@ func legacyAdminEnabledFromEnv() bool {
 }
 
 func localAdminAuthEnabledFromEnv() bool {
-	raw := envOr("ENGINE_LOCAL_ADMIN_AUTH_ENABLED", "true")
+	return localAdminAuthEnabledWithDefault(false)
+}
+
+func localAdminAuthEnabledWithDefault(developmentDefault bool) bool {
+	fallback := "false"
+	if developmentDefault {
+		fallback = "true"
+	}
+	raw := envOr("ENGINE_LOCAL_ADMIN_AUTH_ENABLED", fallback)
 	enabled, err := strconv.ParseBool(raw)
 	if err != nil {
 		return false
@@ -324,6 +516,44 @@ func hostedConsentConfigFromEnv() (string, ed25519.PublicKey, error) {
 		return "", nil, fmt.Errorf("ENGINE_CONSENT_PUBLIC_KEY must be base64-encoded Ed25519 public key (%d bytes)", ed25519.PublicKeySize)
 	}
 	return consentURL, ed25519.PublicKey(key), nil
+}
+
+func hostedActorVerifierFromEnv(
+	publicKey ed25519.PublicKey,
+	issuer string,
+) (*engine.PlatformActorVerifier, error) {
+	workspaceID := strings.TrimSpace(os.Getenv("SYNAXIS_WORKSPACE_ID"))
+	if workspaceID == "" {
+		return nil, nil // self-hosted Engines do not receive Platform assertions.
+	}
+	if len(publicKey) != ed25519.PublicKeySize {
+		return nil, errors.New("SYNAXIS_WORKSPACE_ID requires ENGINE_CONSENT_PUBLIC_KEY")
+	}
+	return engine.NewPlatformActorVerifier(workspaceID, issuer, publicKey)
+}
+
+func hostedUsageGateFromEnv(
+	ctx context.Context,
+	store engine.AccountStore,
+	publicKey ed25519.PublicKey,
+) (*engine.UsageGate, error) {
+	workspaceID := strings.TrimSpace(os.Getenv("SYNAXIS_WORKSPACE_ID"))
+	if workspaceID == "" {
+		return nil, nil // self-hosted default: no subscription quota
+	}
+	if len(publicKey) != ed25519.PublicKeySize {
+		return nil, errors.New("SYNAXIS_WORKSPACE_ID requires ENGINE_CONSENT_PUBLIC_KEY")
+	}
+	rawGeneration := strings.TrimSpace(os.Getenv("SYNAXIS_PROVISION_GENERATION"))
+	generation, err := strconv.ParseInt(rawGeneration, 10, 64)
+	if err != nil || generation <= 0 || strconv.FormatInt(generation, 10) != rawGeneration {
+		return nil, errors.New("SYNAXIS_WORKSPACE_ID requires a positive canonical SYNAXIS_PROVISION_GENERATION")
+	}
+	usageStore, ok := store.(engine.UsageStore)
+	if !ok {
+		return nil, errors.New("hosted usage enforcement requires a durable usage store")
+	}
+	return engine.NewUsageGate(ctx, usageStore, workspaceID, generation, publicKey)
 }
 
 const tokenFormHTML = `<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1"><title>Synaxis Engine — Add token backend</title>

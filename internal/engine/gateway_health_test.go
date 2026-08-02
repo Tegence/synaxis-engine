@@ -1,0 +1,343 @@
+package engine
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/mark3labs/mcp-go/mcp"
+)
+
+func healthRowsByAccount(rows []AccountHealth) map[string]AccountHealth {
+	byAccount := make(map[string]AccountHealth, len(rows))
+	for _, row := range rows {
+		byAccount[row.UUID] = row
+	}
+	return byAccount
+}
+
+func TestHealthBoundsHungProviderWithoutBlockingHealthyAccounts(t *testing.T) {
+	g := newConnectorTestGateway(t, map[string][]string{
+		"hung":    nil,
+		"healthy": nil,
+	})
+	g.healthProbeTimeout = 30 * time.Millisecond
+
+	// Intentionally ignore ctx. This models a third-party transport/library
+	// that fails to observe cancellation; Health must still return and let the
+	// watch loop continue. Release it during cleanup so the test does not leave
+	// a goroutine behind.
+	releaseHung := make(chan struct{})
+	t.Cleanup(func() { close(releaseHung) })
+	hungStarted := make(chan struct{})
+	var startedOnce sync.Once
+	var hungCalls atomic.Int32
+	g.listTools = func(_ context.Context, a Account) ([]mcp.Tool, error) {
+		switch a.Name {
+		case "hung":
+			hungCalls.Add(1)
+			startedOnce.Do(func() { close(hungStarted) })
+			<-releaseHung
+			return nil, errors.New("provider-private-error-after-release")
+		case "healthy":
+			return []mcp.Tool{mcp.NewTool("healthy__search")}, nil
+		default:
+			return nil, errors.New("unexpected account")
+		}
+	}
+
+	started := time.Now()
+	rows := g.Health(context.Background())
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("Health waited for a cancellation-ignorant provider: %s", elapsed)
+	}
+	byAccount := healthRowsByAccount(rows)
+	if got := byAccount["healthy"]; got.Status != healthStatusOK || got.ToolCount != 1 {
+		t.Fatalf("healthy account was not assessed while peer was hung: %+v", got)
+	}
+	if got := byAccount["hung"]; got.Status != healthStatusTimeout || got.Recovery != healthRecoveryRetry ||
+		got.Detail != "The provider did not respond before the health check timed out." {
+		t.Fatalf("hung account health = %+v", got)
+	}
+	select {
+	case <-hungStarted:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("hung provider probe did not start")
+	}
+	// Repeated dashboard polls receive bounded timeout rows instead of spawning
+	// another non-cooperative provider operation.
+	for range 4 {
+		_ = g.Health(context.Background())
+	}
+	if got := hungCalls.Load(); got != 1 {
+		t.Fatalf("hung provider received %d live probes, want one", got)
+	}
+}
+
+func TestHealthRecoversAfterCredentialChangeWhileOldProbeIsStranded(t *testing.T) {
+	g := newConnectorTestGateway(t, map[string][]string{"notion": nil})
+	g.healthProbeTimeout = 30 * time.Millisecond
+
+	before, ok := g.store.Account("notion")
+	if !ok {
+		t.Fatal("seed account missing")
+	}
+	oldToken := before.BearerToken
+	releaseOldProbe := make(chan struct{})
+	oldStarted := make(chan struct{})
+	oldFinished := make(chan struct{})
+	var oldStartedOnce sync.Once
+	var probeCalls atomic.Int32
+	g.listTools = func(_ context.Context, a Account) ([]mcp.Tool, error) {
+		probeCalls.Add(1)
+		switch a.BearerToken {
+		case oldToken:
+			oldStartedOnce.Do(func() { close(oldStarted) })
+			<-releaseOldProbe // deliberately ignores the health context
+			close(oldFinished)
+			return nil, errors.New("old provider call finally unwound")
+		case "repaired-token":
+			return []mcp.Tool{mcp.NewTool("notion__search")}, nil
+		default:
+			return nil, errors.New("unexpected credential generation")
+		}
+	}
+	t.Cleanup(func() {
+		close(releaseOldProbe)
+		select {
+		case <-oldFinished:
+		case <-time.After(time.Second):
+			t.Error("stranded probe did not unwind during cleanup")
+		}
+	})
+
+	first := healthRowsByAccount(g.Health(context.Background()))["notion"]
+	if first.Status != healthStatusTimeout {
+		t.Fatalf("first health = %+v, want timeout", first)
+	}
+	select {
+	case <-oldStarted:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("old provider probe did not start")
+	}
+
+	// A poll with the same durable credential remains coalesced with the old
+	// probe. This is the no-goroutine-storm side of the recovery behavior.
+	_ = g.Health(context.Background())
+	if got := probeCalls.Load(); got != 1 {
+		t.Fatalf("same credential started %d probes, want one", got)
+	}
+
+	if _, err := g.store.SetBearerToken(context.Background(), before.Name, before.IncarnationID, "repaired-token", before.Revision); err != nil {
+		t.Fatalf("replace bearer token: %v", err)
+	}
+	recovered := healthRowsByAccount(g.Health(context.Background()))["notion"]
+	if recovered.Status != healthStatusOK || recovered.ToolCount != 1 {
+		t.Fatalf("health after credential repair = %+v, want healthy one-tool account", recovered)
+	}
+	if got := probeCalls.Load(); got != 2 {
+		t.Fatalf("credential repair started %d probes, want old plus one fresh", got)
+	}
+
+	// The unrecoverable old transport remains tracked, but a completed fresh
+	// probe released its own generation. There is no unbounded per-poll work.
+	g.healthProbeMu.Lock()
+	remaining := len(g.healthProbes)
+	g.healthProbeMu.Unlock()
+	if remaining != 1 {
+		t.Fatalf("in-flight probe generations = %d, want only the stranded old one", remaining)
+	}
+}
+
+func TestHealthProbeGenerationsStayBoundedAcrossRepeatedRepairs(t *testing.T) {
+	g := newConnectorTestGateway(t, nil)
+	base := Account{
+		Name:          "notion",
+		IncarnationID: "incarnation-1",
+		URL:           "https://notion.example/mcp",
+		AuthMode:      "token",
+		BearerToken:   "old-token",
+	}
+
+	releaseOld, started := g.beginHealthProbe(base)
+	if !started {
+		t.Fatal("start old generation")
+	}
+	repaired := base
+	repaired.BearerToken = "repaired-token"
+	releaseRepaired, started := g.beginHealthProbe(repaired)
+	if !started {
+		t.Fatal("credential repair should get one fresh probe generation")
+	}
+
+	thirdGeneration := repaired
+	thirdGeneration.BearerToken = "third-token"
+	if _, started := g.beginHealthProbe(thirdGeneration); started {
+		t.Fatal("third stranded generation bypassed the per-account health-probe cap")
+	}
+
+	// Once the repaired probe finishes, capacity opens for the next real
+	// configuration change even if the original transport is still stranded.
+	releaseRepaired()
+	releaseThird, started := g.beginHealthProbe(thirdGeneration)
+	if !started {
+		t.Fatal("completed repaired probe did not release recovery capacity")
+	}
+	releaseThird()
+	releaseOld()
+}
+
+func TestHealthPublishesOnlySafeActionableFailures(t *testing.T) {
+	g := newConnectorTestGateway(t, map[string][]string{
+		"expired":     nil,
+		"unreachable": nil,
+	})
+	if err := g.store.Upsert(context.Background(), Account{
+		Name: "unconnected", URL: "https://unused.example/mcp", AuthMode: "oauth",
+	}); err != nil {
+		t.Fatalf("seed unconnected account: %v", err)
+	}
+	const secret = "provider-secret-do-not-expose"
+	g.listTools = func(_ context.Context, a Account) ([]mcp.Tool, error) {
+		switch a.Name {
+		case "expired":
+			return nil, errors.New("401 unauthorized: " + secret)
+		case "unreachable":
+			return nil, errors.New("provider host failed: " + secret)
+		default:
+			return nil, errors.New("unexpected probe: " + a.Name)
+		}
+	}
+
+	rows := healthRowsByAccount(g.Health(context.Background()))
+	checks := []struct {
+		account  string
+		status   string
+		recovery string
+		detail   string
+	}{
+		{"unconnected", healthStatusNeedsAuth, healthRecoveryConnect, "This connection has not been authorized yet."},
+		{"expired", healthStatusAuthExpired, healthRecoveryReauthorize, "This connection needs to be authorized again."},
+		{"unreachable", healthStatusUnreachable, healthRecoveryRetry, "The provider could not be reached. Check its service and try again."},
+	}
+	for _, check := range checks {
+		got := rows[check.account]
+		if got.Status != check.status || got.Recovery != check.recovery || got.Detail != check.detail {
+			t.Errorf("%s health = %+v, want status=%q recovery=%q detail=%q", check.account, got, check.status, check.recovery, check.detail)
+		}
+	}
+	encoded, err := json.Marshal(rows)
+	if err != nil {
+		t.Fatalf("marshal health: %v", err)
+	}
+	if strings.Contains(string(encoded), secret) {
+		t.Fatalf("health response leaked provider diagnostic: %s", encoded)
+	}
+}
+
+func TestWatchTickProgressesPastHungProvider(t *testing.T) {
+	g := newConnectorTestGateway(t, map[string][]string{
+		"hung":    nil,
+		"healthy": nil,
+	})
+	g.healthProbeTimeout = 30 * time.Millisecond
+	releaseHung := make(chan struct{})
+	t.Cleanup(func() { close(releaseHung) })
+	var hungCalls atomic.Int32
+	var healthyCalls atomic.Int32
+	g.listTools = func(_ context.Context, a Account) ([]mcp.Tool, error) {
+		if a.Name == "hung" {
+			hungCalls.Add(1)
+			<-releaseHung
+			return nil, errors.New("provider-private-error-after-release")
+		}
+		healthyCalls.Add(1)
+		return []mcp.Tool{mcp.NewTool("healthy__search")}, nil
+	}
+
+	for tick := 0; tick < 2; tick++ {
+		done := make(chan struct{})
+		go func() {
+			g.tick(context.Background())
+			close(done)
+		}()
+		select {
+		case <-done:
+			// A timeout row was produced, alerts were evaluated, and the watcher
+			// is ready for its next interval despite the hung provider goroutine.
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("watch tick was blocked by a hung provider")
+		}
+	}
+	if got := hungCalls.Load(); got != 1 {
+		t.Fatalf("hung provider probes across two watch ticks = %d, want one", got)
+	}
+	if got := healthyCalls.Load(); got != 2 {
+		t.Fatalf("healthy provider probes across two watch ticks = %d, want two", got)
+	}
+}
+
+func TestHealthAlertNeverIncludesProviderDetail(t *testing.T) {
+	received := make(chan string, 1)
+	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		received <- string(body)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer webhook.Close()
+
+	g := newConnectorTestGateway(t, nil)
+	g.SetAlertWebhook(webhook.URL)
+	const secret = "provider-secret-do-not-alert"
+	g.evalAlert(AccountHealth{
+		UUID:     "notion",
+		Status:   healthStatusUnreachable,
+		Detail:   secret,
+		Recovery: secret,
+	})
+
+	select {
+	case body := <-received:
+		if strings.Contains(body, secret) {
+			t.Fatalf("alert leaked provider detail: %s", body)
+		}
+		if !strings.Contains(body, healthStatusUnreachable) || !strings.Contains(body, healthRecoveryRetry) {
+			t.Fatalf("alert omitted safe status/recovery: %s", body)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("health alert was not delivered")
+	}
+}
+
+func TestConsoleHealthDefensivelyNormalizesProviderDetail(t *testing.T) {
+	mux, token, g := newConnectorConsole(t, map[string][]string{"linear": nil})
+	const secret = "provider-secret-do-not-return"
+	g.listTools = func(_ context.Context, _ Account) ([]mcp.Tool, error) {
+		return nil, errors.New("upstream request failed: " + secret)
+	}
+
+	rec, _ := doJSON(t, mux, token, http.MethodGet, "/api/health", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/health = %d, body %s", rec.Code, rec.Body)
+	}
+	if strings.Contains(rec.Body.String(), secret) {
+		t.Fatalf("console health leaked provider detail: %s", rec.Body)
+	}
+	var rows []AccountHealth
+	if err := json.Unmarshal(rec.Body.Bytes(), &rows); err != nil || len(rows) != 1 {
+		t.Fatalf("decode health = %s (err %v)", rec.Body, err)
+	}
+	got := rows[0]
+	if got.Status != healthStatusUnreachable || got.Recovery != healthRecoveryRetry ||
+		got.Detail != "The provider could not be reached. Check its service and try again." {
+		t.Fatalf("console health row = %+v", got)
+	}
+}

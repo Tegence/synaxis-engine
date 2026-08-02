@@ -28,10 +28,12 @@ import (
 // pointer on purpose: the approval wrapper sits between the scope injection
 // and the dispatch closure and mutates decision on an approved call.
 type auditScope struct {
-	connector string
-	record    bool
-	decision  string          // set to "approved" by the approval wrapper before dispatch
-	guards    *compiledGuards // response guardrails; nil only off-connector (/mcp injects no scope at all)
+	connector  string
+	kind       string
+	generation string
+	record     bool
+	decision   string          // set to "approved" by the approval wrapper before dispatch
+	guards     *compiledGuards // response guardrails; nil only off-connector (/mcp injects no scope at all)
 }
 
 type auditScopeKey struct{}
@@ -51,9 +53,17 @@ func auditScopeFrom(ctx context.Context) *auditScope {
 // it carries a fresh auditScope naming the connector, its Record flag, and its
 // compiled response guards (applied by the dispatch closure after the upstream
 // call, before the audit row — see applyGuards in gateway_guard.go).
-func (g *Gateway) scopedHandler(connector string, record bool, guards *compiledGuards, inner server.ToolHandlerFunc) server.ToolHandlerFunc {
+func (g *Gateway) scopedHandler(
+	connector, kind, generation string,
+	record bool,
+	guards *compiledGuards,
+	inner server.ToolHandlerFunc,
+) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		return inner(withAuditScope(ctx, &auditScope{connector: connector, record: record, guards: guards}), req)
+		return inner(withAuditScope(ctx, &auditScope{
+			connector: connector, kind: kind, generation: generation,
+			record: record, guards: guards,
+		}), req)
 	}
 }
 
@@ -104,6 +114,68 @@ func (g *Gateway) Replay(ctx context.Context, id int64, force bool) (CallRecord,
 	if orig.Args == "" {
 		return CallRecord{}, fmt.Errorf("call %d has no recorded payload (recording was off) — nothing to replay", id)
 	}
+	// A connector-attributed row is replayable only through the exact endpoint
+	// incarnation that accepted it. Slug alone is unsafe: namespace deletion
+	// followed by connector/namespace recreation could otherwise make an old
+	// record cross a new authorization boundary. Legacy attributed rows lack
+	// this identity and therefore fail closed.
+	var replayGuards *compiledGuards
+	if orig.Connector == "" {
+		if orig.EndpointKind != "" || orig.EndpointGeneration != "" {
+			return CallRecord{}, fmt.Errorf("call %d has inconsistent root endpoint identity", id)
+		}
+	} else {
+		if orig.EndpointGeneration == "" {
+			return CallRecord{}, fmt.Errorf("call %d has no endpoint generation and cannot be replayed safely", id)
+		}
+		switch orig.EndpointKind {
+		case endpointKindConnector:
+			connectors, supported := g.connectorStore()
+			if !supported {
+				return CallRecord{}, fmt.Errorf("connector store unavailable for replay")
+			}
+			connector, exists := connectors.VirtualConnector(ctx, orig.Connector)
+			if !exists || connector.Epoch != orig.EndpointGeneration {
+				return CallRecord{}, fmt.Errorf(
+					"connector %q was deleted or replaced since call %d",
+					orig.Connector,
+					id,
+				)
+			}
+			if !toSet(connector.Tools[orig.Account])[orig.Tool] {
+				return CallRecord{}, fmt.Errorf(
+					"connector %q no longer exposes %s/%s",
+					orig.Connector,
+					orig.Account,
+					orig.Tool,
+				)
+			}
+			guards := compileGuards(connector)
+			replayGuards = &guards
+		case endpointKindNamespace:
+			namespaces, supported := g.namespaceStore()
+			if !supported {
+				return CallRecord{}, fmt.Errorf("namespace store unavailable for replay")
+			}
+			namespace, exists := namespaces.Namespace(ctx, orig.Connector)
+			if !exists || namespace.Epoch != orig.EndpointGeneration {
+				return CallRecord{}, fmt.Errorf(
+					"namespace %q was deleted or replaced since call %d",
+					orig.Connector,
+					id,
+				)
+			}
+			if !toSet(namespace.Accounts)[orig.Account] {
+				return CallRecord{}, fmt.Errorf(
+					"namespace %q no longer includes account %q",
+					orig.Connector,
+					orig.Account,
+				)
+			}
+		default:
+			return CallRecord{}, fmt.Errorf("call %d has unknown endpoint kind %q", id, orig.EndpointKind)
+		}
+	}
 
 	// The tool must still be live: the CURRENT cached definition supplies the
 	// annotations for the read-only check, and its absence means the account
@@ -135,31 +207,36 @@ func (g *Gateway) Replay(ctx context.Context, id int64, force bool) (CallRecord,
 	}
 
 	start := time.Now()
-	res, callErr := g.upstreamFor(a).CallTool(ctx, orig.Tool, args)
-	// A connector-attributed replay re-applies that connector's CURRENT
-	// response guards: replay dispatches straight upstream (not through the
-	// connector's scoped handler), so the guard stage is re-run here from the
-	// live connector server's compiled guards. Connector deleted since the
-	// original call → no guards (there is no current config to apply).
+	execution := g.executeUpstream(
+		ctx,
+		UsageCallMeta{
+			Account: orig.Account, Tool: orig.Tool, Connector: orig.Connector, Replay: true,
+		},
+		args,
+		func(callCtx context.Context) (*mcp.CallToolResult, error) {
+			return g.upstreamFor(a).CallTool(callCtx, orig.Tool, args)
+		},
+	)
+	if execution.usageErr != nil {
+		return CallRecord{}, execution.usageErr
+	}
+	res, callErr := execution.result, execution.callErr
+	// A connector-attributed replay re-applies that exact incarnation's current
+	// response guards. Identity was validated against durable store state above
+	// before any upstream dispatch.
 	var guard string
-	if orig.Connector != "" && callErr == nil && res != nil {
-		g.mu.Lock()
-		var cg *compiledGuards
-		if cs, ok := g.connectors[orig.Connector]; ok {
-			cg = cs.guards
-		}
-		g.mu.Unlock()
-		if cg != nil {
-			res, guard = applyGuards(res, *cg)
-		}
+	if replayGuards != nil && callErr == nil && res != nil {
+		res, guard = applyGuards(res, *replayGuards)
 	}
 	rec := CallRecord{
 		Account: orig.Account, Tool: orig.Tool, OK: callErr == nil,
-		Ms:        time.Since(start).Milliseconds(),
-		Connector: orig.Connector, // attribute the replay to the original endpoint
-		Decision:  "replay",
-		Args:      clampPayload(orig.Args, maxPayloadBytes),
-		Guard:     guard,
+		Ms:                 time.Since(start).Milliseconds(),
+		Connector:          orig.Connector, // attribute replay to the validated endpoint
+		EndpointKind:       orig.EndpointKind,
+		EndpointGeneration: orig.EndpointGeneration,
+		Decision:           "replay",
+		Args:               clampPayload(orig.Args, maxPayloadBytes),
+		Guard:              guard,
 	}
 	if res != nil {
 		rec.Result = marshalPayload(res)

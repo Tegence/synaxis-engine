@@ -327,8 +327,8 @@ method metadata; it does not own a user's credential. The same provider can
 therefore be connected repeatedly:
 
 ```text
-Lelapa
-└── Notion (credential A)   → lelapa_notion__notion-search
+Tegence
+└── Notion (credential A)   → tegence_notion__notion-search
 
 Personal
 └── Notion (credential B)   → personal_notion__notion-search
@@ -348,8 +348,8 @@ served as an audience-bound MCP resource at
 endpoint bundles without copying credentials:
 
 ```text
-Client delivery  → Lelapa / Notion, Lelapa / GitHub
-Research tools   → Lelapa / Notion
+Client delivery  → Tegence / Notion, Tegence / GitHub
+Research tools   → Tegence / Notion
 ```
 
 Inside every endpoint, tools retain their `<tool-prefix>__<tool>` identities.

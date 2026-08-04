@@ -207,6 +207,19 @@ func TestVerifyUsageGrantAcceptsStarterPaidAndTrialPolicies(t *testing.T) {
 			}
 		})
 	}
+	t.Run("accepts a platform-defined plan identifier", func(t *testing.T) {
+		claims := starterClaims(now, "active")
+		claims.PlanID = "pro-v1"
+		grant, err := verifyUsageGrant(
+			signUsageClaims(t, privateKey, claims), publicKey, identity, now,
+		)
+		if err != nil {
+			t.Fatalf("platform-defined plan: %v", err)
+		}
+		if grant.PlanID != "pro-v1" {
+			t.Fatalf("grant plan=%q", grant.PlanID)
+		}
+	})
 	t.Run("signed operator extension", func(t *testing.T) {
 		claims := starterClaims(now, "active")
 		claims.Revision = 2
@@ -245,7 +258,7 @@ func TestVerifyUsageGrantRejectsTamperingBindingExpiryAndOversizedPolicy(t *test
 		{"workspace", func(c *usageGrantClaims) { c.WorkspaceID = "workspace-two" }, privateKey},
 		{"generation", func(c *usageGrantClaims) { c.EngineGeneration++ }, privateKey},
 		{"revision", func(c *usageGrantClaims) { c.Revision = 0 }, privateKey},
-		{"plan", func(c *usageGrantClaims) { c.PlanID = "pro" }, privateKey},
+		{"plan", func(c *usageGrantClaims) { c.PlanID = "Pro" }, privateKey},
 		{"status", func(c *usageGrantClaims) { c.Status = "past_due" }, privateKey},
 		{"ended period", func(c *usageGrantClaims) {
 			c.PeriodStart = now.Add(-2 * time.Hour).Format(time.RFC3339)

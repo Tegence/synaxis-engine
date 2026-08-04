@@ -56,6 +56,97 @@ func TestCreateAccountAllowsUniqueNormalizedName(t *testing.T) {
 	}
 }
 
+func TestCreateAccountPersistsStaticOAuthConfigurationBeforeAuthorization(t *testing.T) {
+	mux, token, gateway := newConnectorConsole(t, nil)
+	const secret = "gmail-secret-must-never-appear-in-a-dto"
+	const scope = "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.compose"
+
+	rec, got := doJSON(t, mux, token, http.MethodPost, "/api/servers", `{
+		"name":"Gmail · Operations",
+		"toolPrefix":"operations_gmail",
+		"url":"https://gmailmcp.googleapis.com/mcp/v1",
+		"oauthClientId":"gmail-client-id",
+		"oauthClientSecret":"`+secret+`",
+		"oauthScope":"`+scope+`"
+	}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST static OAuth account = %d, body %s; want 201", rec.Code, rec.Body)
+	}
+	if strings.Contains(rec.Body.String(), secret) {
+		t.Fatalf("create response leaked OAuth client secret: %s", rec.Body.String())
+	}
+	for _, forbidden := range []string{"oauthClientId", "oauthClientSecret", "oauthScope", "clientSecret"} {
+		if _, found := got[forbidden]; found {
+			t.Fatalf("create DTO exposed %q: %v", forbidden, got)
+		}
+	}
+
+	account, found := gateway.store.Account("operations_gmail")
+	if !found {
+		t.Fatal("created static OAuth account was not persisted")
+	}
+	if account.ClientID != "gmail-client-id" || account.ClientSecret != secret || account.Scope != scope {
+		t.Fatalf("stored static OAuth configuration = %+v", account)
+	}
+	// This is the retry path after browser cancellation: no browser-supplied
+	// credentials are necessary, and Gmail gets its durable-token parameters.
+	retry := effectiveStaticCreds(nil, account, true, account.URL)
+	if retry == nil || retry.ClientID != account.ClientID || retry.ClientSecret != secret || retry.Scope != scope {
+		t.Fatalf("cancel/retry static OAuth configuration = %+v, want persisted Gmail client", retry)
+	}
+	if retry.AuthorizationExtras["access_type"] != "offline" || retry.AuthorizationExtras["prompt"] != "consent" {
+		t.Fatalf("Gmail retry did not derive durable authorization extras: %+v", retry.AuthorizationExtras)
+	}
+}
+
+func TestCreateAccountRejectsInvalidStaticOAuthConfigurationBeforeMutation(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		body   string
+		want   string
+		secret string
+	}{
+		{
+			name: "missing scope",
+			body: `{"name":"Static","url":"https://example.com/mcp","oauthClientId":"client-id"}`,
+			want: "scope",
+		},
+		{
+			name: "Gmail missing confidential client secret",
+			body: `{"name":"Gmail","url":"https://gmailmcp.googleapis.com/mcp/v1","oauthClientId":"client-id","oauthScope":"https://www.googleapis.com/auth/gmail.readonly"}`,
+			want: "clientSecret",
+		},
+		{
+			name: "static OAuth plus bearer token",
+			body: `{"name":"Mixed","url":"https://example.com/mcp","oauthClientId":"client-id","oauthScope":"read","bearerToken":"provider-token"}`,
+			want: "bearer token",
+		},
+		{
+			name:   "invalid URL does not echo OAuth secret",
+			body:   `{"name":"Broken","url":"http://127.0.0.1/mcp","oauthClientId":"client-id","oauthClientSecret":"never-echo-this-secret","oauthScope":"read"}`,
+			want:   "url",
+			secret: "never-echo-this-secret",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mux, token, gateway := newConnectorConsole(t, nil)
+			rec, got := doJSON(t, mux, token, http.MethodPost, "/api/servers", tc.body)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("POST invalid static OAuth account = %d, body %s; want 400", rec.Code, rec.Body)
+			}
+			if message, _ := got["error"].(string); !strings.Contains(message, tc.want) {
+				t.Fatalf("error = %q, want mention of %q", message, tc.want)
+			}
+			if tc.secret != "" && strings.Contains(rec.Body.String(), tc.secret) {
+				t.Fatalf("invalid static OAuth response leaked client secret: %s", rec.Body.String())
+			}
+			if accounts := gateway.store.Accounts(); len(accounts) != 0 {
+				t.Fatalf("invalid static OAuth request persisted account(s): %+v", accounts)
+			}
+		})
+	}
+}
+
 func TestCreateAccountAllowsMultipleConnectionsToSameProvider(t *testing.T) {
 	mux, token, gateway := newConnectorConsole(t, nil)
 
@@ -92,11 +183,11 @@ func TestSameProviderConnectionsKeepOwningNamespacesCredentialsAndMethodsIndepen
 	// The test seam is captured by reference. Populate it after constructing
 	// the empty store so each API create aggregates the provider's same bare
 	// method under that account's independent stable prefix.
-	tools["lelapa_notion"] = []string{"search", "fetch"}
+	tools["tegence_notion"] = []string{"search", "fetch"}
 	tools["personal_notion"] = []string{"search", "fetch"}
 
 	for _, body := range []string{
-		`{"name":"Notion · Lelapa","toolPrefix":"lelapa_notion","connectionNamespace":"Lelapa","group":"Lelapa","url":"https://mcp.notion.com/mcp","bearerToken":"lelapa-token"}`,
+		`{"name":"Notion · Tegence","toolPrefix":"tegence_notion","connectionNamespace":"Tegence","group":"Tegence","url":"https://mcp.notion.com/mcp","bearerToken":"tegence-token"}`,
 		`{"name":"Notion · Personal","toolPrefix":"personal_notion","connectionNamespace":"Personal","group":"Personal","url":"https://mcp.notion.com/mcp","bearerToken":"personal-token"}`,
 	} {
 		rec, _ := doJSON(t, mux, token, http.MethodPost, "/api/servers", body)
@@ -105,30 +196,30 @@ func TestSameProviderConnectionsKeepOwningNamespacesCredentialsAndMethodsIndepen
 		}
 	}
 
-	lelapa, lelapaOK := gateway.store.Account("lelapa_notion")
+	tegence, tegenceOK := gateway.store.Account("tegence_notion")
 	personal, personalOK := gateway.store.Account("personal_notion")
-	if !lelapaOK || !personalOK {
-		t.Fatalf("same-provider accounts missing: lelapa=%t personal=%t", lelapaOK, personalOK)
+	if !tegenceOK || !personalOK {
+		t.Fatalf("same-provider accounts missing: tegence=%t personal=%t", tegenceOK, personalOK)
 	}
-	if lelapa.Group != "Lelapa" || personal.Group != "Personal" {
-		t.Fatalf("owning connection namespaces = %q/%q; want Lelapa/Personal", lelapa.Group, personal.Group)
+	if tegence.Group != "Tegence" || personal.Group != "Personal" {
+		t.Fatalf("owning connection namespaces = %q/%q; want Tegence/Personal", tegence.Group, personal.Group)
 	}
-	if lelapa.BearerToken != "lelapa-token" || personal.BearerToken != "personal-token" ||
-		lelapa.BearerToken == personal.BearerToken {
+	if tegence.BearerToken != "tegence-token" || personal.BearerToken != "personal-token" ||
+		tegence.BearerToken == personal.BearerToken {
 		t.Fatal("same-provider account credentials were fused")
 	}
 
 	gateway.mu.Lock()
-	lelapaTools := append([]cachedTool(nil), gateway.cached["lelapa_notion"]...)
+	tegenceTools := append([]cachedTool(nil), gateway.cached["tegence_notion"]...)
 	personalTools := append([]cachedTool(nil), gateway.cached["personal_notion"]...)
 	gateway.mu.Unlock()
-	if len(lelapaTools) != 2 || len(personalTools) != 2 {
-		t.Fatalf("cached method counts = %d/%d; want 2/2", len(lelapaTools), len(personalTools))
+	if len(tegenceTools) != 2 || len(personalTools) != 2 {
+		t.Fatalf("cached method counts = %d/%d; want 2/2", len(tegenceTools), len(personalTools))
 	}
-	if lelapaTools[0].tool.Name != "lelapa_notion__search" ||
+	if tegenceTools[0].tool.Name != "tegence_notion__search" ||
 		personalTools[0].tool.Name != "personal_notion__search" {
 		t.Fatalf("same bare method tool names = %q/%q; want independent account prefixes",
-			lelapaTools[0].tool.Name, personalTools[0].tool.Name)
+			tegenceTools[0].tool.Name, personalTools[0].tool.Name)
 	}
 
 	rec, _ := doJSON(t, mux, token, http.MethodGet, "/api/servers", "")
@@ -150,28 +241,28 @@ func TestConnectionNamespacePreferredAliasAndLegacyGroupStayCompatible(t *testin
 	mux, token, gateway := newConnectorConsole(t, nil)
 
 	rec, got := doJSON(t, mux, token, http.MethodPost, "/api/servers",
-		`{"name":"Notion","toolPrefix":"lelapa_notion","connectionNamespace":"Lelapa","url":"https://mcp.notion.com/mcp"}`)
-	if rec.Code != http.StatusCreated || got["connectionNamespace"] != "Lelapa" || got["group"] != "Lelapa" {
+		`{"name":"Notion","toolPrefix":"tegence_notion","connectionNamespace":"Tegence","url":"https://mcp.notion.com/mcp"}`)
+	if rec.Code != http.StatusCreated || got["connectionNamespace"] != "Tegence" || got["group"] != "Tegence" {
 		t.Fatalf("preferred namespace create = %d %v", rec.Code, got)
 	}
 
-	rec, got = doJSON(t, mux, token, http.MethodPatch, "/api/servers/lelapa_notion",
+	rec, got = doJSON(t, mux, token, http.MethodPatch, "/api/servers/tegence_notion",
 		`{"connectionNamespace":"Research","group":"Research"}`)
 	if rec.Code != http.StatusOK || got["connectionNamespace"] != "Research" || got["group"] != "Research" {
 		t.Fatalf("matching namespace aliases PATCH = %d %v", rec.Code, got)
 	}
 
-	rec, _ = doJSON(t, mux, token, http.MethodPatch, "/api/servers/lelapa_notion",
-		`{"connectionNamespace":"Lelapa","group":"Personal"}`)
+	rec, _ = doJSON(t, mux, token, http.MethodPatch, "/api/servers/tegence_notion",
+		`{"connectionNamespace":"Tegence","group":"Personal"}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("conflicting namespace aliases PATCH = %d, want 400", rec.Code)
 	}
-	if account, _ := gateway.store.Account("lelapa_notion"); account.Group != "Research" {
+	if account, _ := gateway.store.Account("tegence_notion"); account.Group != "Research" {
 		t.Fatalf("rejected namespace alias conflict mutated account: %+v", account)
 	}
 
 	rec, _ = doJSON(t, mux, token, http.MethodPost, "/api/servers",
-		`{"name":"Conflict","toolPrefix":"conflict","connectionNamespace":"Lelapa","group":"Personal","url":"https://mcp.notion.com/mcp"}`)
+		`{"name":"Conflict","toolPrefix":"conflict","connectionNamespace":"Tegence","group":"Personal","url":"https://mcp.notion.com/mcp"}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("conflicting namespace aliases POST = %d, want 400", rec.Code)
 	}
@@ -295,15 +386,15 @@ func TestNamespaceOnlyMoveSkipsUpstreamAndFailedPolicyPatchCanBeRetried(t *testi
 	// Moving the owning namespace is metadata-only. It must not dial upstream
 	// or disturb the last-known-good cache and endpoint membership.
 	rec, got := doJSON(t, mux, token, http.MethodPatch, "/api/servers/notion",
-		`{"connectionNamespace":"Lelapa"}`)
-	if rec.Code != http.StatusOK || got["connectionNamespace"] != "Lelapa" {
+		`{"connectionNamespace":"Tegence"}`)
+	if rec.Code != http.StatusOK || got["connectionNamespace"] != "Tegence" {
 		t.Fatalf("namespace-only PATCH = %d %v", rec.Code, got)
 	}
 	if listCalls != 0 {
 		t.Fatalf("namespace-only PATCH listed upstream %d times", listCalls)
 	}
 	moved, _ := gateway.store.Account("notion")
-	if moved.Name != "notion" || moved.Group != "Lelapa" || moved.BearerToken != "credential-must-survive" ||
+	if moved.Name != "notion" || moved.Group != "Tegence" || moved.BearerToken != "credential-must-survive" ||
 		moved.ToolOverrides["search"].Description != "Curated search" {
 		t.Fatalf("namespace move changed account identity/credentials/policy: %+v", moved)
 	}
@@ -318,7 +409,7 @@ func TestNamespaceOnlyMoveSkipsUpstreamAndFailedPolicyPatchCanBeRetried(t *testi
 	// Label/read-only persistence succeeds but live replacement fails. The API
 	// must surface that failure without deleting the previous cache.
 	rec, _ = doJSON(t, mux, token, http.MethodPatch, "/api/servers/notion",
-		`{"displayName":"Notion · Lelapa","readOnly":true}`)
+		`{"displayName":"Notion · Tegence","readOnly":true}`)
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("failed label/read-only reaggregate = %d, body %s; want 502", rec.Code, rec.Body)
 	}
@@ -332,8 +423,8 @@ func TestNamespaceOnlyMoveSkipsUpstreamAndFailedPolicyPatchCanBeRetried(t *testi
 	// Retry with the same already-persisted values must still reaggregate.
 	failList = false
 	rec, got = doJSON(t, mux, token, http.MethodPatch, "/api/servers/notion",
-		`{"displayName":"Notion · Lelapa","readOnly":true}`)
-	if rec.Code != http.StatusOK || got["displayName"] != "Notion · Lelapa" || got["readOnly"] != true {
+		`{"displayName":"Notion · Tegence","readOnly":true}`)
+	if rec.Code != http.StatusOK || got["displayName"] != "Notion · Tegence" || got["readOnly"] != true {
 		t.Fatalf("retry PATCH = %d %v", rec.Code, got)
 	}
 	if listCalls != 2 {

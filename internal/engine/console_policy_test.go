@@ -315,13 +315,13 @@ func TestPortableConfigImportRejectsCredentialRetargeting(t *testing.T) {
 
 func TestPortableConfigImportAcceptsLegacyGroupOnly(t *testing.T) {
 	mux, tok, g := newConnectorConsole(t, nil)
-	payload := `{"version":1,"accounts":[{"name":"legacy_notion","displayName":"Legacy Notion","group":"Lelapa","url":"https://mcp.example/mcp","readOnly":false}],"connectors":[]}`
+	payload := `{"version":1,"accounts":[{"name":"legacy_notion","displayName":"Legacy Notion","group":"Tegence","url":"https://mcp.example/mcp","readOnly":false}],"connectors":[]}`
 	rec, _ := doJSON(t, mux, tok, http.MethodPost, "/api/config/import", payload)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("legacy group-only import = %d, body %s", rec.Code, rec.Body)
 	}
 	account, ok := g.store.Account("legacy_notion")
-	if !ok || account.Group != "Lelapa" {
+	if !ok || account.Group != "Tegence" {
 		t.Fatalf("legacy group-only account = %+v ok=%v", account, ok)
 	}
 }

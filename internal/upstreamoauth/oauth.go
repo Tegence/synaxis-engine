@@ -87,6 +87,49 @@ type Tokens struct {
 	RefreshToken string `json:"refresh_token,omitempty"`
 }
 
+// authorizationExtraKeys is deliberately small. These are OAuth authorization
+// request knobs used by known static-client providers; callers must never be
+// able to override the redirect URI, PKCE state, resource, or client identity.
+var authorizationExtraKeys = []string{
+	"access_type",
+	"prompt",
+	"include_granted_scopes",
+}
+
+var allowedAuthorizationExtraKeys = map[string]struct{}{
+	"access_type":            {},
+	"prompt":                 {},
+	"include_granted_scopes": {},
+}
+
+// ValidateAuthorizationExtras accepts only safe, provider-specific
+// authorization parameters. Values are bounded and normalized before being
+// copied so they can safely become URL query values. It intentionally reports
+// only the key, never a supplied value.
+func ValidateAuthorizationExtras(extras map[string]string) (map[string]string, error) {
+	if len(extras) == 0 {
+		return nil, nil
+	}
+	validated := make(map[string]string, len(extras))
+	for key, value := range extras {
+		if _, ok := allowedAuthorizationExtraKeys[key]; !ok {
+			return nil, fmt.Errorf("unsupported authorization extra %q", key)
+		}
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return nil, fmt.Errorf("authorization extra %q must not be empty", key)
+		}
+		if len(value) > 256 {
+			return nil, fmt.Errorf("authorization extra %q is too long", key)
+		}
+		if strings.ContainsAny(value, "\r\n") {
+			return nil, fmt.Errorf("authorization extra %q contains an invalid character", key)
+		}
+		validated[key] = value
+	}
+	return validated, nil
+}
+
 // Discover follows RFC 9728 (protected-resource metadata) then RFC 8414
 // (authorization-server metadata) for the given MCP server URL.
 func Discover(ctx context.Context, serverURL string) (*Metadata, error) {
@@ -100,20 +143,33 @@ func Discover(ctx context.Context, serverURL string) (*Metadata, error) {
 	origin := u.Scheme + "://" + u.Host
 
 	// RFC 9728: the protected-resource-metadata location is advertised in the
-	// 401 WWW-Authenticate header (resource_metadata=...). Notion serves it at
-	// the origin; GitHub serves it under a path. Follow the header, then fall
-	// back to the origin default.
+	// 401 WWW-Authenticate header (resource_metadata=...). When the challenge
+	// is not available, a resource with a path uses the path-scoped well-known
+	// location before the origin default. For example, Gmail's
+	// /mcp/v1 resource publishes metadata at
+	// /.well-known/oauth-protected-resource/mcp/v1.
 	prmURL := probeResourceMetadata(ctx, serverURL)
+	prmURLs := []string{prmURL}
 	if prmURL == "" {
-		prmURL = origin + "/.well-known/oauth-protected-resource"
+		prmURLs = protectedResourceMetadataURLs(origin, u)
 	}
 
 	var prm struct {
 		Resource             string   `json:"resource"`
 		AuthorizationServers []string `json:"authorization_servers"`
 	}
-	if err := getJSON(ctx, prmURL, &prm); err != nil {
-		return nil, fmt.Errorf("protected-resource metadata: %w", err)
+	var prmErr error
+	foundPRM := false
+	for _, candidate := range prmURLs {
+		if err := getJSON(ctx, candidate, &prm); err != nil {
+			prmErr = err
+			continue
+		}
+		foundPRM = true
+		break
+	}
+	if !foundPRM {
+		return nil, fmt.Errorf("protected-resource metadata: %w", prmErr)
 	}
 	as := origin
 	if len(prm.AuthorizationServers) > 0 {
@@ -145,6 +201,22 @@ func Discover(ctx context.Context, serverURL string) (*Metadata, error) {
 		TokenEndpoint:         asm.TokenEndpoint,
 		RegistrationEndpoint:  asm.RegistrationEndpoint,
 	}, nil
+}
+
+// protectedResourceMetadataURLs returns the RFC 9728 well-known locations to
+// try when an upstream did not advertise one in a WWW-Authenticate challenge.
+// A resource path belongs after /.well-known/oauth-protected-resource rather
+// than after the host root. The unscoped origin location remains a fallback for
+// providers that publish metadata for every resource there.
+func protectedResourceMetadataURLs(origin string, resourceURL *url.URL) []string {
+	path := resourceURL.EscapedPath()
+	if path == "" || path == "/" {
+		return []string{origin + "/.well-known/oauth-protected-resource"}
+	}
+	return []string{
+		origin + "/.well-known/oauth-protected-resource" + path,
+		origin + "/.well-known/oauth-protected-resource",
+	}
 }
 
 // ClientInfo is the dynamic-client-registration result.
@@ -242,7 +314,10 @@ func NewPKCE() (PKCE, string, error) {
 }
 
 // AuthorizeURL builds the authorization redirect (RFC 8707 resource included).
-func AuthorizeURL(m *Metadata, clientID, redirectURI, challenge, state, scope string) string {
+// authorizationExtras may add only the fixed provider-safe allowlist above;
+// arbitrary map entries are ignored as a defense in depth against a caller
+// accidentally forwarding a secret or redirect override into a browser URL.
+func AuthorizeURL(m *Metadata, clientID, redirectURI, challenge, state, scope string, authorizationExtras map[string]string) string {
 	q := url.Values{}
 	q.Set("response_type", "code")
 	q.Set("client_id", clientID)
@@ -253,6 +328,11 @@ func AuthorizeURL(m *Metadata, clientID, redirectURI, challenge, state, scope st
 	q.Set("resource", m.Resource)
 	if scope != "" {
 		q.Set("scope", scope)
+	}
+	for _, key := range authorizationExtraKeys {
+		if value := strings.TrimSpace(authorizationExtras[key]); value != "" {
+			q.Set(key, value)
+		}
 	}
 	sep := "?"
 	if strings.Contains(m.AuthorizationEndpoint, "?") {

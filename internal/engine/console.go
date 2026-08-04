@@ -1218,10 +1218,11 @@ func (c *ConsoleAPI) handleProbe(w http.ResponseWriter, r *http.Request) {
 
 func (c *ConsoleAPI) handleGateway(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
-		"connectorUrl": c.selfURL + "/mcp",
-		"endpoint":     "mcp",
-		"namespace":    "narthex",
-		"ready":        true,
+		"connectorUrl":     c.selfURL + "/mcp",
+		"oauthCallbackUrl": c.selfURL + "/api/oauth/callback",
+		"endpoint":         "mcp",
+		"namespace":        "narthex",
+		"ready":            true,
 	})
 }
 
@@ -1373,6 +1374,51 @@ func (c *ConsoleAPI) handleServers(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// staticCredsFromRequest normalizes the credential-bearing portion of a
+// pre-registered OAuth app request. It deliberately returns only a private
+// engine value: callers must never include the resulting client secret in a
+// management DTO, error response, or log entry.
+func staticCredsFromRequest(clientID, clientSecret, scope string, authorizationExtras map[string]string) (*StaticCreds, error) {
+	clientID = strings.TrimSpace(clientID)
+	clientSecret = strings.TrimSpace(clientSecret)
+	scope = strings.TrimSpace(scope)
+	extras, err := upstreamoauth.ValidateAuthorizationExtras(authorizationExtras)
+	if err != nil {
+		return nil, err
+	}
+	if clientID == "" && clientSecret == "" && scope == "" && len(extras) == 0 {
+		return nil, nil
+	}
+	if clientID == "" {
+		return nil, errors.New("clientId is required for a pre-registered OAuth app")
+	}
+	if scope == "" {
+		return nil, errors.New("scope is required for a pre-registered OAuth app")
+	}
+	return &StaticCreds{
+		ClientID:            clientID,
+		ClientSecret:        clientSecret,
+		Scope:               scope,
+		AuthorizationExtras: extras,
+	}, nil
+}
+
+func writeStaticOAuthConfigPersistenceError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, ErrConnectAccountDeleted):
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "connection not found"})
+	case errors.Is(err, ErrConnectAccountURLChanged),
+		errors.Is(err, ErrConnectAccountReplaced),
+		errors.Is(err, ErrConnectAccountMoved),
+		errors.Is(err, ErrAccountIncarnation):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "connection changed; reload and try again"})
+	default:
+		// Store errors are intentionally not exposed: they may contain driver
+		// context, while the incoming request included credential material.
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "could not save OAuth client configuration"})
+	}
+}
+
 func (c *ConsoleAPI) create(w http.ResponseWriter, r *http.Request, actor PlatformActor) {
 	var req struct {
 		Name                  string           `json:"name"`
@@ -1386,6 +1432,12 @@ func (c *ConsoleAPI) create(w http.ResponseWriter, r *http.Request, actor Platfo
 		Transport             string           `json:"transport"`
 		URL                   string           `json:"url"`
 		BearerToken           string           `json:"bearerToken"`
+		// OAuth app credentials are accepted only on account creation so the
+		// Engine holds the static-client configuration before browser consent.
+		// They are intentionally omitted from serverDTO and every response.
+		OAuthClientID     string `json:"oauthClientId"`
+		OAuthClientSecret string `json:"oauthClientSecret"`
+		OAuthScope        string `json:"oauthScope"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
@@ -1414,6 +1466,24 @@ func (c *ConsoleAPI) create(w http.ResponseWriter, r *http.Request, actor Platfo
 	name := slugify(toolPrefix)
 	if name == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "tool prefix must contain letters or numbers"})
+		return
+	}
+	upstreamURL := strings.TrimSpace(req.URL)
+	if err := upstreamoauth.ValidateUpstreamURL(upstreamURL); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "url must be a valid https URL"})
+		return
+	}
+	staticCreds, err := staticCredsFromRequest(req.OAuthClientID, req.OAuthClientSecret, req.OAuthScope, nil)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if err := validateStaticCredsForUpstream(staticCreds, upstreamURL); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if staticCreds != nil && strings.TrimSpace(req.BearerToken) != "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "pre-registered OAuth credentials cannot be used with a bearer token"})
 		return
 	}
 	if req.ConnectionNamespace != nil && req.Group != nil &&
@@ -1492,7 +1562,6 @@ func (c *ConsoleAPI) create(w http.ResponseWriter, r *http.Request, actor Platfo
 		ownerSubject = ""
 	}
 	var namespace ConnectionNamespace
-	var err error
 	if actor.Role == "operator" && scope == ConnectionScopePersonal && namespaceID == "" && connectionNamespace == "" {
 		namespace, err = c.defaultPersonalConnectionNamespace(r.Context(), actor)
 	} else {
@@ -1508,19 +1577,20 @@ func (c *ConsoleAPI) create(w http.ResponseWriter, r *http.Request, actor Platfo
 		writeConnectionNamespaceResolutionError(w, err)
 		return
 	}
-	if err := upstreamoauth.ValidateUpstreamURL(strings.TrimSpace(req.URL)); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "url must be a valid https URL"})
-		return
-	}
 	a := Account{
 		Name:                  name,
 		Label:                 friendly,
 		Group:                 namespace.Label,
-		URL:                   strings.TrimSpace(req.URL),
+		URL:                   upstreamURL,
 		AuthMode:              "oauth",
 		ConnectionNamespaceID: namespace.ID,
 		ConnectionScope:       scope,
 		OwnerSubject:          ownerSubject,
+	}
+	if staticCreds != nil {
+		a.ClientID = staticCreds.ClientID
+		a.ClientSecret = staticCreds.ClientSecret
+		a.Scope = staticCreds.Scope
 	}
 	if t := strings.TrimSpace(req.BearerToken); t != "" {
 		a.AuthMode, a.BearerToken = "token", t
@@ -1617,7 +1687,7 @@ func (c *ConsoleAPI) update(w http.ResponseWriter, r *http.Request, a Account, a
 		requestedNamespaceID = strings.TrimSpace(*req.ConnectionNamespaceID)
 	}
 	// ponytail: rename changes only the display Label, NOT Name — so Claude's
-	// tool prefix (lelapa_notion__) stays stable instead of churning on rename.
+	// tool prefix (tegence_notion__) stays stable instead of churning on rename.
 	// Re-read immediately before mutating. This retains omitted fields and,
 	// more importantly, prevents a stale manager from overwriting an ownership
 	// transition which completed between the initial authorization check and
@@ -1754,36 +1824,53 @@ func (c *ConsoleAPI) handleConnect(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	// Optional body selects the connect path. No body / all-empty fields → DCR
-	// (RFC 7591 Dynamic Client Registration), the original behavior. If ANY
-	// static field is present → static-client path (pre-registered app), which
-	// requires clientId AND scope; clientSecret MAY be empty (public client).
-	// clientSecret is a credential: never logged, never echoed in a response.
+	// Optional body selects the connect path. A no-body request reuses a static
+	// client that was safely saved with the account, if one exists; otherwise it
+	// takes the legacy RFC 7591 DCR path. If any static field or provider
+	// authorization extra is present, this request supplies a pre-registered
+	// client and is durably saved before browser authorization begins. The client
+	// secret is credential material: it is never logged or echoed in a response.
 	var req struct {
-		ClientID     string `json:"clientId"`
-		ClientSecret string `json:"clientSecret"`
-		Scope        string `json:"scope"`
+		ClientID            string            `json:"clientId"`
+		ClientSecret        string            `json:"clientSecret"`
+		Scope               string            `json:"scope"`
+		AuthorizationExtras map[string]string `json:"authorizationExtras"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
 		return
 	}
-	clientID := strings.TrimSpace(req.ClientID)
-	clientSecret := strings.TrimSpace(req.ClientSecret)
-	scope := strings.TrimSpace(req.Scope)
-
-	var sc *StaticCreds
-	if clientID != "" || clientSecret != "" || scope != "" {
-		// Static mode requested — enforce the minimum viable set.
-		if clientID == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "clientId is required for a pre-registered OAuth app"})
+	sc, err := staticCredsFromRequest(req.ClientID, req.ClientSecret, req.Scope, req.AuthorizationExtras)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	// A reauthorization has no browser-supplied credentials. Resolve the
+	// existing static client here too, so a Gmail connection with a missing
+	// confidential-client secret fails clearly before starting OAuth.
+	if err := validateStaticCredsForUpstream(effectiveStaticCreds(sc, a, true, a.URL), a.URL); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if sc != nil {
+		configStore, ok := c.store.(StaticOAuthConfigStore)
+		if !ok {
+			// Do not begin a static OAuth flow unless its retry-critical client
+			// configuration can be persisted. Falling back to DCR here would
+			// silently break Gmail and other non-DCR providers after cancellation.
+			writeJSON(w, http.StatusNotImplemented, map[string]string{"error": "static OAuth configuration is not supported by this store"})
 			return
 		}
-		if scope == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "scope is required for a pre-registered OAuth app"})
+		persisted, err := configStore.SaveStaticOAuthConfig(r.Context(), a.Name, oauthCompletionPreconditionForAccount(a), StaticOAuthConfig{
+			ClientID:     sc.ClientID,
+			ClientSecret: sc.ClientSecret,
+			Scope:        sc.Scope,
+		})
+		if err != nil {
+			writeStaticOAuthConfigPersistenceError(w, err)
 			return
 		}
-		sc = &StaticCreds{ClientID: clientID, ClientSecret: clientSecret, Scope: scope}
+		a = persisted
 	}
 
 	label := a.Label
@@ -1867,7 +1954,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// slugify turns "Notion Lelapa" into "notion_lelapa" — lowercase, non-alnum
+// slugify turns "Notion Tegence" into "notion_tegence" — lowercase, non-alnum
 // collapsed to single underscores, trimmed.
 func slugify(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))

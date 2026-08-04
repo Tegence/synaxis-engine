@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -106,7 +107,7 @@ func TestStaticClient_AuthorizeURL(t *testing.T) {
 		t.Fatalf("NewPKCE: %v", err)
 	}
 
-	authURL := AuthorizeURL(meta, ci.ClientID, "https://narthex.example.com/callback", pkce.Challenge, state, "read")
+	authURL := AuthorizeURL(meta, ci.ClientID, "https://narthex.example.com/callback", pkce.Challenge, state, "read", nil)
 
 	if !strings.HasPrefix(authURL, "https://auth.example.com/authorize?") {
 		t.Errorf("unexpected AuthorizeURL prefix: %s", authURL)
@@ -115,6 +116,76 @@ func TestStaticClient_AuthorizeURL(t *testing.T) {
 		if !strings.Contains(authURL, param) {
 			t.Errorf("AuthorizeURL missing %q; full URL: %s", param, authURL)
 		}
+	}
+}
+
+func TestAuthorizeURL_AllowsOnlyProviderAuthorizationExtras(t *testing.T) {
+	meta := &Metadata{
+		Resource:              "https://gmailmcp.googleapis.com/mcp/v1",
+		AuthorizationEndpoint: "https://accounts.example/authorize",
+		TokenEndpoint:         "https://accounts.example/token",
+	}
+	authURL := AuthorizeURL(
+		meta,
+		"public-client-id",
+		"https://engine.example/api/oauth/callback",
+		"pkce-challenge",
+		"opaque-state",
+		"https://www.googleapis.com/auth/gmail.readonly",
+		map[string]string{
+			"access_type":            "offline",
+			"prompt":                 "consent",
+			"include_granted_scopes": "true",
+			"client_secret":          "must-not-leak",
+			"redirect_uri":           "https://attacker.example/callback",
+			"state":                  "attacker-state",
+		},
+	)
+	parsed, err := url.Parse(authURL)
+	if err != nil {
+		t.Fatalf("parse authorization URL: %v", err)
+	}
+	query := parsed.Query()
+	for key, want := range map[string]string{
+		"access_type":            "offline",
+		"prompt":                 "consent",
+		"include_granted_scopes": "true",
+	} {
+		if got := query.Get(key); got != want {
+			t.Errorf("query %s = %q, want %q", key, got, want)
+		}
+	}
+	if got := query.Get("redirect_uri"); got != "https://engine.example/api/oauth/callback" {
+		t.Errorf("redirect_uri = %q, want engine callback", got)
+	}
+	if got := query.Get("state"); got != "opaque-state" {
+		t.Errorf("state = %q, want opaque state", got)
+	}
+	if got := query.Get("client_secret"); got != "" {
+		t.Errorf("unsafe authorization extra client_secret leaked into URL: %q", got)
+	}
+}
+
+func TestValidateAuthorizationExtrasRejectsUnknownValuesWithoutEchoingThem(t *testing.T) {
+	valid, err := ValidateAuthorizationExtras(map[string]string{
+		"access_type":            " offline ",
+		"prompt":                 "consent",
+		"include_granted_scopes": "true",
+	})
+	if err != nil {
+		t.Fatalf("validate allowed extras: %v", err)
+	}
+	if valid["access_type"] != "offline" || valid["prompt"] != "consent" || valid["include_granted_scopes"] != "true" {
+		t.Errorf("validated extras = %#v", valid)
+	}
+
+	const secret = "TOPSECRET-do-not-echo"
+	_, err = ValidateAuthorizationExtras(map[string]string{"client_secret": secret})
+	if err == nil {
+		t.Fatal("expected unknown authorization extra to be rejected")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Errorf("validation error leaked supplied value: %v", err)
 	}
 }
 

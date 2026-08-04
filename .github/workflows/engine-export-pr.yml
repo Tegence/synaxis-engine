@@ -1,0 +1,44 @@
+name: Open Engine export pull request
+
+on:
+  push:
+    branches:
+      - automation/engine-export-*
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  open-pull-request:
+    name: Open draft Engine export PR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Open a draft PR when one is not already open
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ENGINE_BRANCH: ${{ github.ref_name }}
+          ENGINE_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          existing_pr="$(gh pr list \
+            --repo "$ENGINE_REPOSITORY" \
+            --head "$ENGINE_BRANCH" \
+            --state open \
+            --json url \
+            --jq '.[0].url // empty')"
+          if [[ -n "$existing_pr" ]]; then
+            echo "Draft Engine export PR already exists: $existing_pr"
+            exit 0
+          fi
+
+          source_short="${ENGINE_BRANCH#automation/engine-export-}"
+          gh pr create \
+            --repo "$ENGINE_REPOSITORY" \
+            --base main \
+            --head "$ENGINE_BRANCH" \
+            --draft \
+            --title "sync: export Engine from ${source_short}" \
+            --body "Automated, allowlist-based export from the private Synaxis product repository.\n\nThis branch must pass the public Engine CI before review and merge."

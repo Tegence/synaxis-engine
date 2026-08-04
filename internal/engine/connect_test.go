@@ -21,7 +21,7 @@ import (
 //
 //  1. StaticClient(id, secret) returns a ClientInfo carrying those exact creds
 //     (which StartConnect stashes into pendingConnect -> Account), and
-//  2. AuthorizeURL(meta, id, ..., scope) emits client_id=id and scope=<scope>
+//  2. AuthorizeURL(meta, id, ..., scope, extras) emits client_id=id and scope=<scope>
 //     (StartConnect passes sc.ClientID and sc.Scope through unchanged).
 //
 // Together these prove that a *StaticCreds threads its client_id and scope into
@@ -76,7 +76,7 @@ func TestStaticConnectSeam(t *testing.T) {
 				t.Errorf("ClientSecret = %q; want %q", ci.ClientSecret, tc.clientSecret)
 			}
 
-			u := upstreamoauth.AuthorizeURL(meta, ci.ClientID, "https://console.example/cb", "chal", "state123", tc.scope)
+			u := upstreamoauth.AuthorizeURL(meta, ci.ClientID, "https://console.example/cb", "chal", "state123", tc.scope, nil)
 
 			if !strings.Contains(u, "client_id="+tc.clientID) {
 				t.Errorf("authorize URL missing client_id=%s: %s", tc.clientID, u)
@@ -98,10 +98,56 @@ func TestStaticConnectSeam(t *testing.T) {
 	}
 }
 
+func TestEffectiveStaticCredsReusesPersistedGmailClientWithOfflineConsent(t *testing.T) {
+	const secret = "stored-secret"
+	persisted := Account{
+		URL:          gmailMCPURL,
+		ClientID:     "gmail-client-id",
+		ClientSecret: secret,
+		Scope:        "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.compose",
+	}
+	got := effectiveStaticCreds(nil, persisted, true, gmailMCPURL+"/")
+	if got == nil {
+		t.Fatal("expected persisted static OAuth client to be reused")
+	}
+	if got.ClientID != persisted.ClientID || got.ClientSecret != secret || got.Scope != persisted.Scope {
+		t.Errorf("effective static creds = %+v, want persisted client, secret, and scope", got)
+	}
+	for key, want := range map[string]string{
+		"access_type":            "offline",
+		"prompt":                 "consent",
+		"include_granted_scopes": "true",
+	} {
+		if value := got.AuthorizationExtras[key]; value != want {
+			t.Errorf("AuthorizationExtras[%q] = %q, want %q", key, value, want)
+		}
+	}
+}
+
+func TestEffectiveStaticCredsLeavesLegacyDCRAccountsOnDCRPath(t *testing.T) {
+	// Dynamic registration records a client ID but no operator-selected scope.
+	// It must remain on the legacy DCR path when the user reauthorizes.
+	persistedDCR := Account{ClientID: "dynamically-registered-id", Scope: ""}
+	if got := effectiveStaticCreds(nil, persistedDCR, true, "https://mcp.notion.com/mcp"); got != nil {
+		t.Errorf("effectiveStaticCreds() = %+v, want nil for legacy DCR account", got)
+	}
+}
+
+func TestEffectiveStaticCredsRejectsGmailClientWithoutSecret(t *testing.T) {
+	persisted := Account{
+		ClientID: "gmail-client-id",
+		Scope:    "https://www.googleapis.com/auth/gmail.readonly",
+	}
+	creds := effectiveStaticCreds(nil, persisted, true, gmailMCPURL)
+	if err := validateStaticCredsForUpstream(creds, gmailMCPURL); err == nil {
+		t.Fatal("expected Gmail's confidential Web OAuth client to require a secret")
+	}
+}
+
 func TestFinishConnectMergesOAuthIntoCurrentAccountAfterMetadataAndPolicyEdits(t *testing.T) {
 	ctx := context.Background()
 	g := newConnectorTestGateway(t, map[string][]string{
-		"lelapa_notion": {"search", "old_tool"},
+		"tegence_notion": {"search", "old_tool"},
 	})
 	baseList := g.listTools
 	g.listTools = func(callCtx context.Context, a Account) ([]mcp.Tool, error) {
@@ -114,7 +160,7 @@ func TestFinishConnectMergesOAuthIntoCurrentAccountAfterMetadataAndPolicyEdits(t
 		return tools, err
 	}
 	account := Account{
-		Name: "lelapa_notion", Label: "Notion old", Group: "Old namespace",
+		Name: "tegence_notion", Label: "Notion old", Group: "Old namespace",
 		URL: "https://mcp.example.com/", AuthMode: "oauth",
 		ClientID: "new-client", AccessToken: "old-access", RefreshToken: "old-refresh", BearerToken: "stale-bearer",
 		DisabledTools: []string{"old_tool"},

@@ -21,7 +21,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
-// Upstream is one connected backend account (e.g. "lelapa_notion").
+// Upstream is one connected backend account (e.g. "tegence_notion").
 type Upstream struct {
 	Name string // the tool prefix Claude sees: <Name>__<tool>
 	URL  string // the upstream MCP Streamable HTTP endpoint

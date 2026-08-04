@@ -610,7 +610,7 @@ func TestNamespaceAPIContractCollisionsAndIdempotency(t *testing.T) {
 
 func TestEndpointAPIAliasesShareAuthorizationStateAndCAS(t *testing.T) {
 	mux, token, _ := newConnectorConsole(t, map[string][]string{
-		"lelapa_notion":   {"search"},
+		"tegence_notion":  {"search"},
 		"personal_notion": {"search"},
 	})
 
@@ -622,7 +622,7 @@ func TestEndpointAPIAliasesShareAuthorizationStateAndCAS(t *testing.T) {
 	}
 
 	rec, created := doJSON(t, mux, token, http.MethodPost, "/api/endpoints",
-		`{"slug":"notion-access","label":"Notion access","members":["lelapa_notion"]}`)
+		`{"slug":"notion-access","label":"Notion access","members":["tegence_notion"]}`)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("POST preferred endpoint = %d, body %s", rec.Code, rec.Body)
 	}
@@ -646,7 +646,7 @@ func TestEndpointAPIAliasesShareAuthorizationStateAndCAS(t *testing.T) {
 	currentRevision := int64(updated["revision"].(float64))
 	members, membersOK := updated["members"].([]any)
 	if !membersOK || len(members) != 2 ||
-		members[0] != "lelapa_notion" || members[1] != "personal_notion" {
+		members[0] != "personal_notion" || members[1] != "tegence_notion" {
 		t.Fatalf("preferred membership update = %v", updated)
 	}
 

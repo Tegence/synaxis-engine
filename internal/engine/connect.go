@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -44,6 +45,67 @@ type pendingConnect struct {
 // directly. A nil *StaticCreds selects the DCR path (unchanged behavior).
 type StaticCreds struct {
 	ClientID, ClientSecret, Scope string
+	AuthorizationExtras           map[string]string
+}
+
+const gmailMCPURL = "https://gmailmcp.googleapis.com/mcp/v1"
+
+// effectiveStaticCreds preserves a pre-registered OAuth client across a
+// reauthorization. Static-client accounts persist their client ID, optional
+// secret, and requested scope after the first successful flow; reusing those
+// credentials avoids incorrectly falling back to upstream DCR. DCR accounts
+// have no persisted scope, so their legacy no-body behavior remains unchanged.
+//
+// Gmail requires offline consent parameters to reliably issue a refresh token.
+// They are intentionally derived only for its first-party MCP URL rather than
+// persisted in the account record, so no new credential schema is needed.
+func effectiveStaticCreds(requested *StaticCreds, existing Account, accountExisted bool, upstreamURL string) *StaticCreds {
+	if requested == nil && accountExisted && existing.ClientID != "" && existing.Scope != "" {
+		requested = &StaticCreds{
+			ClientID:     existing.ClientID,
+			ClientSecret: existing.ClientSecret,
+			Scope:        existing.Scope,
+		}
+	}
+	if requested == nil {
+		return nil
+	}
+	effective := *requested
+	effective.AuthorizationExtras = copyAuthorizationExtras(requested.AuthorizationExtras)
+	if isGmailMCPURL(upstreamURL) {
+		effective.AuthorizationExtras = map[string]string{
+			"access_type":            "offline",
+			"prompt":                 "consent",
+			"include_granted_scopes": "true",
+		}
+	}
+	return &effective
+}
+
+func isGmailMCPURL(upstreamURL string) bool {
+	return strings.TrimRight(strings.TrimSpace(upstreamURL), "/") == gmailMCPURL
+}
+
+// validateStaticCredsForUpstream enforces requirements that are specific to a
+// first-party provider's officially supported OAuth client type. Google
+// documents Gmail's MCP connection as a confidential Web OAuth client, so an
+// empty secret must not start a flow that cannot exchange its code.
+func validateStaticCredsForUpstream(sc *StaticCreds, upstreamURL string) error {
+	if sc != nil && isGmailMCPURL(upstreamURL) && strings.TrimSpace(sc.ClientSecret) == "" {
+		return errors.New("clientSecret is required for Gmail's pre-registered OAuth app")
+	}
+	return nil
+}
+
+func copyAuthorizationExtras(extras map[string]string) map[string]string {
+	if len(extras) == 0 {
+		return nil
+	}
+	copy := make(map[string]string, len(extras))
+	for key, value := range extras {
+		copy[key] = value
+	}
+	return copy
 }
 
 func NewConnector(store AccountStore, gw *Gateway) *Connector {
@@ -68,18 +130,24 @@ func (c *Connector) StartConnect(ctx context.Context, name, label, group, url, r
 		accountPrecondition = oauthCompletionPreconditionForAccount(existingAccount)
 		accountPrecondition.URL = url
 	}
+	sc = effectiveStaticCreds(sc, existingAccount, accountExisted, url)
+	if err := validateStaticCredsForUpstream(sc, url); err != nil {
+		return "", err
+	}
 	meta, err := upstreamoauth.Discover(ctx, url)
 	if err != nil {
 		return "", fmt.Errorf("discover: %w", err)
 	}
 	var ci *upstreamoauth.ClientInfo
 	scope := ""
+	var authorizationExtras map[string]string
 	if sc != nil {
 		ci, err = upstreamoauth.StaticClient(sc.ClientID, sc.ClientSecret)
 		if err != nil {
 			return "", fmt.Errorf("static client: %w", err)
 		}
 		scope = sc.Scope
+		authorizationExtras = sc.AuthorizationExtras
 	} else {
 		ci, err = upstreamoauth.Register(ctx, meta.RegistrationEndpoint, redirectURI)
 		if err != nil {
@@ -103,7 +171,7 @@ func (c *Connector) StartConnect(ctx context.Context, name, label, group, url, r
 		accountExisted: accountExisted, accountPrecondition: accountPrecondition,
 	}
 	c.mu.Unlock()
-	return upstreamoauth.AuthorizeURL(meta, ci.ClientID, redirectURI, pkce.Challenge, state, scope), nil
+	return upstreamoauth.AuthorizeURL(meta, ci.ClientID, redirectURI, pkce.Challenge, state, scope, authorizationExtras), nil
 }
 
 // FinishConnect: the OAuth callback — exchange the code, persist the account,

@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -47,7 +48,15 @@ const (
 
 	usageGrantIssuer   = "synaxis-platform"
 	usageGrantAudience = "synaxis-engine"
-	usageGrantPlan     = "starter-v1"
+	// legacyUsageGrantPlan remains useful to compatibility tests and existing
+	// hosted deployments. The Engine must not, however, own the Platform's
+	// commercial catalogue: a valid Platform-signed grant may carry any
+	// well-formed plan identifier and its explicit, signed limits remain the
+	// only enforcement input.
+	legacyUsageGrantPlan = "starter-v1"
+	// usageGrantPlan is retained for package-internal compatibility fixtures.
+	// It is not an allowlist.
+	usageGrantPlan     = legacyUsageGrantPlan
 	usageGrantType     = "synaxis-engine-usage-grant+jwt"
 	maxUsageGrantBytes = 16 << 10
 
@@ -55,6 +64,8 @@ const (
 	// multiplying so a trusted operator extension can never overflow int64.
 	maxRuntimeGrantSeconds = int64(1<<63-1) / 1000
 )
+
+var usageGrantPlanIDPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,63}$`)
 
 // UsageIdentity binds durable counters and signed grants to one immutable
 // hosted Engine deployment.
@@ -432,8 +443,8 @@ func verifyUsageGrant(
 		return UsageGrant{}, errors.New("usage grant generation does not match this Engine")
 	case claims.Revision <= 0:
 		return UsageGrant{}, errors.New("usage grant revision must be positive")
-	case claims.PlanID != usageGrantPlan:
-		return UsageGrant{}, errors.New("usage grant plan is unsupported")
+	case !usageGrantPlanIDPattern.MatchString(claims.PlanID):
+		return UsageGrant{}, errors.New("usage grant plan identifier is invalid")
 	case claims.Status != "trialing" && claims.Status != "active":
 		return UsageGrant{}, errors.New("usage grant status is not enforceable")
 	case !end.After(start):

@@ -18,6 +18,8 @@ type tokenGenerationStoreContract interface {
 var (
 	_ AccountStore                 = (*FileStore)(nil)
 	_ AccountStore                 = (*PgStore)(nil)
+	_ StaticOAuthConfigStore       = (*FileStore)(nil)
+	_ StaticOAuthConfigStore       = (*PgStore)(nil)
 	_ PortableAccountConfigStore   = (*FileStore)(nil)
 	_ PortableAccountConfigStore   = (*PgStore)(nil)
 	_ ConnectorStore               = (*FileStore)(nil)
@@ -29,6 +31,50 @@ var (
 	_ tokenGenerationStoreContract = (*FileStore)(nil)
 	_ tokenGenerationStoreContract = (*PgStore)(nil)
 )
+
+func TestFileStoreSaveStaticOAuthConfigRejectsMovedAccount(t *testing.T) {
+	ctx := context.Background()
+	store, err := LoadFileStore(filepath.Join(t.TempDir(), "accounts.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := store.CreateConnectionNamespace(ctx, ConnectionNamespace{Label: "Source"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := store.CreateConnectionNamespace(ctx, ConnectionNamespace{Label: "Target"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Create(ctx, Account{
+		Name: "gmail", Label: "Gmail", Group: source.Label,
+		ConnectionNamespaceID: source.ID, ConnectionScope: ConnectionScopeShared,
+		URL: "https://gmailmcp.googleapis.com/mcp/v1", AuthMode: "oauth",
+		ClientID: "old-client", ClientSecret: "old-secret", Scope: "old-scope",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before, found := store.Account("gmail")
+	if !found {
+		t.Fatal("seed account missing")
+	}
+	if _, err := store.MoveAccountToConnectionNamespace(ctx, before.Name, before.IncarnationID, AccountConnectionAssignment{
+		ConnectionNamespaceID: target.ID,
+		Scope:                 ConnectionScopeShared,
+	}, before.Revision); err != nil {
+		t.Fatalf("move account: %v", err)
+	}
+	_, err = store.SaveStaticOAuthConfig(ctx, before.Name, oauthCompletionPreconditionForAccount(before), StaticOAuthConfig{
+		ClientID: "new-client", ClientSecret: "new-secret", Scope: "new-scope",
+	})
+	if !errors.Is(err, ErrConnectAccountMoved) {
+		t.Fatalf("stale static OAuth config write = %v, want ErrConnectAccountMoved", err)
+	}
+	after, found := store.Account(before.Name)
+	if !found || after.ClientID != "old-client" || after.ClientSecret != "old-secret" || after.Scope != "old-scope" || after.ConnectionNamespaceID != target.ID {
+		t.Fatalf("stale config write mutated moved account: %+v", after)
+	}
+}
 
 func TestFileStoreSetMetaIsLabelOnlyAndRejectsStaleGroupOwnership(t *testing.T) {
 	ctx := context.Background()

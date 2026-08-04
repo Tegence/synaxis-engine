@@ -19,7 +19,7 @@ func connectionNamespacePrecondition(ns ConnectionNamespace) ConnectionNamespace
 func TestFileStoreBackfillsLegacyGroupsAsSharedConnectionNamespaces(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "legacy.json")
 	legacy := []Account{{
-		Name: "notion_legacy", Label: "Notion · Lelapa", Group: "Lelapa",
+		Name: "notion_legacy", Label: "Notion · Tegence", Group: "Tegence",
 		URL: "https://notion.example/mcp", AuthMode: "token", BearerToken: "secret",
 	}}
 	b, err := json.Marshal(legacy)
@@ -41,11 +41,11 @@ func TestFileStoreBackfillsLegacyGroupsAsSharedConnectionNamespaces(t *testing.T
 	if account.ConnectionScope != ConnectionScopeShared || account.ConnectionNamespaceID == "" || account.Revision != 1 || account.IncarnationID == "" {
 		t.Fatalf("legacy account ownership = %+v; want explicitly shared with namespace and revision", account)
 	}
-	if account.Group != "Lelapa" || account.BearerToken != "secret" {
+	if account.Group != "Tegence" || account.BearerToken != "secret" {
 		t.Fatalf("legacy account data changed during backfill: %+v", account)
 	}
 	ns, ok := store.ConnectionNamespace(context.Background(), account.ConnectionNamespaceID)
-	if !ok || ns.Label != "Lelapa" || ns.Slug != "lelapa" || ns.Revision != 1 || ns.CreatedAt.IsZero() || ns.UpdatedAt.IsZero() {
+	if !ok || ns.Label != "Tegence" || ns.Slug != "tegence" || ns.Revision != 1 || ns.CreatedAt.IsZero() || ns.UpdatedAt.IsZero() {
 		t.Fatalf("legacy namespace = %+v, ok=%v", ns, ok)
 	}
 

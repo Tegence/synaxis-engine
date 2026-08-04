@@ -23,6 +23,7 @@ type PgStore struct {
 
 var _ NamespaceStore = (*PgStore)(nil)
 var _ ConnectionNamespaceStore = (*PgStore)(nil)
+var _ StaticOAuthConfigStore = (*PgStore)(nil)
 
 const (
 	enginePostgresMaxConns        int32 = 2
@@ -1032,6 +1033,51 @@ WHERE name=$1`, completion.Name, completion.ClientID, s.enc(completion.ClientSec
 	current.AccessToken, current.RefreshToken = completion.AccessToken, refresh
 	current.TokenEndpoint, current.Resource, current.Scope = completion.TokenEndpoint, completion.Resource, completion.Scope
 	current.BearerToken = ""
+	return current, nil
+}
+
+// SaveStaticOAuthConfig records a pre-registered OAuth application before the
+// browser is redirected to the provider. The existing provider tokens remain
+// untouched, so a cancelled authorization does not disrupt a previously
+// working account; only the durable client configuration is updated.
+func (s *PgStore) SaveStaticOAuthConfig(ctx context.Context, name string, precondition OAuthCompletionPrecondition, config StaticOAuthConfig) (Account, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Account{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	current, err := s.scanAccount(tx.QueryRow(ctx, `SELECT `+accountCols+` FROM narthex_accounts WHERE name=$1 FOR UPDATE`, name))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Account{}, ErrConnectAccountDeleted
+	}
+	if err != nil {
+		return Account{}, err
+	}
+	if precondition.IncarnationID == "" || current.IncarnationID != precondition.IncarnationID {
+		return Account{}, ErrConnectAccountReplaced
+	}
+	if !equalAccountURL(current.URL, precondition.URL) {
+		return Account{}, ErrConnectAccountURLChanged
+	}
+	if current.ConnectionNamespaceID != precondition.ConnectionNamespaceID ||
+		current.ConnectionScope != precondition.ConnectionScope ||
+		current.OwnerSubject != precondition.OwnerSubject {
+		return Account{}, ErrConnectAccountMoved
+	}
+
+	if _, err := tx.Exec(ctx, `
+UPDATE narthex_accounts
+SET client_id=$2, client_secret=$3, scope=$4
+WHERE name=$1`, name, config.ClientID, s.enc(config.ClientSecret), config.Scope); err != nil {
+		return Account{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Account{}, err
+	}
+	current.ClientID = config.ClientID
+	current.ClientSecret = config.ClientSecret
+	current.Scope = config.Scope
 	return current, nil
 }
 

@@ -602,6 +602,32 @@ type AccountStore interface {
 	SetReadOnly(ctx context.Context, name string, ro bool) error
 }
 
+// StaticOAuthConfig is the pre-registered OAuth application configuration for
+// providers that do not support dynamic client registration. It deliberately
+// contains no provider tokens: it is persisted before the browser leaves the
+// console so a cancelled or failed authorization can be safely retried.
+//
+// ClientSecret is credential material. Callers must keep this type inside the
+// Engine boundary; management DTOs intentionally never serialize it.
+type StaticOAuthConfig struct {
+	ClientID     string
+	ClientSecret string
+	Scope        string
+}
+
+// StaticOAuthConfigStore is the narrow credential-write capability used by
+// the console before it redirects the browser to a pre-registered OAuth app.
+// It is intentionally separate from AccountStore so external AccountStore
+// implementations do not silently gain a new secret mutation API. Engines
+// without this facet fail static OAuth connects closed instead of starting a
+// flow that could not be retried safely.
+//
+// The precondition binds the write to the exact account incarnation, URL, and
+// credential-ownership boundary that the console just authorized.
+type StaticOAuthConfigStore interface {
+	SaveStaticOAuthConfig(ctx context.Context, name string, precondition OAuthCompletionPrecondition, config StaticOAuthConfig) (Account, error)
+}
+
 // PortableAccountConfig is the secret-free, non-ownership portion of an
 // account accepted by a portable configuration import. It deliberately omits
 // Group, namespace, scope, owner, and credentials: importing an old snapshot
@@ -675,6 +701,7 @@ type FileStore struct {
 
 var _ NamespaceStore = (*FileStore)(nil)
 var _ ConnectionNamespaceStore = (*FileStore)(nil)
+var _ StaticOAuthConfigStore = (*FileStore)(nil)
 
 // fileStoreData is the on-disk shape. Older files were a bare JSON array of
 // accounts; LoadFileStore still accepts that, and a missing "connectors"
@@ -1100,6 +1127,40 @@ func (s *FileStore) CompleteOAuth(_ context.Context, precondition OAuthCompletio
 		}
 		current.TokenEndpoint, current.Resource, current.Scope = completion.TokenEndpoint, completion.Resource, completion.Scope
 		current.BearerToken = ""
+		if err := s.saveLocked(); err != nil {
+			*current = before
+			return Account{}, err
+		}
+		return copyAccount(*current), nil
+	}
+	return Account{}, ErrConnectAccountDeleted
+}
+
+// SaveStaticOAuthConfig records a pre-registered OAuth app before browser
+// authorization begins. Keeping the write narrow preserves existing provider
+// tokens and account policy if a user cancels the new authorization flow.
+func (s *FileStore) SaveStaticOAuthConfig(_ context.Context, name string, precondition OAuthCompletionPrecondition, config StaticOAuthConfig) (Account, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, current := range s.accounts {
+		if current.Name != name {
+			continue
+		}
+		if precondition.IncarnationID == "" || current.IncarnationID != precondition.IncarnationID {
+			return Account{}, ErrConnectAccountReplaced
+		}
+		if !equalAccountURL(current.URL, precondition.URL) {
+			return Account{}, ErrConnectAccountURLChanged
+		}
+		if current.ConnectionNamespaceID != precondition.ConnectionNamespaceID ||
+			current.ConnectionScope != precondition.ConnectionScope ||
+			current.OwnerSubject != precondition.OwnerSubject {
+			return Account{}, ErrConnectAccountMoved
+		}
+		before := copyAccount(*current)
+		current.ClientID = config.ClientID
+		current.ClientSecret = config.ClientSecret
+		current.Scope = config.Scope
 		if err := s.saveLocked(); err != nil {
 			*current = before
 			return Account{}, err

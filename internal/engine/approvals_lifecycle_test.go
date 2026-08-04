@@ -169,7 +169,7 @@ func TestApprovalDecisionActorDoesNotTrustRawPlatformIdentityHeaders(t *testing.
 	api := NewConsoleAPI(nil, nil, nil, "pw", "secret", "https://engine.example", "", "", WithAdminToken("machine"))
 	machine := httptest.NewRequest("POST", "/", nil)
 	machine.Header.Set("Authorization", "Bearer machine")
-	machine.Header.Set("X-Synaxis-User-ID", "olumide.okubadejo")
+	machine.Header.Set("X-Synaxis-User-ID", "operator@example.test")
 	if got := api.approvalDecisionActor(machine); got != "platform-admin" {
 		t.Fatalf("raw platform actor must not be trusted, got %q", got)
 	}

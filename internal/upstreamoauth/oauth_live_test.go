@@ -28,6 +28,6 @@ func TestLiveNotion(t *testing.T) {
 		}
 		t.Logf("register redirect=%s -> OK client_id=%s", redirect, ci.ClientID)
 		pkce, state, _ := NewPKCE()
-		t.Logf("  authorize URL: %s", AuthorizeURL(m, ci.ClientID, redirect, pkce.Challenge, state, ""))
+		t.Logf("  authorize URL: %s", AuthorizeURL(m, ci.ClientID, redirect, pkce.Challenge, state, "", nil))
 	}
 }

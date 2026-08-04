@@ -22,6 +22,7 @@ type fakeConnector struct {
 	authURL     string
 	startErr    error
 	finishErr   error
+	store       *FileStore
 }
 
 func (f *fakeConnector) StartConnect(_ context.Context, _, _, _, _, _ string, sc *StaticCreds) (string, error) {
@@ -41,16 +42,20 @@ func (f *fakeConnector) FinishConnect(_ context.Context, _, _ string) (string, i
 // newConnectConsole builds a ConsoleAPI with a fakeConnector injected via the
 // unexported conn seam, an account pre-seeded, a bearer minted like handleLogin.
 func newConnectConsole(t *testing.T) (*http.ServeMux, string, *fakeConnector) {
+	return newConnectConsoleForURL(t, "https://acme.example/mcp")
+}
+
+func newConnectConsoleForURL(t *testing.T, upstreamURL string) (*http.ServeMux, string, *fakeConnector) {
 	t.Helper()
 	fs, err := LoadFileStore(filepath.Join(t.TempDir(), "accounts.json"))
 	if err != nil {
 		t.Fatalf("file store: %v", err)
 	}
-	if err := fs.Upsert(context.Background(), Account{Name: "acme", Label: "Acme", URL: "https://acme.example/mcp", AuthMode: "oauth"}); err != nil {
+	if err := fs.Upsert(context.Background(), Account{Name: "acme", Label: "Acme", URL: upstreamURL, AuthMode: "oauth"}); err != nil {
 		t.Fatalf("upsert account: %v", err)
 	}
 	g := NewGateway(fs, nil)
-	fake := &fakeConnector{}
+	fake := &fakeConnector{store: fs}
 	api := NewConsoleAPI(fs, g, nil, "pw", "test-secret", "https://engine.example", "http://localhost:3000", "")
 	api.conn = fake // inject the seam
 	mux := http.NewServeMux()
@@ -90,12 +95,83 @@ func TestConnectDCRPathNoBody(t *testing.T) {
 // the DCR path — backward compatible with any client that posts {}.
 func TestConnectDCRPathEmptyFields(t *testing.T) {
 	mux, tok, fake := newConnectConsole(t)
-	rec := doConnect(t, mux, tok, `{"clientId":"","clientSecret":"","scope":""}`)
+	rec := doConnect(t, mux, tok, `{"clientId":"","clientSecret":"","scope":"","authorizationExtras":{}}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d; want 200 (body=%s)", rec.Code, rec.Body.String())
 	}
 	if fake.sawStatic {
 		t.Errorf("expected DCR path for all-empty static fields; got %+v", fake.gotSC)
+	}
+}
+
+func TestConnectStaticAuthorizationExtras(t *testing.T) {
+	mux, tok, fake := newConnectConsole(t)
+	rec := doConnect(t, mux, tok, `{
+		"clientId":"gmail-client-id",
+		"clientSecret":"gmail-client-secret",
+		"scope":"https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.compose",
+		"authorizationExtras":{
+			"access_type":"offline",
+			"prompt":"consent",
+			"include_granted_scopes":"true"
+		}
+	}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if !fake.sawStatic || fake.gotSC == nil {
+		t.Fatal("expected static OAuth credentials")
+	}
+	for key, want := range map[string]string{
+		"access_type":            "offline",
+		"prompt":                 "consent",
+		"include_granted_scopes": "true",
+	} {
+		if got := fake.gotSC.AuthorizationExtras[key]; got != want {
+			t.Errorf("AuthorizationExtras[%q] = %q, want %q", key, got, want)
+		}
+	}
+}
+
+func TestConnectRejectsUnknownAuthorizationExtrasWithoutLeakingSecret(t *testing.T) {
+	const secret = "TOPSECRET-do-not-echo"
+	mux, tok, fake := newConnectConsole(t)
+	rec := doConnect(t, mux, tok, `{
+		"clientId":"gmail-client-id",
+		"clientSecret":"`+secret+`",
+		"scope":"https://www.googleapis.com/auth/gmail.readonly",
+		"authorizationExtras":{"client_secret":"`+secret+`"}
+	}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d; want 400 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if fake.startCalled {
+		t.Fatal("StartConnect must not be called for an unknown authorization extra")
+	}
+	if strings.Contains(rec.Body.String(), secret) {
+		t.Errorf("response leaked a credential: %s", rec.Body.String())
+	}
+}
+
+func TestConnectRejectsGmailStaticClientWithoutSecret(t *testing.T) {
+	mux, tok, fake := newConnectConsoleForURL(t, gmailMCPURL+"/")
+	rec := doConnect(t, mux, tok, `{
+		"clientId":"gmail-client-id",
+		"scope":"https://www.googleapis.com/auth/gmail.readonly",
+		"authorizationExtras":{
+			"access_type":"offline",
+			"prompt":"consent",
+			"include_granted_scopes":"true"
+		}
+	}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d; want 400 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "clientSecret") {
+		t.Errorf("response should explain the Gmail client-secret requirement: %s", rec.Body.String())
+	}
+	if fake.startCalled {
+		t.Fatal("StartConnect must not be called without Gmail's required client secret")
 	}
 }
 
@@ -118,6 +194,42 @@ func TestConnectStaticPath(t *testing.T) {
 	}
 	if fake.gotSC.Scope != "mcp:connect read" {
 		t.Errorf("Scope = %q; want %q", fake.gotSC.Scope, "mcp:connect read")
+	}
+}
+
+func TestConnectStagesStaticOAuthConfigurationBeforeBrowserAuthorization(t *testing.T) {
+	const secret = "gmail-secret-must-not-leak"
+	mux, tok, fake := newConnectConsoleForURL(t, gmailMCPURL)
+	// Simulate the point at which an initial authorization cannot start (for
+	// example discovery or a provider outage). The static app configuration
+	// must already be durable so the user can retry later without DCR.
+	fake.startErr = errors.New("upstream authorization discovery unavailable")
+	rec := doConnect(t, mux, tok, `{
+		"clientId":"gmail-client-id",
+		"clientSecret":"`+secret+`",
+		"scope":"https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.compose"
+	}`)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d; want 502 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), secret) {
+		t.Fatalf("connect response leaked OAuth client secret: %s", rec.Body.String())
+	}
+	account, found := fake.store.Account("acme")
+	if !found {
+		t.Fatal("account disappeared while staging static OAuth configuration")
+	}
+	if account.ClientID != "gmail-client-id" || account.ClientSecret != secret || account.Scope == "" {
+		t.Fatalf("static OAuth configuration was not staged before redirect: %+v", account)
+	}
+	// A cancellation never calls FinishConnect. A fresh no-body retry must
+	// still select this saved Gmail client rather than DCR.
+	retry := effectiveStaticCreds(nil, account, true, account.URL)
+	if retry == nil || retry.ClientID != account.ClientID || retry.ClientSecret != secret || retry.Scope != account.Scope {
+		t.Fatalf("cancellation retry selected %+v; want saved static client", retry)
+	}
+	if err := validateStaticCredsForUpstream(retry, account.URL); err != nil {
+		t.Fatalf("saved Gmail retry should be valid: %v", err)
 	}
 }
 

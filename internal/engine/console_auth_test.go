@@ -74,6 +74,38 @@ func TestConsoleMachineAdminAndSessionAuthentication(t *testing.T) {
 	}
 }
 
+func TestGatewayReportsOAuthCallbackURL(t *testing.T) {
+	api := NewConsoleAPI(
+		nil,
+		nil,
+		nil,
+		"self-hosted-password",
+		"test-session-secret",
+		"https://engine.example/",
+		"http://localhost:3000",
+		"",
+	)
+	mux := http.NewServeMux()
+	api.Routes(mux)
+	rec := requestStatus(mux, http.MethodGet, "/api/gateway", api.signToken(), "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("gateway status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		ConnectorURL     string `json:"connectorUrl"`
+		OAuthCallbackURL string `json:"oauthCallbackUrl"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode gateway response: %v", err)
+	}
+	if payload.ConnectorURL != "https://engine.example/mcp" {
+		t.Errorf("connectorUrl = %q", payload.ConnectorURL)
+	}
+	if payload.OAuthCallbackURL != "https://engine.example/api/oauth/callback" {
+		t.Errorf("oauthCallbackUrl = %q", payload.OAuthCallbackURL)
+	}
+}
+
 func TestConsoleMachineAuthenticationDisabledWhenTokenEmpty(t *testing.T) {
 	mux := newAuthTestConsole(WithAdminToken(""))
 	if rec := requestStatus(mux, http.MethodGet, "/api/gateway", "platform-machine-secret", ""); rec.Code != http.StatusUnauthorized {

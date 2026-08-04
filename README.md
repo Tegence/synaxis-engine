@@ -277,7 +277,7 @@ Before exposing MCP traffic, Platform sends an authenticated
   "period_start": "2026-07-30T00:00:00Z",
   "period_end": "2026-08-30T00:00:00Z",
   "revision": 3,
-  "plan_id": "starter-v1",
+  "plan_id": "platform-plan-v1",
   "status": "active",
   "limits": {
     "calls": 10000,
@@ -293,11 +293,12 @@ Before exposing MCP traffic, Platform sends an authenticated
 }
 ```
 
-Trial grants cap calls/runtime/transfer at 2,000, 7,200 seconds, and 512 MiB.
-Paid grants cap them at 10,000, 28,800 seconds, and 2 GiB. Signed grants may
-include audited operator extensions to those three metered totals.
-Concurrency, rate, burst, and per-call deadline remain hard Engine safety
-ceilings of 4, 60/minute, 10, and 120 seconds.
+`plan_id` is an opaque, Platform-defined identifier. The Engine validates its
+format and signature but intentionally does not maintain a commercial plan
+catalogue: every enforceable allowance is carried explicitly in the signed
+`limits` claim. Signed grants may include audited operator extensions to the
+metered totals. The Engine still applies its independent request, result, and
+signed-limit safety validation.
 
 Admission and settlement use durable usage-period and reservation rows, not
 the asynchronous audit log. An interrupted reservation retains its concurrency

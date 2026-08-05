@@ -207,19 +207,47 @@ func TestVerifyUsageGrantAcceptsStarterPaidAndTrialPolicies(t *testing.T) {
 			}
 		})
 	}
-	t.Run("accepts a platform-defined plan identifier", func(t *testing.T) {
-		claims := starterClaims(now, "active")
-		claims.PlanID = "pro-v1"
-		grant, err := verifyUsageGrant(
-			signUsageClaims(t, privateKey, claims), publicKey, identity, now,
-		)
-		if err != nil {
-			t.Fatalf("platform-defined plan: %v", err)
-		}
-		if grant.PlanID != "pro-v1" {
-			t.Fatalf("grant plan=%q", grant.PlanID)
-		}
-	})
+	for _, tc := range []struct {
+		name   string
+		planID string
+		limits UsageLimits
+	}{
+		{
+			name: "basic", planID: "basic-v1",
+			limits: UsageLimits{
+				Calls: 10_000, RuntimeSeconds: 18_000, TransferBytes: 2 << 30,
+				Concurrency: 2, RatePerMinute: 60, Burst: 10, MaxCallSeconds: 300,
+			},
+		},
+		{
+			name: "pro", planID: "pro-v1",
+			limits: UsageLimits{
+				Calls: 40_000, RuntimeSeconds: 60_000, TransferBytes: 2 << 30,
+				Concurrency: 5, RatePerMinute: 60, Burst: 10, MaxCallSeconds: 900,
+			},
+		},
+	} {
+		t.Run("accepts a platform-defined "+tc.name+" policy", func(t *testing.T) {
+			claims := starterClaims(now, "active")
+			claims.PlanID = tc.planID
+			claims.Limits.Calls = tc.limits.Calls
+			claims.Limits.RuntimeSeconds = tc.limits.RuntimeSeconds
+			claims.Limits.TransferBytes = tc.limits.TransferBytes
+			claims.Limits.Concurrency = tc.limits.Concurrency
+			claims.Limits.RatePerMinute = tc.limits.RatePerMinute
+			claims.Limits.Burst = tc.limits.Burst
+			claims.Limits.MaxCallSeconds = tc.limits.MaxCallSeconds
+			grant, err := verifyUsageGrant(
+				signUsageClaims(t, privateKey, claims), publicKey, identity, now,
+			)
+			if err != nil {
+				t.Fatalf("platform-defined %s policy: %v", tc.name, err)
+			}
+			if grant.PlanID != tc.planID || grant.Limits != tc.limits {
+				t.Fatalf("verified grant = %+v", grant)
+			}
+		})
+	}
 	t.Run("signed operator extension", func(t *testing.T) {
 		claims := starterClaims(now, "active")
 		claims.Revision = 2
@@ -280,10 +308,10 @@ func TestVerifyUsageGrantRejectsTamperingBindingExpiryAndOversizedPolicy(t *test
 			c.Limits.RuntimeSeconds = maxRuntimeGrantSeconds + 1
 		}, privateKey},
 		{"negative transfer", func(c *usageGrantClaims) { c.Limits.TransferBytes = -1 }, privateKey},
-		{"concurrency", func(c *usageGrantClaims) { c.Limits.Concurrency++ }, privateKey},
-		{"rate", func(c *usageGrantClaims) { c.Limits.RatePerMinute++ }, privateKey},
-		{"burst", func(c *usageGrantClaims) { c.Limits.Burst++ }, privateKey},
-		{"deadline", func(c *usageGrantClaims) { c.Limits.MaxCallSeconds++ }, privateKey},
+		{"concurrency", func(c *usageGrantClaims) { c.Limits.Concurrency = maxUsageGrantConcurrency + 1 }, privateKey},
+		{"rate", func(c *usageGrantClaims) { c.Limits.RatePerMinute = maxUsageGrantRatePerMinute + 1 }, privateKey},
+		{"burst", func(c *usageGrantClaims) { c.Limits.Burst = maxUsageGrantBurst + 1 }, privateKey},
+		{"deadline", func(c *usageGrantClaims) { c.Limits.MaxCallSeconds = maxUsageGrantMaxCallSeconds + 1 }, privateKey},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

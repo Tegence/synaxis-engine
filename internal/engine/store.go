@@ -207,8 +207,49 @@ type AccountPolicyMutation struct {
 // Description replaces the upstream description. Empty fields inherit the
 // upstream definition.
 type ToolOverride struct {
-	Alias       string `json:"alias,omitempty"`
-	Description string `json:"description,omitempty"`
+	Alias            string           `json:"alias,omitempty"`
+	Description      string           `json:"description,omitempty"`
+	GovernancePreset GovernancePreset `json:"governancePreset,omitempty"`
+}
+
+// GovernancePreset is an explicit, durable safety policy for a single
+// upstream tool. It is intentionally kept alongside the agent-facing alias
+// and description rather than on a delivery endpoint, because the same tool
+// can be reachable through the aggregate, an endpoint bundle, a connector,
+// or a subject-bound MCP client.
+//
+// The empty value preserves the historical behaviour for existing accounts.
+// Safe-write and high-risk are enforced by the Gateway on every projection;
+// they are not merely console labels that another MCP URL can bypass.
+type GovernancePreset string
+
+const (
+	GovernancePresetReadOnly  GovernancePreset = "read_only"
+	GovernancePresetSafeWrite GovernancePreset = "safe_write"
+	GovernancePresetHighRisk  GovernancePreset = "high_risk"
+)
+
+func normalizedGovernancePreset(preset GovernancePreset) (GovernancePreset, error) {
+	switch GovernancePreset(strings.ToLower(strings.TrimSpace(string(preset)))) {
+	case "":
+		return "", nil
+	case GovernancePresetReadOnly:
+		return GovernancePresetReadOnly, nil
+	case GovernancePresetSafeWrite:
+		return GovernancePresetSafeWrite, nil
+	case GovernancePresetHighRisk:
+		return GovernancePresetHighRisk, nil
+	default:
+		return "", fmt.Errorf("invalid governance preset %q", preset)
+	}
+}
+
+func (preset GovernancePreset) requiresApproval() bool {
+	return preset == GovernancePresetSafeWrite || preset == GovernancePresetHighRisk
+}
+
+func (preset GovernancePreset) recordsPayloads() bool {
+	return preset == GovernancePresetHighRisk
 }
 
 // VirtualConnector is a named, curated subset of the aggregated tools, served

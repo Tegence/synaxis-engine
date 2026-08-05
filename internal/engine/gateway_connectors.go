@@ -110,7 +110,10 @@ func (g *Gateway) buildConnector(vc VirtualConnector) error {
 			if !allowSet[bare] {
 				continue
 			}
-			if approvalSet[bare] {
+			preset, presetErr := normalizedGovernancePreset(
+				account.ToolOverrides[bare].GovernancePreset,
+			)
+			if approvalSet[bare] && (presetErr != nil || !preset.requiresApproval()) {
 				// require_approval: park the call for a human decision first.
 				// ct is a copy — the cached (main /mcp) handler stays unwrapped;
 				// that's safe because access tokens are bound to the endpoint

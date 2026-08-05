@@ -90,6 +90,32 @@ func TestConnectorFilteringBareVsPrefixed(t *testing.T) {
 	}
 }
 
+func TestReadOnlyGovernanceFailsClosedWhenAppliedToWriteTool(t *testing.T) {
+	g := newConnectorTestGateway(t, map[string][]string{
+		"linear": {"get_issue", "save_issue"},
+	})
+	ctx := context.Background()
+	account, ok := g.store.Account("linear")
+	if !ok {
+		t.Fatal("account missing")
+	}
+	account.ToolOverrides = map[string]ToolOverride{
+		"save_issue": {GovernancePreset: GovernancePresetReadOnly},
+	}
+	if err := g.store.Upsert(ctx, account); err != nil {
+		t.Fatalf("persist governance profile: %v", err)
+	}
+	if count := g.Aggregate(ctx); count != 1 {
+		t.Fatalf("aggregate count = %d, want only get_issue", count)
+	}
+	g.mu.Lock()
+	names := append([]string(nil), g.byAcct["linear"]...)
+	g.mu.Unlock()
+	if !eq(names, []string{"linear__get_issue"}) {
+		t.Fatalf("read-only profile leaked write tool: %v", names)
+	}
+}
+
 func TestSameProviderAccountsKeepDistinctToolNamespaces(t *testing.T) {
 	g := newConnectorTestGateway(t, map[string][]string{
 		"notion_work":     {"search", "fetch"},

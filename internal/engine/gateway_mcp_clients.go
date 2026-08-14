@@ -117,15 +117,18 @@ func (g *Gateway) refreshMCPClientsLocked(ctx context.Context) error {
 	store, ok := g.mcpClientStore()
 	if !ok {
 		g.mu.Lock()
-		stale := make([]string, 0, len(g.clientEndpoints))
-		for slug := range g.clientEndpoints {
-			stale = append(stale, slug)
+		stale := make(map[string]string, len(g.clientEndpoints))
+		for slug, endpoint := range g.clientEndpoints {
+			stale[slug] = endpoint.epoch
 		}
 		g.clientEndpoints = map[string]*connectorServer{}
 		revoke := g.revokeResource
+		revokeEpoch := g.revokeResourceEpoch
 		g.mu.Unlock()
-		if revoke != nil {
-			for _, slug := range stale {
+		for slug, epoch := range stale {
+			if revokeEpoch != nil && epoch != "" {
+				revokeEpoch("/mcp/clients/"+slug, epoch)
+			} else if revoke != nil {
 				revoke("/mcp/clients/" + slug)
 			}
 		}
@@ -151,25 +154,28 @@ func (g *Gateway) refreshMCPClientsLocked(ctx context.Context) error {
 	}
 
 	g.mu.Lock()
-	var revoked []string
+	revoked := make(map[string]string)
 	for slug := range g.clientEndpoints {
 		epoch, live := seen[slug]
 		if !live {
 			delete(g.clientEndpoints, slug)
-			revoked = append(revoked, slug)
+			revoked[slug] = previousEpochs[slug]
 			continue
 		}
 		// If a previous endpoint generation was served before this refresh,
 		// discard pending OAuth code/refresh state for its path as a faster
 		// complement to the epoch check in RequireAuth.
 		if previousEpochs[slug] != "" && previousEpochs[slug] != epoch {
-			revoked = append(revoked, slug)
+			revoked[slug] = previousEpochs[slug]
 		}
 	}
 	revoke := g.revokeResource
+	revokeEpoch := g.revokeResourceEpoch
 	g.mu.Unlock()
-	if revoke != nil {
-		for _, slug := range revoked {
+	for slug, epoch := range revoked {
+		if revokeEpoch != nil && epoch != "" {
+			revokeEpoch("/mcp/clients/"+slug, epoch)
+		} else if revoke != nil {
 			revoke("/mcp/clients/" + slug)
 		}
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mark3labs/mcp-go/client/transport"
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
@@ -209,7 +211,10 @@ func TestHealthPublishesOnlySafeActionableFailures(t *testing.T) {
 	g.listTools = func(_ context.Context, a Account) ([]mcp.Tool, error) {
 		switch a.Name {
 		case "expired":
-			return nil, errors.New("401 unauthorized: " + secret)
+			// What production now produces for a transport-level HTTP 401:
+			// mcp-go's typed sentinel, wrapping a provider-controlled diagnostic
+			// that must never be published.
+			return nil, fmt.Errorf("%w: %s", transport.ErrAuthorizationRequired, secret)
 		case "unreachable":
 			return nil, errors.New("provider host failed: " + secret)
 		default:
@@ -240,6 +245,39 @@ func TestHealthPublishesOnlySafeActionableFailures(t *testing.T) {
 	}
 	if strings.Contains(string(encoded), secret) {
 		t.Fatalf("health response leaked provider diagnostic: %s", encoded)
+	}
+}
+
+// TestHealthClassifiesToolLevelAuthFailureTextAsExpired guards the opposite
+// side of the typed-401 fix in upstream.go: classifyHealthProbeError must NOT
+// inherit isUnauthorized's strictness. A tool-level/proxy error that merely
+// LOOKS auth-shaped (contains "401"/"invalid_token") but is not mcp-go's
+// typed transport sentinel must still classify as auth_expired — the one
+// actionable "reauthorize" message for TOKEN-mode (PAT) accounts, which
+// upstreamFor never wires a Refresh for. The retry path's isUnauthorized, in
+// contrast, must keep rejecting this exact same error (asserted below):
+// re-executing a mutating tool call on it would be unsafe, which is exactly
+// what TestToolLevelErrorMentioning401NeverRefreshesOrReexecutes proves for
+// the CallTool path.
+func TestHealthClassifiesToolLevelAuthFailureTextAsExpired(t *testing.T) {
+	g := newConnectorTestGateway(t, map[string][]string{"revoked-pat": nil})
+	// A tool-level JSON-RPC error / proxy diagnostic delivered over HTTP 200 —
+	// not mcp-go's typed transport.ErrAuthorizationRequired — exactly the
+	// shape a revoked PAT surfaces as on many upstreams.
+	toolLevelErr := errors.New("tool failed: upstream returned 401 unauthorized (invalid_token: invalid access token)")
+	g.listTools = func(_ context.Context, a Account) ([]mcp.Tool, error) {
+		return nil, toolLevelErr
+	}
+
+	got := healthRowsByAccount(g.Health(context.Background()))["revoked-pat"]
+	if got.Status != healthStatusAuthExpired || got.Recovery != healthRecoveryReauthorize ||
+		got.Detail != "This connection needs to be authorized again." {
+		t.Fatalf("revoked-pat health = %+v, want auth_expired/reauthorize", got)
+	}
+
+	// The retry/refresh path's predicate must remain typed-401-only.
+	if isUnauthorized(toolLevelErr) {
+		t.Fatal("isUnauthorized must stay typed-401-only; the retry path would unsafely re-execute a mutating call on tool-level error text")
 	}
 }
 

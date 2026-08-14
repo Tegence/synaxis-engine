@@ -110,7 +110,10 @@ func (g *Gateway) buildConnector(vc VirtualConnector) error {
 			if !allowSet[bare] {
 				continue
 			}
-			if approvalSet[bare] {
+			preset, presetErr := normalizedGovernancePreset(
+				account.ToolOverrides[bare].GovernancePreset,
+			)
+			if approvalSet[bare] && (presetErr != nil || !preset.requiresApproval()) {
 				// require_approval: park the call for a human decision first.
 				// ct is a copy — the cached (main /mcp) handler stays unwrapped;
 				// that's safe because access tokens are bound to the endpoint
@@ -181,7 +184,7 @@ func (g *Gateway) buildNamespace(ns Namespace) error {
 			continue
 		}
 		for _, cached := range g.cached[account] {
-			if cached.accountIncarnationID == "" || cached.accountIncarnationID != stored.IncarnationID || !equalAccountSnapshotURL(cached.accountURL, stored.URL) {
+			if cached.accountIncarnationID == "" || cached.accountIncarnationID != stored.IncarnationID || cached.accountRevision != stored.Revision || !equalAccountSnapshotURL(cached.accountURL, stored.URL) {
 				continue
 			}
 			ct := cached
@@ -290,6 +293,9 @@ func (g *Gateway) UpsertConnector(ctx context.Context, vc VirtualConnector) erro
 	if !ok {
 		return fmt.Errorf("store does not support connectors")
 	}
+	if reservedEndpointSlugs[vc.Slug] {
+		return fmt.Errorf("%w: %s", ErrEndpointCollision, vc.Slug)
+	}
 	if err := g.rejectPersonalEndpointAccounts(accountNamesInToolMap(vc.Tools)); err != nil {
 		return err
 	}
@@ -395,6 +401,9 @@ func (g *Gateway) CreateNamespace(ctx context.Context, ns Namespace) (Namespace,
 	store, ok := g.namespaceStore()
 	if !ok {
 		return Namespace{}, fmt.Errorf("store does not support namespaces")
+	}
+	if reservedEndpointSlugs[ns.Slug] {
+		return Namespace{}, fmt.Errorf("%w: %s", ErrEndpointCollision, ns.Slug)
 	}
 	if err := g.rejectPersonalEndpointAccounts(normalizedNamespaceAccounts(ns.Accounts)); err != nil {
 		return Namespace{}, err
@@ -509,9 +518,14 @@ func (g *Gateway) retireEndpoint(slug, kind, generation string) {
 		delete(g.connectors, slug)
 	}
 	revoke := g.revokeResource
+	revokeEpoch := g.revokeResourceEpoch
 	g.mu.Unlock()
-	if !reused && revoke != nil {
-		revoke("/mcp/" + slug)
+	if !reused {
+		if revokeEpoch != nil && generation != "" {
+			revokeEpoch("/mcp/"+slug, generation)
+		} else if revoke != nil {
+			revoke("/mcp/" + slug)
+		}
 	}
 }
 
@@ -521,6 +535,15 @@ func (g *Gateway) retireEndpoint(slug, kind, generation string) {
 func (g *Gateway) SetTokenRevoker(fn func(resourcePath string)) {
 	g.mu.Lock()
 	g.revokeResource = fn
+	g.mu.Unlock()
+}
+
+// SetTokenEpochRevoker installs the precise revocation callback used by the
+// durable OAuth store. `retiringEpoch` is the endpoint generation removed or
+// replaced by this Gateway refresh, never the replacement's generation.
+func (g *Gateway) SetTokenEpochRevoker(fn func(resourcePath, retiringEpoch string)) {
+	g.mu.Lock()
+	g.revokeResourceEpoch = fn
 	g.mu.Unlock()
 }
 

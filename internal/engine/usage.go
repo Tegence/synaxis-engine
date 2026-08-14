@@ -46,6 +46,15 @@ const (
 	StarterRateBurst      int64 = 10
 	StarterMaxCallSeconds int64 = 120
 
+	// Hosted Platform-signed grants may define limits above the legacy Starter
+	// defaults. These are Engine safety ceilings, deliberately independent of
+	// the Platform's commercial catalogue. They bound instantaneous resource
+	// use without preventing the Platform from evolving named plans.
+	maxUsageGrantConcurrency    int64 = 16
+	maxUsageGrantRatePerMinute  int64 = 600
+	maxUsageGrantBurst          int64 = 120
+	maxUsageGrantMaxCallSeconds int64 = 900
+
 	usageGrantIssuer   = "synaxis-platform"
 	usageGrantAudience = "synaxis-engine"
 	// legacyUsageGrantPlan remains useful to compatibility tests and existing
@@ -486,16 +495,16 @@ func validateUsageLimits(limits UsageLimits) error {
 		return fmt.Errorf("usage grant runtime_seconds must be between 0 and %d", maxRuntimeGrantSeconds)
 	case limits.TransferBytes < 0:
 		return errors.New("usage grant transfer_bytes cannot be negative")
-	case limits.Concurrency <= 0 || limits.Concurrency > StarterMaxConcurrency:
-		return fmt.Errorf("usage grant concurrency must be between 1 and %d", StarterMaxConcurrency)
-	case limits.RatePerMinute <= 0 || limits.RatePerMinute > StarterRatePerMinute:
-		return fmt.Errorf("usage grant rate_per_minute must be between 1 and %d", StarterRatePerMinute)
-	case limits.Burst <= 0 || limits.Burst > StarterRateBurst:
-		return fmt.Errorf("usage grant burst must be between 1 and %d", StarterRateBurst)
+	case limits.Concurrency <= 0 || limits.Concurrency > maxUsageGrantConcurrency:
+		return fmt.Errorf("usage grant concurrency must be between 1 and %d", maxUsageGrantConcurrency)
+	case limits.RatePerMinute <= 0 || limits.RatePerMinute > maxUsageGrantRatePerMinute:
+		return fmt.Errorf("usage grant rate_per_minute must be between 1 and %d", maxUsageGrantRatePerMinute)
+	case limits.Burst <= 0 || limits.Burst > maxUsageGrantBurst:
+		return fmt.Errorf("usage grant burst must be between 1 and %d", maxUsageGrantBurst)
 	case limits.Burst > limits.RatePerMinute:
 		return errors.New("usage grant burst cannot exceed rate_per_minute")
-	case limits.MaxCallSeconds <= 0 || limits.MaxCallSeconds > StarterMaxCallSeconds:
-		return fmt.Errorf("usage grant max_call_seconds must be between 1 and %d", StarterMaxCallSeconds)
+	case limits.MaxCallSeconds <= 0 || limits.MaxCallSeconds > maxUsageGrantMaxCallSeconds:
+		return fmt.Errorf("usage grant max_call_seconds must be between 1 and %d", maxUsageGrantMaxCallSeconds)
 	}
 	return nil
 }

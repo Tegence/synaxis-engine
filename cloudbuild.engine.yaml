@@ -1,3 +1,10 @@
+# Builds the open-source Synaxis Engine image. Production promotion must use
+# the digest emitted by this build in Terraform; do not update a Cloud Run
+# service directly with this tag.
+#
+# Usage from the repository root:
+#   gcloud builds submit backend --config backend/cloudbuild.engine.yaml \
+#     --substitutions _IMAGE=us-central1-docker.pkg.dev/PROJECT/REPOSITORY/synaxis-engine:SOURCE_SHA
 steps:
   - name: gcr.io/cloud-builders/docker
     args: ['build', '-t', '${_IMAGE}', '.']

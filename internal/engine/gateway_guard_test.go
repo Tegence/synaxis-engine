@@ -22,6 +22,7 @@ import (
 // between calls) and save_issue (mutating; returns a secret).
 func newGuardGateway(t *testing.T) (*Gateway, *FileStore, *mcp.CallToolResult) {
 	t.Helper()
+	useLoopbackUpstreamTransport(t)
 	payload := &mcp.CallToolResult{}
 	up := server.NewMCPServer("up", "0.0.0", server.WithToolCapabilities(true))
 	up.AddTool(mcp.NewTool("emit", mcp.WithDescription("emits the test payload"), mcp.WithReadOnlyHintAnnotation(true)),

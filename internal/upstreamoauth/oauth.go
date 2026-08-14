@@ -20,37 +20,12 @@ import (
 	"time"
 )
 
-// safeDialer returns a DialContext func that resolves the host and rejects any
-// IP that is loopback, private, link-local, or unspecified — preventing SSRF
-// pivots into cloud-internal or RFC-1918 addresses.
-func safeDialer() func(ctx context.Context, network, addr string) (net.Conn, error) {
-	d := &net.Dialer{Timeout: 10 * time.Second}
-	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		host, port, err := net.SplitHostPort(addr)
-		if err != nil {
-			return nil, err
-		}
-		ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-		if err != nil {
-			return nil, err
-		}
-		for _, ip := range ips {
-			if ip.IP.IsLoopback() || ip.IP.IsPrivate() || ip.IP.IsLinkLocalUnicast() || ip.IP.IsLinkLocalMulticast() || ip.IP.IsUnspecified() {
-				return nil, fmt.Errorf("refusing to connect to non-public address %s", ip.IP)
-			}
-		}
-		return d.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
-	}
-}
+var httpClient = NewHardenedHTTPClient(20 * time.Second)
 
-var httpClient = &http.Client{
-	Timeout: 20 * time.Second,
-	Transport: &http.Transport{
-		DialContext: safeDialer(),
-	},
-}
-
-// validateUpstreamURL returns an error if raw is not a valid https URL with a host.
+// validateUpstreamURL validates an operator-configured upstream before it is
+// persisted or probed. Do not allow URL userinfo here: besides being an
+// accidental credential storage path, net/http would turn it into a Basic
+// Authorization header on the discovery request.
 func validateUpstreamURL(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -59,8 +34,17 @@ func validateUpstreamURL(raw string) error {
 	if u.Scheme != "https" {
 		return fmt.Errorf("upstream url must be https")
 	}
-	if u.Host == "" {
+	if !u.IsAbs() || u.Host == "" || u.Hostname() == "" {
 		return fmt.Errorf("upstream url must have a host")
+	}
+	if u.User != nil {
+		return fmt.Errorf("upstream url must not include user credentials")
+	}
+	if u.Fragment != "" {
+		return fmt.Errorf("upstream url must not include a fragment")
+	}
+	if ip := net.ParseIP(u.Hostname()); ip != nil && isUnsafeOutboundIP(ip) {
+		return fmt.Errorf("%w: %s", ErrUnsafeOutboundAddress, ip)
 	}
 	return nil
 }
@@ -68,6 +52,40 @@ func validateUpstreamURL(raw string) error {
 // ValidateUpstreamURL is the exported variant for use by the API layer.
 func ValidateUpstreamURL(raw string) error {
 	return validateUpstreamURL(raw)
+}
+
+// validateOAuthEndpoint is stricter than the configured upstream-resource
+// check because these metadata values become credential-bearing destinations.
+// In particular, a malicious or compromised authorization-server metadata
+// document must not redirect a browser or send a client secret, authorization
+// code, or refresh token to cleartext HTTP or a private network address.
+//
+// This intentionally permits public IP literals: the hardened transport uses
+// the same public-address policy and TLS still authenticates the destination.
+// There is no loopback development exception in this Engine path; production
+// upstream OAuth endpoints are HTTPS-only and local tests use explicit client
+// seams rather than weakening the runtime policy.
+func validateOAuthEndpoint(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid endpoint URL: %w", err)
+	}
+	if u.Scheme != "https" {
+		return fmt.Errorf("endpoint URL must be https")
+	}
+	if !u.IsAbs() || u.Host == "" || u.Hostname() == "" {
+		return fmt.Errorf("endpoint URL must be absolute with a host")
+	}
+	if u.User != nil {
+		return fmt.Errorf("endpoint URL must not include user credentials")
+	}
+	if u.Fragment != "" {
+		return fmt.Errorf("endpoint URL must not include a fragment")
+	}
+	if ip := net.ParseIP(u.Hostname()); ip != nil && isUnsafeOutboundIP(ip) {
+		return fmt.Errorf("%w: %s", ErrUnsafeOutboundAddress, ip)
+	}
+	return nil
 }
 
 // Metadata is the subset of upstream OAuth discovery we need.
@@ -195,6 +213,21 @@ func Discover(ctx context.Context, serverURL string) (*Metadata, error) {
 	if asm.AuthorizationEndpoint == "" || asm.TokenEndpoint == "" {
 		return nil, fmt.Errorf("authorization server missing authorize/token endpoints")
 	}
+	for _, endpoint := range []struct {
+		field string
+		url   string
+	}{
+		{field: "authorization_endpoint", url: asm.AuthorizationEndpoint},
+		{field: "token_endpoint", url: asm.TokenEndpoint},
+		{field: "registration_endpoint", url: asm.RegistrationEndpoint},
+	} {
+		if endpoint.url == "" && endpoint.field == "registration_endpoint" {
+			continue
+		}
+		if err := validateOAuthEndpoint(endpoint.url); err != nil {
+			return nil, fmt.Errorf("discovered %s rejected: %w", endpoint.field, err)
+		}
+	}
 	return &Metadata{
 		Resource:              resource,
 		AuthorizationEndpoint: asm.AuthorizationEndpoint,
@@ -234,6 +267,9 @@ func Register(ctx context.Context, regEndpoint, redirectURI string) (*ClientInfo
 	if regEndpoint == "" {
 		return nil, fmt.Errorf("upstream does not support dynamic client registration")
 	}
+	if err := validateOAuthEndpoint(regEndpoint); err != nil {
+		return nil, fmt.Errorf("registration endpoint rejected: %w", err)
+	}
 	body := map[string]any{
 		"redirect_uris":              []string{redirectURI},
 		"token_endpoint_auth_method": "none",
@@ -243,7 +279,10 @@ func Register(ctx context.Context, regEndpoint, redirectURI string) (*ClientInfo
 		"client_uri":                 "https://github.com/narthex",
 	}
 	raw, _ := json.Marshal(body)
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, regEndpoint, strings.NewReader(string(raw)))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, regEndpoint, strings.NewReader(string(raw)))
+	if err != nil {
+		return nil, fmt.Errorf("create registration request: %w", err)
+	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -343,6 +382,12 @@ func AuthorizeURL(m *Metadata, clientID, redirectURI, challenge, state, scope st
 
 // Exchange swaps an authorization code for tokens (PKCE + resource).
 func Exchange(ctx context.Context, m *Metadata, code, redirectURI, clientID, clientSecret, verifier string) (*Tokens, error) {
+	if m == nil {
+		return nil, fmt.Errorf("OAuth metadata is required")
+	}
+	if err := validateOAuthEndpoint(m.TokenEndpoint); err != nil {
+		return nil, fmt.Errorf("token endpoint rejected: %w", err)
+	}
 	form := url.Values{}
 	form.Set("grant_type", "authorization_code")
 	form.Set("code", code)
@@ -353,7 +398,10 @@ func Exchange(ctx context.Context, m *Metadata, code, redirectURI, clientID, cli
 	if clientSecret != "" {
 		form.Set("client_secret", clientSecret)
 	}
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, m.TokenEndpoint, strings.NewReader(form.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, m.TokenEndpoint, strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, fmt.Errorf("create token exchange request: %w", err)
+	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -380,6 +428,12 @@ func Exchange(ctx context.Context, m *Metadata, code, redirectURI, clientID, cli
 // Refresh exchanges a refresh token for a fresh access token. Providers may
 // rotate the refresh token, so callers must persist the returned RefreshToken.
 func Refresh(ctx context.Context, m *Metadata, refreshToken, clientID, clientSecret string) (*Tokens, error) {
+	if m == nil {
+		return nil, fmt.Errorf("OAuth metadata is required")
+	}
+	if err := validateOAuthEndpoint(m.TokenEndpoint); err != nil {
+		return nil, fmt.Errorf("token endpoint rejected: %w", err)
+	}
 	form := url.Values{}
 	form.Set("grant_type", "refresh_token")
 	form.Set("refresh_token", refreshToken)
@@ -388,7 +442,10 @@ func Refresh(ctx context.Context, m *Metadata, refreshToken, clientID, clientSec
 	if clientSecret != "" {
 		form.Set("client_secret", clientSecret)
 	}
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, m.TokenEndpoint, strings.NewReader(form.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, m.TokenEndpoint, strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, fmt.Errorf("create token refresh request: %w", err)
+	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -445,7 +502,17 @@ func probeResourceMetadata(ctx context.Context, serverURL string) string {
 }
 
 func getJSON(ctx context.Context, u string, out any) error {
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	// Both RFC 9728 resource metadata and RFC 8414 authorization-server
+	// metadata can be supplied by an upstream response. Apply the same policy
+	// used for OAuth endpoints before issuing either discovery request so a
+	// challenge cannot induce an initial cleartext or local-network fetch.
+	if err := validateOAuthEndpoint(u); err != nil {
+		return fmt.Errorf("metadata URL rejected: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return fmt.Errorf("create metadata request: %w", err)
+	}
 	req.Header.Set("Accept", "application/json")
 	resp, err := httpClient.Do(req)
 	if err != nil {

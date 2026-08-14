@@ -2,7 +2,7 @@ package upstreamoauth
 
 import (
 	"context"
-	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -194,25 +194,7 @@ func TestValidateAuthorizationExtrasRejectsUnknownValuesWithoutEchoingThem(t *te
 // Register. We intercept the token endpoint to verify the POST body.
 func TestStaticClient_ExchangeRequest(t *testing.T) {
 	var gotBody string
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/token" {
-			if err := r.ParseForm(); err != nil {
-				http.Error(w, "bad form", http.StatusBadRequest)
-				return
-			}
-			gotBody = r.Form.Encode()
-			// Return a minimal token response.
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"access_token": "tok123",
-				"token_type":   "Bearer",
-				"expires_in":   3600,
-			})
-			return
-		}
-		http.NotFound(w, r)
-	}))
-	defer ts.Close()
+	const tokenEndpoint = "https://token.example.test/token"
 
 	ci, err := StaticClient("static-id", "static-secret")
 	if err != nil {
@@ -220,12 +202,30 @@ func TestStaticClient_ExchangeRequest(t *testing.T) {
 	}
 
 	meta := &Metadata{
-		Resource:      ts.URL,
-		TokenEndpoint: ts.URL + "/token",
+		Resource:      "https://provider.example.test/mcp",
+		TokenEndpoint: tokenEndpoint,
 	}
-	// Use the shared httpClient replacement with a plain http client for tests.
+	// Use the shared client seam with a public HTTPS endpoint. A loopback
+	// httptest URL would correctly fail the production endpoint policy.
 	origClient := httpClient
-	httpClient = ts.Client()
+	httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.String() != tokenEndpoint {
+			t.Errorf("token endpoint = %q, want %q", r.URL, tokenEndpoint)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			return nil, err
+		}
+		gotBody = string(body)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(
+				`{"access_token":"tok123","token_type":"Bearer","expires_in":3600}`,
+			)),
+			Request: r,
+		}, nil
+	})}
 	defer func() { httpClient = origClient }()
 
 	tokens, err := Exchange(context.Background(), meta, "auth-code", "https://callback.example.com/cb",
@@ -245,5 +245,66 @@ func TestStaticClient_ExchangeRequest(t *testing.T) {
 	}
 	if !strings.Contains(gotBody, "grant_type=authorization_code") {
 		t.Errorf("token POST missing grant_type; body: %s", gotBody)
+	}
+}
+
+func TestCredentialBearingRequestsRejectUnsafeEndpointsBeforeNetwork(t *testing.T) {
+	originalClient := httpClient
+	calls := 0
+	httpClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls++
+		return nil, nil
+	})}
+	t.Cleanup(func() { httpClient = originalClient })
+
+	tests := []struct {
+		name string
+		call func() error
+	}{
+		{
+			name: "registration refuses cleartext endpoint",
+			call: func() error {
+				_, err := Register(
+					context.Background(),
+					"http://public.example.test/register",
+					"https://engine.example/callback",
+				)
+				return err
+			},
+		},
+		{
+			name: "code exchange refuses cleartext endpoint",
+			call: func() error {
+				_, err := Exchange(
+					context.Background(),
+					&Metadata{TokenEndpoint: "http://public.example.test/token"},
+					"authorization-code", "https://engine.example/callback",
+					"client", "client-secret", "verifier",
+				)
+				return err
+			},
+		},
+		{
+			name: "refresh refuses private endpoint",
+			call: func() error {
+				_, err := Refresh(
+					context.Background(),
+					&Metadata{TokenEndpoint: "https://127.0.0.1/token"},
+					"refresh-token", "client", "client-secret",
+				)
+				return err
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.call(); err == nil {
+				t.Fatal("credential-bearing request accepted an unsafe endpoint")
+			}
+		})
+	}
+	if calls != 0 {
+		t.Fatalf("unsafe endpoint validation made %d network request(s)", calls)
 	}
 }

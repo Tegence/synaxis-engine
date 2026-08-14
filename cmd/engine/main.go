@@ -14,10 +14,13 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -28,18 +31,43 @@ import (
 )
 
 func main() {
+	rootCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := runEngine(rootCtx); err != nil && !errors.Is(err, context.Canceled) {
+		log.Fatalf("engine: %v", err)
+	}
+}
+
+// runEngine owns the Engine process lifecycle. Startup work and background
+// refresh loops share rootCtx so a termination signal stops new work before
+// HTTP begins its graceful drain.
+func runEngine(rootCtx context.Context) error {
+	if rootCtx == nil {
+		rootCtx = context.Background()
+	}
+	runCtx, cancelRun := context.WithCancel(rootCtx)
+	defer cancelRun()
+
 	// Cloud Run provides PORT; ENGINE_PORT is the local override.
 	port := envOr("PORT", envOr("ENGINE_PORT", "8080"))
 	issuer := envOr("ENGINE_ISSUER", "http://localhost:"+port)
 	security, err := startupSecurityConfigFromEnv()
 	if err != nil {
-		log.Fatalf("engine: startup security configuration: %v", err)
+		return fmt.Errorf("startup security configuration: %w", err)
+	}
+	encryptionKey, err := encryptionKeyFromEnv(security.hosted)
+	if err != nil {
+		return fmt.Errorf("startup encryption configuration: %w", err)
 	}
 	password := security.password
 	secret := security.secret
 	adminToken := adminTokenFromEnv()
 	legacyAdmin := security.legacyAdmin
 	localAdminAuth := security.localAdminAuth
+	trustProxyHeaders := security.trustProxyHeaders
+	if trustProxyHeaders {
+		log.Printf("engine: ENGINE_TRUST_PROXY_HEADERS enabled — login/consent rate limiting keys on the trusted X-Forwarded-For hop; only use this behind an operator-controlled reverse proxy")
+	}
 	accountsPath := envOr("ACCOUNTS_PATH", "accounts.json")
 	if security.generatedPassword {
 		// Development mode intentionally avoids a compiled-in credential. This
@@ -51,39 +79,33 @@ func main() {
 	}
 
 	// --- MCP server (Claude-facing) ---
+	// Built-in tools are registered by registerBuiltinTools below, once the
+	// store (and therefore the audit sink) exists.
 	s := server.NewMCPServer("synaxis-engine", "0.1.0", server.WithToolCapabilities(true))
-	s.AddTool(
-		mcp.NewTool("engine_ping", mcp.WithDescription("Health check for Synaxis Engine.")),
-		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			return mcp.NewToolResultText("synaxis-engine ok"), nil
-		},
-	)
 
 	// --- aggregate every account from the store ---
 	var store engine.AccountStore
 	if dsn := os.Getenv("DATABASE_URL"); dsn != "" {
-		pg, err := engine.NewPgStore(context.Background(), dsn)
+		pg, err := engine.NewPgStore(runCtx, dsn)
 		if err != nil {
-			log.Fatalf("engine: postgres store: %v", err)
+			return fmt.Errorf("postgres store: %w", err)
 		}
-		if k := os.Getenv("ENGINE_ENCRYPTION_KEY"); k != "" {
-			cipher, err := engine.NewCipher(k)
-			if err != nil {
-				log.Fatalf("engine: encryption key: %v", err)
-			}
-			pg.SetCipher(cipher)
-			if err := pg.EncryptExisting(context.Background()); err != nil {
-				log.Printf("engine: encrypt-existing pass failed: %v", err)
-			}
+		if enabled, err := configureStoreEncryption(runCtx, pg, encryptionKey); err != nil {
+			// Continuing would either leave plaintext secrets behind or make an
+			// encrypted row silently unavailable. The deployment must be fixed
+			// before this Engine is allowed to serve traffic.
+			pg.Close()
+			return fmt.Errorf("token encryption migration: %w", err)
+		} else if enabled {
 			log.Printf("engine: token encryption at rest ENABLED")
 		} else {
-			log.Printf("engine: WARNING token encryption DISABLED (set ENGINE_ENCRYPTION_KEY)")
+			log.Printf("engine: WARNING token encryption DISABLED for self-hosted development (set ENGINE_ENCRYPTION_KEY before storing real credentials)")
 		}
 		// Recover according to the persisted lifecycle. Calls whose deadline
 		// genuinely elapsed are expired; still-live rows are explicitly cancelled
 		// because their original MCP request died with the previous process and
 		// generic tool calls must never be replayed from stored arguments.
-		if recovery, err := pg.RecoverPendingApprovals(context.Background(), time.Now()); err != nil {
+		if recovery, err := pg.RecoverPendingApprovals(runCtx, time.Now()); err != nil {
 			log.Printf("engine: recover interrupted pending approvals: %v", err)
 		} else if recovery.Expired > 0 || recovery.Cancelled > 0 {
 			log.Printf("engine: recovered pending approvals: expired=%d cancelled=%d", recovery.Expired, recovery.Cancelled)
@@ -93,16 +115,41 @@ func main() {
 	} else {
 		fs, err := engine.LoadFileStore(accountsPath)
 		if err != nil {
-			log.Fatalf("engine: load accounts (%s): %v", accountsPath, err)
+			return fmt.Errorf("load accounts (%s): %w", accountsPath, err)
 		}
 		store = fs
 		log.Printf("engine: using file account store (%s)", accountsPath)
 	}
+	var watchDone <-chan struct{}
+	// A future durable dependency (for example, the audit writer) can expose
+	// Shutdown(context.Context) and be drained here without changing the
+	// process lifecycle. PgStore currently exposes Close(), which remains the
+	// compatibility fallback.
+	defer func() {
+		// A listener failure is also a terminal Engine condition. Cancel the
+		// watcher before closing its store, not only when the OS sends SIGTERM.
+		cancelRun()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), engineShutdownTimeout)
+		defer cancel()
+		if watchDone != nil {
+			select {
+			case <-watchDone:
+			case <-shutdownCtx.Done():
+				log.Printf("engine: background watcher did not stop before shutdown deadline")
+			}
+		}
+		if err := shutdownEngineDependencies(shutdownCtx, store); err != nil {
+			log.Printf("engine: dependency shutdown: %v", err)
+		}
+	}()
 	gw := engine.NewGateway(store, s)
+	var auditSink engine.AuditSink
 	if as, ok := store.(engine.AuditSink); ok {
 		gw.SetAudit(as) // record every tool call
+		auditSink = as
 	}
-	actx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	registerBuiltinTools(s, auditSink)
+	actx, cancel := context.WithTimeout(runCtx, 60*time.Second)
 	n := gw.Aggregate(actx)
 	cancel()
 	log.Printf("engine: aggregated %d tools across %d account(s) from %s", n, len(store.Accounts()), accountsPath)
@@ -131,38 +178,44 @@ func main() {
 	gw.SetAuditRetention(time.Duration(retentionDays) * 24 * time.Hour)
 	log.Printf("engine: flight recorder — /mcp payload recording=%v, audit retention=%dd (0=keep forever)", recordDefault, retentionDays)
 
-	go gw.StartWatch(context.Background(), 30*time.Minute)
+	watcherDone := make(chan struct{})
+	watchDone = watcherDone
+	go func() {
+		defer close(watcherDone)
+		gw.StartWatch(runCtx, 30*time.Minute)
+	}()
 	log.Printf("engine: refresh-ahead + alert watch started (every 30m; webhook configured=%v)", os.Getenv("ALERT_WEBHOOK_URL") != "")
 
 	// --- OAuth AS protecting the MCP endpoint ---
 	as := oauthas.New(issuer, password, secret)
+	as.SetTrustProxyHeaders(trustProxyHeaders)
 	generationStore, ok := store.(oauthas.TokenGenerationStore)
 	if !ok {
-		log.Fatalf("engine: account store does not support durable OAuth token generations")
+		return errors.New("account store does not support durable OAuth token generations")
 	}
-	generationCtx, generationCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	generationCtx, generationCancel := context.WithTimeout(runCtx, 10*time.Second)
 	err = as.ConfigureTokenGeneration(generationCtx, generationStore)
 	generationCancel()
 	if err != nil {
-		log.Fatalf("engine: initialize durable OAuth token generation: %v", err)
+		return fmt.Errorf("initialize durable OAuth token generation: %w", err)
 	}
 	consentURL, consentPublicKey, err := hostedConsentConfigFromEnv()
 	if err != nil {
-		log.Fatalf("engine: hosted consent configuration: %v", err)
+		return fmt.Errorf("hosted consent configuration: %w", err)
 	}
 	if consentURL != "" {
 		if err := as.ConfigureHostedConsent(consentURL, consentPublicKey); err != nil {
-			log.Fatalf("engine: hosted consent configuration: %v", err)
+			return fmt.Errorf("hosted consent configuration: %w", err)
 		}
 		log.Printf("engine: hosted OAuth consent delegation enabled")
 	}
 	actorVerifier, err := hostedActorVerifierFromEnv(consentPublicKey, issuer)
 	if err != nil {
-		log.Fatalf("engine: hosted actor assertion configuration: %v", err)
+		return fmt.Errorf("hosted actor assertion configuration: %w", err)
 	}
 	if actorVerifier != nil {
 		if adminToken == "" {
-			log.Fatalf("engine: hosted actor assertions require SYNAXIS_ADMIN_TOKEN")
+			return errors.New("hosted actor assertions require SYNAXIS_ADMIN_TOKEN")
 		}
 		// A hosted Engine has one management entrypoint: the Platform proxy.
 		// Never leave password/session or legacy query-string administration as a
@@ -171,11 +224,11 @@ func main() {
 		legacyAdmin = false
 		log.Printf("engine: hosted Platform actor assertions enabled")
 	}
-	usageCtx, usageCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	usageCtx, usageCancel := context.WithTimeout(runCtx, 10*time.Second)
 	usageGate, err := hostedUsageGateFromEnv(usageCtx, store, consentPublicKey)
 	usageCancel()
 	if err != nil {
-		log.Fatalf("engine: hosted usage configuration: %v", err)
+		return fmt.Errorf("hosted usage configuration: %w", err)
 	}
 	if usageGate != nil {
 		gw.SetUsageGate(usageGate)
@@ -210,8 +263,11 @@ func main() {
 	// a personal connection private even when Claude or Codex connects directly
 	// to an open-source Engine.
 	as.SetLocalConsentAuthorizer(gw.AuthorizeMCPConsent)
-	// Deleting a connector also drops its refresh grants at the AS.
+	// Deleting or rebinding an endpoint drops grants for its retiring epoch at
+	// the AS. The path-only callback remains for compatibility; the epoch-aware
+	// callback avoids sweeping a newly recreated endpoint's grants.
 	gw.SetTokenRevoker(as.RevokeResource)
+	gw.SetTokenEpochRevoker(as.RevokeResourceAtEpoch)
 	mcpHandler := engine.LimitMCPRequestBody(
 		server.NewStreamableHTTPServer(s, server.WithEndpointPath("/mcp")),
 	)
@@ -257,8 +313,17 @@ func main() {
 	consoleOptions := []engine.ConsoleOption{
 		engine.WithAdminToken(adminToken),
 		engine.WithLocalAdminAuth(localAdminAuth),
+		engine.WithTrustProxyHeaders(trustProxyHeaders),
 		engine.WithOAuthRevoker(as.RevokeAll),
 		engine.WithUsageGate(usageGate),
+		// CurrentTokenGeneration is a cheap durable read. On PgStore it proves
+		// the database connection and initialized Engine state without probing
+		// accounts or external providers; FileStore retains its local check.
+		engine.WithReadinessCheck(func(ctx context.Context) error {
+			_, err := generationStore.CurrentTokenGeneration(ctx)
+			return err
+		}),
+		engine.WithLifecycleContext(runCtx),
 	}
 	if actorVerifier != nil {
 		consoleOptions = append(consoleOptions, engine.WithPlatformActorVerifier(actorVerifier))
@@ -279,11 +344,111 @@ func main() {
 
 	registerLegacyAdminRoutes(mux, legacyAdmin, password, issuer, conn, store, gw)
 
-	httpServer := &http.Server{Addr: ":" + port, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
-	log.Printf("synaxis engine on :%s — issuer %s legacy_admin=%v", port, issuer, legacyAdmin)
-	if err := httpServer.ListenAndServe(); err != nil {
-		log.Fatalf("engine: %v", err)
+	httpServer := newEngineHTTPServer(port, mux)
+	listener, err := net.Listen("tcp", httpServer.Addr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", httpServer.Addr, err)
 	}
+	log.Printf("synaxis engine on :%s — issuer %s legacy_admin=%v", port, issuer, legacyAdmin)
+	return serveEngineHTTP(runCtx, httpServer, listener)
+}
+
+const engineShutdownTimeout = 25 * time.Second
+
+// newEngineHTTPServer intentionally leaves WriteTimeout unset. MCP Streamable
+// HTTP responses may remain open while a model consumes a result, so a generic
+// short write timeout would turn normal governed calls into spurious failures.
+func newEngineHTTPServer(port string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              ":" + port,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+}
+
+// serveEngineHTTP accepts an already-bound listener to make the lifecycle
+// testable and to keep listener ownership explicit. On termination it first
+// stops accepting new requests, then lets active MCP streams drain within the
+// platform-safe shutdown budget.
+func serveEngineHTTP(ctx context.Context, httpServer *http.Server, listener net.Listener) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- httpServer.Serve(listener)
+	}()
+
+	select {
+	case err := <-errCh:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return fmt.Errorf("serve HTTP: %w", err)
+	case <-ctx.Done():
+		log.Printf("engine: shutdown requested; draining active HTTP requests")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), engineShutdownTimeout)
+		defer cancel()
+		if err := httpServer.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			// Shutdown timed out or encountered a listener failure. Force close so
+			// the serving goroutine cannot outlive process teardown, but retain the
+			// graceful-shutdown error for operators.
+			_ = httpServer.Close()
+			<-errCh
+			return fmt.Errorf("graceful HTTP shutdown: %w", err)
+		}
+		if err := <-errCh; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("serve HTTP during shutdown: %w", err)
+		}
+		return nil
+	}
+}
+
+// engineShutdowner is an optional hook for dependencies that need to drain
+// durable work before their connections close. Existing stores only need the
+// close fallback; a future audit writer can implement Shutdown without
+// coupling lifecycle control to PgStore internals.
+type engineShutdowner interface {
+	Shutdown(context.Context) error
+}
+
+type engineCloser interface {
+	Close()
+}
+
+func shutdownEngineDependencies(ctx context.Context, dependencies ...any) error {
+	var shutdownErr error
+	for _, dependency := range dependencies {
+		if dependency == nil {
+			continue
+		}
+		if shutdowner, ok := dependency.(engineShutdowner); ok {
+			shutdownErr = errors.Join(shutdownErr, shutdowner.Shutdown(ctx))
+			continue
+		}
+		if closer, ok := dependency.(engineCloser); ok {
+			closer.Close()
+		}
+	}
+	return shutdownErr
+}
+
+// registerBuiltinTools registers Engine-owned tools on the root MCP server.
+// Built-ins bypass the gateway's dispatch boundary, so upstream admission and
+// the automatic audit row do not apply; each one records its own
+// fire-and-forget audit row through the store's audit sink, and a recording
+// failure must never fail the call. Future built-in tools MUST register
+// through this same audited path rather than calling s.AddTool directly.
+func registerBuiltinTools(s *server.MCPServer, sink engine.AuditSink) {
+	s.AddTool(
+		mcp.NewTool("engine_ping", mcp.WithDescription("Health check for Synaxis Engine.")),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			if sink != nil {
+				sink.LogCall(engine.CallRecord{Account: "engine", Tool: "engine_ping", OK: true})
+			}
+			return mcp.NewToolResultText("synaxis-engine ok"), nil
+		},
+	)
 }
 
 // registerLegacyAdminRoutes deliberately registers nothing until a caller has
@@ -384,6 +549,42 @@ func adminTokenFromEnv() string {
 	return envOr("SYNAXIS_ADMIN_TOKEN", os.Getenv("ENGINE_ADMIN_TOKEN"))
 }
 
+// encryptionKeyFromEnv makes encryption mandatory for Platform-managed
+// workspaces while preserving the explicitly documented local self-hosted
+// development path. A missing key must be caught before any Engine listener is
+// created, even if another hosted configuration error would fail later.
+func encryptionKeyFromEnv(hosted bool) (string, error) {
+	key := strings.TrimSpace(os.Getenv("ENGINE_ENCRYPTION_KEY"))
+	if hosted && key == "" {
+		return "", errors.New("SYNAXIS_WORKSPACE_ID requires ENGINE_ENCRYPTION_KEY")
+	}
+	return key, nil
+}
+
+type encryptionStore interface {
+	SetCipher(*engine.Cipher)
+	EncryptExisting(context.Context) error
+}
+
+// configureStoreEncryption validates the configured key, enables encryption,
+// and completes the in-place migration as one startup prerequisite. It is kept
+// small and interface-based so migration failure behavior is unit-testable
+// without a running Postgres instance.
+func configureStoreEncryption(ctx context.Context, store encryptionStore, key string) (bool, error) {
+	if key == "" {
+		return false, nil
+	}
+	cipher, err := engine.NewCipher(key)
+	if err != nil {
+		return false, fmt.Errorf("invalid ENGINE_ENCRYPTION_KEY: %w", err)
+	}
+	store.SetCipher(cipher)
+	if err := store.EncryptExisting(ctx); err != nil {
+		return false, fmt.Errorf("encrypt existing data: %w", err)
+	}
+	return true, nil
+}
+
 // startupSecurityConfig keeps password-based administration fail-closed. A
 // self-hosted Engine should be useful as an MCP runtime without silently
 // publishing a browser login or legacy form protected by a source-known
@@ -398,6 +599,10 @@ type startupSecurityConfig struct {
 	hosted            bool
 	generatedPassword bool
 	generatedSecret   bool
+	// trustProxyHeaders opts the login/consent rate limiters into keying on
+	// the trusted last X-Forwarded-For hop instead of RemoteAddr. See
+	// ENGINE_TRUST_PROXY_HEADERS in startupSecurityConfigFromEnv.
+	trustProxyHeaders bool
 }
 
 func startupSecurityConfigFromEnv() (startupSecurityConfig, error) {
@@ -444,6 +649,14 @@ func startupSecurityConfigFromEnv() (startupSecurityConfig, error) {
 	// for a generated password; legacy forms still require their own opt-in.
 	config.localAdminAuth = localAdminAuthEnabledWithDefault(development)
 	config.legacyAdmin = legacyAdminEnabledFromEnv()
+	// Opt-in only: the login/consent rate limiters key on RemoteAddr unless
+	// the operator confirms exactly one trusted reverse-proxy hop sits in
+	// front of this Engine (see ENGINE_TRUST_PROXY_HEADERS in README.md).
+	trustProxyHeaders, err := boolEnv("ENGINE_TRUST_PROXY_HEADERS", false)
+	if err != nil {
+		return startupSecurityConfig{}, err
+	}
+	config.trustProxyHeaders = trustProxyHeaders
 	if config.hosted {
 		// Hosted Engine management is always the signed Platform actor plus
 		// machine token boundary. Do not allow env drift to add a local bypass.

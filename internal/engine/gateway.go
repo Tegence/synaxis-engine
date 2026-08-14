@@ -50,9 +50,11 @@ type Gateway struct {
 	webhook         string                      // optional alert webhook URL
 	consoleURL      string                      // linked in approval webhook messages
 
-	// revokeResource, when wired (SetTokenRevoker), tells the OAuth AS to drop
-	// refresh grants for a deleted connector's resource path.
-	revokeResource func(resourcePath string)
+	// revokeResource is the legacy path-only OAuth cleanup hook. The
+	// epoch-aware hook is used in production so cleanup cannot remove grants
+	// minted for a newly recreated endpoint with the same slug.
+	revokeResource      func(resourcePath string)
+	revokeResourceEpoch func(resourcePath, retiringEpoch string)
 
 	// Flight recorder knobs (set once at startup, before serving).
 	recordDefault bool          // record payloads for calls on the default /mcp endpoint
@@ -76,7 +78,18 @@ type Gateway struct {
 	// upstream-config generation so a successful reauthorization can supersede
 	// a stranded old probe. Per account identity, the small fixed limit below
 	// keeps repeated reconfigurations from becoming a goroutine storm too.
-	healthProbes map[string]healthProbeFlight
+	healthProbes map[string]*healthProbeFlight
+	// healthCacheTTL bounds the console read-path cache below. A field (not the
+	// const directly) so tests can shorten expiry, mirroring healthProbeTimeout.
+	healthCacheTTL time.Duration
+	// healthCacheMu guards only healthCache — deliberately not g.mu, so the
+	// read cache introduces no new lock ordering.
+	healthCacheMu sync.Mutex
+	// healthCache holds the last completed probe row per account identity,
+	// tagged with the credential generation that produced it. A credential or
+	// endpoint change yields a new generation and therefore a cache miss, so
+	// the console recovery flow still sees a live probe after a repair.
+	healthCache map[string]cachedAccountHealth
 	// refreshTokens is a test seam; nil uses upstreamoauth.Refresh.
 	refreshTokens func(context.Context, *upstreamoauth.Metadata, string, string, string) (*upstreamoauth.Tokens, error)
 	// beforeAccountDispatch is a test seam used to deterministically exercise
@@ -115,7 +128,9 @@ func NewGateway(store AccountStore, mcpServer *server.MCPServer) *Gateway {
 		connectors:            map[string]*connectorServer{},
 		clientEndpoints:       map[string]*connectorServer{},
 		healthProbeTimeout:    defaultHealthProbeTimeout,
-		healthProbes:          map[string]healthProbeFlight{},
+		healthCacheTTL:        defaultHealthCacheTTL,
+		healthProbes:          map[string]*healthProbeFlight{},
+		healthCache:           map[string]cachedAccountHealth{},
 	}
 }
 
@@ -184,6 +199,12 @@ const (
 	// MCP call ceiling so one unavailable provider cannot hold the console or
 	// watcher hostage.
 	defaultHealthProbeTimeout = 10 * time.Second
+
+	// defaultHealthCacheTTL bounds how long the console read path may serve a
+	// completed probe result before re-probing. It exists to deduplicate the
+	// N-viewers × M-accounts dashboard fan-out, not to stretch freshness; the
+	// watch loop bypasses the cache so alerting always sees live probes.
+	defaultHealthCacheTTL = 30 * time.Second
 )
 
 // upstreamFor builds a live Upstream for an account, wiring Token + Refresh
@@ -264,6 +285,22 @@ func (g *Gateway) refreshAccount(ctx context.Context, name, expectedIncarnationI
 	return g.store.UpdateTokens(ctx, name, expectedIncarnationID, nt.AccessToken, nt.RefreshToken)
 }
 
+// CompleteOAuthLocked applies an OAuth (re)authorization under the same
+// per-account lock as refreshAccount. Without it, a refresh already in flight
+// when the user completes reauthorization could commit afterwards and
+// overwrite the brand-new credentials with its stale token family — and
+// providers that revoke the old family on re-authorization then leave the
+// account dead despite a successful reconnect. With both writers serialized, a
+// refresh that started earlier commits first (reauthorization wins); one that
+// starts later re-reads the new credentials. The lock is held only for one
+// fast store transaction.
+func (g *Gateway) CompleteOAuthLocked(ctx context.Context, precondition OAuthCompletionPrecondition, completion Account) (Account, error) {
+	mu := g.refreshLock(completion.Name)
+	mu.Lock()
+	defer mu.Unlock()
+	return g.store.CompleteOAuth(ctx, precondition, completion)
+}
+
 // aggregateAccount connects to one account, lists its tools, and registers each
 // (prefixed) tool with a handler that routes tools/call back to that upstream.
 func (g *Gateway) aggregateAccount(ctx context.Context, a Account) (int, error) {
@@ -291,6 +328,19 @@ func (g *Gateway) aggregateAccount(ctx context.Context, a Account) (int, error) 
 			continue // read-only account: mutating tools are never registered
 		}
 		override := a.ToolOverrides[bare]
+		governance, err := normalizedGovernancePreset(override.GovernancePreset)
+		if err != nil {
+			// A malformed value can exist only through an old/imported durable
+			// record. Do not turn an unrecognised safety policy into a live
+			// capability; a console edit can repair it after discovery.
+			continue
+		}
+		if governance == GovernancePresetReadOnly && !readOnlyTool(t, bare) {
+			// Read-only is an enforced contract, not an optimistic label. If an
+			// upstream changes its metadata or name after the policy was saved,
+			// fail closed until an administrator selects a suitable preset.
+			continue
+		}
 		exposedName := bare
 		if override.Alias != "" {
 			exposedName = override.Alias
@@ -312,6 +362,7 @@ func (g *Gateway) aggregateAccount(ctx context.Context, a Account) (int, error) 
 		t.Title = label + " · " + disp
 		t.Annotations.Title = t.Title
 		handler := g.accountToolHandler(a, up, bare)
+		handler = g.governedAccountToolHandler(a, bare, governance, handler)
 		names = append(names, t.Name)
 		// Cache tool + the SAME closure so connector endpoints dispatch (and
 		// audit) identically without re-dialing the upstream.
@@ -322,8 +373,10 @@ func (g *Gateway) aggregateAccount(ctx context.Context, a Account) (int, error) 
 	// Only replace the live registration after the upstream list and all local
 	// rewrites have succeeded. A transient upstream failure must leave the last
 	// known-good account cache (and every endpoint built from it) intact.
-	g.mu.Lock()
+	// store I/O stays outside g.mu; dispatch-time revision fences
+	// (accountSnapshotLive) remain the authority.
 	current, live := g.store.Account(a.Name)
+	g.mu.Lock()
 	if !live || a.IncarnationID == "" || a.Revision < 1 || current.IncarnationID != a.IncarnationID || current.Revision != a.Revision || !equalAccountSnapshotURL(current.URL, a.URL) {
 		g.mu.Unlock()
 		return 0, ErrAccountIncarnation
@@ -376,9 +429,10 @@ func (g *Gateway) accountToolHandler(a Account, upRef *Upstream, bareName string
 		if execution.usageErr != nil {
 			res, err = UsageToolResult(execution.usageErr), nil
 		}
-		// Response guardrails — CONNECTOR endpoints only. The default /mcp
-		// endpoint never injects an auditScope, so sc is nil there and the result
-		// passes through raw. Order matters: redact → cap → injection scan runs
+		// Response guardrails — CONNECTOR endpoints only. An account-level
+		// governance policy may add an identity-free auditScope on default /mcp,
+		// but it carries no guards, so the result still passes through raw. Order
+		// matters: redact → cap → injection scan runs
 		// BEFORE the audit row below, so recorded payloads never contain what
 		// redaction removed. Protocol errors skip guards; isError tool results are
 		// guarded like any other (their Error field isn't touched — only text).
@@ -398,7 +452,8 @@ func (g *Gateway) accountToolHandler(a Account, upRef *Upstream, bareName string
 			// This closure is shared byte-for-byte between /mcp and every
 			// connector server; the endpoint identity (connector slug, approval
 			// decision, record flag) is layered on by the scope wrapper via ctx.
-			// No scope = the default /mcp endpoint.
+			// No scope is an ordinary default /mcp call. A governed root call has
+			// a scope with an intentionally empty endpoint identity.
 			record := g.recordDefault
 			if sc := auditScopeFrom(ctx); sc != nil {
 				rec.Connector = sc.connector
@@ -517,6 +572,10 @@ type ToolInfo struct {
 	Enabled     bool   `json:"enabled"`
 	ReadOnly    bool   `json:"readOnly"`
 	Destructive bool   `json:"destructive"`
+	// GovernancePreset is empty when the account uses the backwards-compatible
+	// standard policy. Console clients can keep that legacy state explicit
+	// instead of silently tightening an existing tool on first edit.
+	GovernancePreset GovernancePreset `json:"governancePreset,omitempty"`
 }
 
 // ListAccountTools live-lists every tool an account exposes upstream, marked
@@ -546,9 +605,20 @@ func (g *Gateway) ListAccountTools(ctx context.Context, name string) ([]ToolInfo
 		if override.Description != "" {
 			description = override.Description
 		}
-		ro := t.Annotations.ReadOnlyHint != nil && *t.Annotations.ReadOnlyHint
+		// Mirror the actual aggregation check rather than exposing only an
+		// upstream annotation. A tool with no annotation can still be treated as
+		// read-only by the conservative name heuristic, and the policy console
+		// must not offer a conflicting classification.
+		ro := readOnlyTool(t, bare)
 		de := t.Annotations.DestructiveHint != nil && *t.Annotations.DestructiveHint
-		out = append(out, ToolInfo{Name: bare, Alias: override.Alias, Title: title, Description: description, Enabled: !disabled[bare], ReadOnly: ro, Destructive: de})
+		preset, err := normalizedGovernancePreset(override.GovernancePreset)
+		if err != nil {
+			// Keep the management listing available so an administrator can
+			// replace a malformed imported value. The live projection above is
+			// still fail-closed.
+			preset = ""
+		}
+		out = append(out, ToolInfo{Name: bare, Alias: override.Alias, Title: title, Description: description, Enabled: !disabled[bare], ReadOnly: ro, Destructive: de, GovernancePreset: preset})
 	}
 	return out, nil
 }
@@ -577,9 +647,11 @@ func (g *Gateway) removeAccountLive(name, expectedIncarnationID string) bool {
 // can still be served through an authorized /mcp/clients/{slug} endpoint.
 // Actual connection deletion continues to use removeAccountLive above.
 func (g *Gateway) removeRootProjectionLive(account Account) bool {
+	// store I/O stays outside g.mu; dispatch-time revision fences
+	// (accountSnapshotLive) remain the authority.
+	current, ok := g.store.Account(account.Name)
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	current, ok := g.store.Account(account.Name)
 	if !ok || account.IncarnationID == "" || current.IncarnationID != account.IncarnationID || !current.IsPersonal() {
 		return false
 	}
@@ -628,6 +700,16 @@ type healthProbeResult struct {
 
 var errHealthProbeInFlight = errors.New("health probe is already in progress")
 
+// errHealthProbeCallerAbandoned marks a caller that stopped waiting on
+// someone else's in-flight probe because its OWN context ended first (e.g. an
+// aborted console fetch) — not because the shared probe itself produced a
+// result. The real flight is bound to a different, still-running context and
+// may yet succeed or fail on its own terms. probeAccountsHealth must never
+// let this reach the shared health cache: doing so would let one viewer's
+// disconnect poison every other viewer's read of an otherwise-healthy
+// account for the remainder of the TTL.
+var errHealthProbeCallerAbandoned = errors.New("caller abandoned wait for in-flight health probe")
+
 // Keep at most one normal live probe plus one prior-generation probe for an
 // account. The latter is important when an upstream library has ignored its
 // context forever: a credential or endpoint repair must still be able to
@@ -636,8 +718,20 @@ var errHealthProbeInFlight = errors.New("health probe is already in progress")
 // creating unbounded background work.
 const maxHealthProbesPerAccount = 2
 
+// healthProbeFlight is one in-flight probe generation. Concurrent callers
+// share its result through done instead of starting duplicate upstream probes.
 type healthProbeFlight struct {
 	accountKey string
+	done       chan struct{}
+	result     healthProbeResult
+}
+
+// cachedAccountHealth is the last completed probe row for one account
+// identity, tagged with the credential generation that produced it.
+type cachedAccountHealth struct {
+	generation string
+	row        AccountHealth
+	probedAt   time.Time
 }
 
 func healthProbeAccountKey(a Account) string {
@@ -675,60 +769,101 @@ func healthProbeKey(a Account) string {
 }
 
 func (g *Gateway) beginHealthProbe(a Account) (release func(), started bool) {
+	_, releaseWithResult, started := g.beginHealthProbeFlight(a)
+	if !started {
+		return nil, false
+	}
+	return func() { releaseWithResult(healthProbeResult{}) }, true
+}
+
+// beginHealthProbeFlight registers a probe generation, or returns the existing
+// flight when the same generation is already in flight so callers can share
+// its result. A nil flight with started=false means the per-account generation
+// cap rejected the probe; the caller must bound itself instead of waiting.
+func (g *Gateway) beginHealthProbeFlight(a Account) (flight *healthProbeFlight, release func(healthProbeResult), started bool) {
 	key := healthProbeKey(a)
 	accountKey := healthProbeAccountKey(a)
 	g.healthProbeMu.Lock()
 	defer g.healthProbeMu.Unlock()
 	if g.healthProbes == nil {
-		g.healthProbes = map[string]healthProbeFlight{}
+		g.healthProbes = map[string]*healthProbeFlight{}
 	}
-	if _, exists := g.healthProbes[key]; exists {
-		return nil, false
+	if existing, exists := g.healthProbes[key]; exists {
+		return existing, nil, false
 	}
 	active := 0
-	for _, flight := range g.healthProbes {
-		if flight.accountKey == accountKey {
+	for _, f := range g.healthProbes {
+		if f.accountKey == accountKey {
 			active++
 		}
 	}
 	if active >= maxHealthProbesPerAccount {
-		return nil, false
+		return nil, nil, false
 	}
-	g.healthProbes[key] = healthProbeFlight{accountKey: accountKey}
-	return func() {
-		g.healthProbeMu.Lock()
-		delete(g.healthProbes, key)
-		g.healthProbeMu.Unlock()
-	}, true
+	flight = &healthProbeFlight{accountKey: accountKey, done: make(chan struct{})}
+	g.healthProbes[key] = flight
+	var releaseOnce sync.Once
+	release = func(result healthProbeResult) {
+		releaseOnce.Do(func() {
+			flight.result = result
+			close(flight.done)
+			g.healthProbeMu.Lock()
+			delete(g.healthProbes, key)
+			g.healthProbeMu.Unlock()
+		})
+	}
+	return flight, release, true
 }
 
 // listAccountToolsForHealth creates a cancellation boundary around provider
 // discovery. Well-behaved transports observe ctx themselves; the result
 // channel additionally lets the Engine control plane move on when a provider
-// library ignores cancellation. The buffered result makes a late return safe
-// without leaving that goroutine blocked on a send.
+// library ignores cancellation. Closing the flight's done channel makes a late
+// return safe without leaving that goroutine blocked on a send.
 func (g *Gateway) listAccountToolsForHealth(ctx context.Context, a Account) ([]mcp.Tool, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	release, started := g.beginHealthProbe(a)
+	flight, release, started := g.beginHealthProbeFlight(a)
 	if !started {
-		return nil, errHealthProbeInFlight
+		if flight == nil {
+			// The per-account generation cap rejected a new probe.
+			return nil, errHealthProbeInFlight
+		}
+		// This exact credential generation is already being probed; share the
+		// in-flight result (bounded by this caller's own deadline) so
+		// concurrent console viewers neither duplicate the upstream round trip
+		// nor see a spurious in-flight timeout row.
+		select {
+		case <-flight.done:
+			return flight.result.tools, flight.result.err
+		case <-ctx.Done():
+			// Only THIS caller gave up; the flight we were sharing belongs to a
+			// different, still-running context and has not produced a result.
+			// Returning the bare ctx.Err() here would let probeAccountsHealth
+			// mistake an abandoned wait for a genuine probe outcome and cache
+			// it — poisoning every other viewer's read for the account. The
+			// sentinel lets probeAccountsHealth tell the two apart while still
+			// answering this caller's own request with a "no answer yet" row.
+			return nil, errHealthProbeCallerAbandoned
+		}
 	}
-	result := make(chan healthProbeResult, 1)
 	go func() {
 		tools, err := g.listAccountTools(ctx, a)
-		// Release before waking the caller. The registry represents active
+		// Release before waking callers. The registry represents active
 		// provider work, which ends once listAccountTools returns; doing this
 		// first also makes a completed recovery generation immediately visible
 		// to a subsequent poll.
-		release()
-		result <- healthProbeResult{tools: tools, err: err}
+		release(healthProbeResult{tools: tools, err: err})
 	}()
 	select {
-	case result := <-result:
-		return result.tools, result.err
+	case <-flight.done:
+		return flight.result.tools, flight.result.err
 	case <-ctx.Done():
+		// Unlike the sharer above, this ctx is the one actually bounding the
+		// listAccountTools call started above: its expiry genuinely describes
+		// why the flight has not produced a result, so ctx.Err() here is a
+		// real outcome for this generation and remains safe to cache.
 		return nil, ctx.Err()
 	}
 }
@@ -766,16 +901,95 @@ func classifyHealthProbeError(err error, probeCtx context.Context) string {
 	if errors.Is(err, errHealthProbeInFlight) || errors.Is(err, context.DeadlineExceeded) || errors.Is(probeCtx.Err(), context.DeadlineExceeded) {
 		return healthStatusTimeout
 	}
-	if isUnauthorized(err) {
+	if looksLikeAuthFailure(err) {
 		return healthStatusAuthExpired
 	}
 	return healthStatusUnreachable
 }
 
+// looksLikeAuthFailure is the HEALTH-CLASSIFIER-ONLY auth check. It is
+// deliberately broader than isUnauthorized (upstream.go), which the
+// refresh-and-redial retry path uses and which must stay typed-401-only:
+// there, a false positive burns a rotating refresh token and re-executes a
+// possibly-mutating tool call, so substring matching on arbitrary error text
+// is unsafe. Here, the only consequence of a false positive is a console
+// label — "needs reauthorization" instead of "unreachable, retry" — so the
+// broader pre-typed-401 heuristic is safe to keep for this call site alone.
+//
+// This match matters most for TOKEN-mode (PAT) accounts: upstreamFor only
+// wires automatic refresh for OAuth accounts, so a PAT has no refresh path at
+// all, and "reauthorize" (go rotate the token) is the one actionable message
+// that fixes a revoked PAT. Many upstreams signal a revoked/expired
+// credential through a tool-level JSON-RPC error or a proxy diagnostic rather
+// than a literal transport 401, and that message must not silently degrade to
+// generic "unreachable" just because it isn't mcp-go's typed sentinel.
+func looksLikeAuthFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isUnauthorized(err) {
+		return true
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "401") ||
+		strings.Contains(s, "unauthorized") ||
+		strings.Contains(s, "authorization required") ||
+		strings.Contains(s, "invalid_token") ||
+		strings.Contains(s, "invalid access token")
+}
+
 // Health live-checks every account concurrently, with an independent bounded
 // context for each provider. A slow or cancellation-ignorant upstream becomes
 // one timeout row; it cannot block healthy accounts or the watcher loop.
+// Results probed within healthCacheTTL are served from the per-account cache
+// so N concurrent console viewers share one upstream probe per account; the
+// cache key covers the credential generation, so a repair always gets a fresh
+// probe. Cached rows keep their original CheckedAt/LatencyMs — they show
+// their real age.
 func (g *Gateway) Health(ctx context.Context) []AccountHealth {
+	return g.probeAccountsHealth(ctx, g.healthCacheTTL)
+}
+
+// liveHealth is the uncached variant for the watch loop: alerting must
+// evaluate fresh probes on every tick so a recovery is detected on the next
+// interval, not after the read cache expires.
+func (g *Gateway) liveHealth(ctx context.Context) []AccountHealth {
+	return g.probeAccountsHealth(ctx, 0)
+}
+
+// cachedHealthRow returns the cached row for this exact account snapshot when
+// it was probed within ttl. A credential or endpoint change is a different
+// generation and therefore a miss, even inside the TTL.
+func (g *Gateway) cachedHealthRow(a Account, ttl time.Duration) (AccountHealth, bool) {
+	if ttl <= 0 {
+		return AccountHealth{}, false
+	}
+	g.healthCacheMu.Lock()
+	defer g.healthCacheMu.Unlock()
+	entry, ok := g.healthCache[healthProbeAccountKey(a)]
+	if !ok || entry.generation != healthProbeKey(a) || time.Since(entry.probedAt) >= ttl {
+		return AccountHealth{}, false
+	}
+	return entry.row, true
+}
+
+func (g *Gateway) cacheHealthRow(a Account, row AccountHealth, probedAt time.Time, ttl time.Duration) {
+	if ttl <= 0 {
+		return
+	}
+	g.healthCacheMu.Lock()
+	defer g.healthCacheMu.Unlock()
+	if g.healthCache == nil {
+		g.healthCache = map[string]cachedAccountHealth{}
+	}
+	g.healthCache[healthProbeAccountKey(a)] = cachedAccountHealth{
+		generation: healthProbeKey(a),
+		row:        row,
+		probedAt:   probedAt,
+	}
+}
+
+func (g *Gateway) probeAccountsHealth(ctx context.Context, cacheTTL time.Duration) []AccountHealth {
 	accts := g.store.Accounts()
 	out := make([]AccountHealth, len(accts))
 	var wg sync.WaitGroup
@@ -783,6 +997,10 @@ func (g *Gateway) Health(ctx context.Context) []AccountHealth {
 		wg.Add(1)
 		go func(i int, a Account) {
 			defer wg.Done()
+			if row, ok := g.cachedHealthRow(a, cacheTTL); ok {
+				out[i] = row
+				return
+			}
 			started := time.Now()
 			h := AccountHealth{UUID: a.Name, CheckedAt: started.UTC().Format(time.RFC3339)}
 			if a.AuthMode == "oauth" && a.AccessToken == "" && a.RefreshToken == "" {
@@ -800,6 +1018,13 @@ func (g *Gateway) Health(ctx context.Context) []AccountHealth {
 				cancel()
 			}
 			h.LatencyMs = time.Since(started).Milliseconds()
+			// Never let a caller that merely gave up waiting on someone else's
+			// in-flight probe write to the shared cache: that reflects this
+			// caller's own deadline/cancellation, not a genuine outcome for the
+			// account. Still return the row for this one caller's own response.
+			if !errors.Is(h.internalErr, errHealthProbeCallerAbandoned) {
+				g.cacheHealthRow(a, h, started, cacheTTL)
+			}
 			out[i] = h
 		}(i, a)
 	}
@@ -864,9 +1089,11 @@ func (g *Gateway) rebindCachedAccount(a Account, expectedPreviousRevision int64)
 		return false
 	}
 	up := g.upstreamFor(a)
+	// store I/O stays outside g.mu; dispatch-time revision fences
+	// (accountSnapshotLive) remain the authority.
+	current, live := g.store.Account(a.Name)
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	current, live := g.store.Account(a.Name)
 	if !live || current.IncarnationID != a.IncarnationID || current.Revision != a.Revision || !equalAccountSnapshotURL(current.URL, a.URL) {
 		return false
 	}
@@ -937,7 +1164,7 @@ func (g *Gateway) tick(ctx context.Context) {
 	if refreshed > 0 {
 		log.Printf("engine: refresh-ahead refreshed %d oauth account(s)", refreshed)
 	}
-	for _, h := range g.Health(ctx) { // health sweep covers token accounts too
+	for _, h := range g.liveHealth(ctx) { // health sweep covers token accounts too; alerts need fresh probes, not the console read cache
 		if h.internalErr != nil && !errors.Is(h.internalErr, errHealthProbeInFlight) {
 			// Preserve the real cause only in Engine-controlled diagnostics.
 			// Browser responses and outbound alerts use healthPresentation below.

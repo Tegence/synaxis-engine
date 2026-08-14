@@ -1,13 +1,18 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
+	"log"
 	"os"
 	"strings"
 	"testing"
 	"time"
+
+	"narthex/backend/internal/oauthas"
 )
 
 func TestEnginePostgresPoolConfigIsCapacityBounded(t *testing.T) {
@@ -112,6 +117,115 @@ func TestPgStoreTokenGenerationPersistsAndUsesCASRotation(t *testing.T) {
 	}
 	if generation != "generation-two" {
 		t.Fatalf("rotated generation did not persist: %q", generation)
+	}
+}
+
+func TestPgStoreOAuthGrantStateSurvivesRestartAndConsumesCodesOnce(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("set TEST_DATABASE_URL to run the Postgres integration test")
+	}
+	ctx := context.Background()
+	first, err := NewPgStore(ctx, dsn)
+	if err != nil {
+		t.Fatalf("NewPgStore: %v", err)
+	}
+	defer first.Close()
+	for _, table := range []string{
+		"narthex_oauth_authorization_codes",
+		"narthex_oauth_refresh_grants",
+		"narthex_oauth_hosted_consent_replays",
+	} {
+		if _, err := first.pool.Exec(ctx, "DELETE FROM "+table); err != nil {
+			t.Fatalf("reset %s: %v", table, err)
+		}
+	}
+	defer func() {
+		for _, table := range []string{
+			"narthex_oauth_authorization_codes",
+			"narthex_oauth_refresh_grants",
+			"narthex_oauth_hosted_consent_replays",
+		} {
+			_, _ = first.pool.Exec(context.Background(), "DELETE FROM "+table)
+		}
+	}()
+
+	now := time.Date(2026, time.August, 9, 12, 0, 0, 0, time.UTC)
+	code := oauthas.DurableAuthorizationCode{
+		TokenHash: "pg-code-hash-that-is-long-enough-to-be-a-digest-0001",
+		ClientID:  "client-1", RedirectURI: "https://client.example/callback",
+		Challenge: "challenge", Scope: "mcp", Resource: "/mcp/team",
+		ResourceEpoch: "team-v1", Generation: "workspace-v1", ExpiresAt: now.Add(time.Minute),
+	}
+	if err := first.StoreAuthorizationCode(ctx, code); err != nil {
+		t.Fatalf("StoreAuthorizationCode: %v", err)
+	}
+
+	second, err := NewPgStore(ctx, dsn)
+	if err != nil {
+		t.Fatalf("NewPgStore after restart: %v", err)
+	}
+	defer second.Close()
+	got, found, err := second.ConsumeAuthorizationCode(ctx, code.TokenHash, now)
+	if err != nil || !found || got.ClientID != code.ClientID || got.ResourceEpoch != code.ResourceEpoch {
+		t.Fatalf("durable code consume = %+v found=%v err=%v", got, found, err)
+	}
+	if _, found, err := first.ConsumeAuthorizationCode(ctx, code.TokenHash, now); err != nil || found {
+		t.Fatalf("authorization code replay found=%v err=%v", found, err)
+	}
+
+	refresh := oauthas.DurableRefreshGrant{
+		TokenHash: "pg-refresh-hash-that-is-long-enough-to-be-a-digest-01",
+		ClientID:  "client-1", Resource: "/mcp/team", ResourceEpoch: "team-v1",
+		Generation: "workspace-v1", ExpiresAt: now.Add(time.Hour),
+	}
+	replacementRefresh := oauthas.DurableRefreshGrant{
+		TokenHash: "pg-replacement-refresh-hash-long-enough-digest-002",
+		ClientID:  "client-1", Resource: "/mcp/team", ResourceEpoch: "team-v2",
+		Generation: "workspace-v1", ExpiresAt: now.Add(time.Hour),
+	}
+	if err := first.StoreRefreshGrant(ctx, refresh); err != nil {
+		t.Fatalf("StoreRefreshGrant: %v", err)
+	}
+	if err := first.StoreRefreshGrant(ctx, replacementRefresh); err != nil {
+		t.Fatalf("StoreRefreshGrant replacement: %v", err)
+	}
+	if got, found, err := second.LoadRefreshGrant(ctx, refresh.TokenHash, now); err != nil || !found || got.Generation != refresh.Generation {
+		t.Fatalf("durable refresh = %+v found=%v err=%v", got, found, err)
+	}
+
+	reserved, err := first.ReserveHostedConsentReplay(
+		ctx,
+		"pg-reservation-opaque-identifier",
+		"approval:pg-opaque-jti-0001",
+		"request:pg-opaque-request-hash-0001",
+		now.Add(time.Minute),
+		now,
+	)
+	if err != nil || !reserved {
+		t.Fatalf("ReserveHostedConsentReplay = %v, %v", reserved, err)
+	}
+	if reserved, err := second.ReserveHostedConsentReplay(
+		ctx,
+		"pg-second-reservation-opaque-id",
+		"approval:pg-opaque-jti-0001",
+		"request:pg-other-request-hash-0001",
+		now.Add(time.Minute),
+		now,
+	); err != nil || reserved {
+		t.Fatalf("replayed consent reservation = %v, %v", reserved, err)
+	}
+	if err := second.FinalizeHostedConsentReplay(ctx, "pg-reservation-opaque-identifier"); err != nil {
+		t.Fatalf("FinalizeHostedConsentReplay: %v", err)
+	}
+	if err := second.RevokeOAuthGrantsForResourceEpoch(ctx, "/mcp/team", "team-v1"); err != nil {
+		t.Fatalf("RevokeOAuthGrantsForResourceEpoch: %v", err)
+	}
+	if _, found, err := first.LoadRefreshGrant(ctx, refresh.TokenHash, now); err != nil || found {
+		t.Fatalf("resource-revoked refresh found=%v err=%v", found, err)
+	}
+	if _, found, err := first.LoadRefreshGrant(ctx, replacementRefresh.TokenHash, now); err != nil || !found {
+		t.Fatalf("replacement-epoch refresh found=%v err=%v", found, err)
 	}
 }
 
@@ -506,6 +620,74 @@ VALUES ($1,'PG Connection Namespace Legacy','https://legacy.example/mcp','token'
 	}
 }
 
+func TestPgStoreUpsertOwnsRevisionMonotonicity(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("set TEST_DATABASE_URL to run the Postgres integration test")
+	}
+	ctx := context.Background()
+	store, err := NewPgStore(ctx, dsn)
+	if err != nil {
+		t.Fatalf("NewPgStore: %v", err)
+	}
+	defer store.Close()
+	const accountName = "pg_upsert_revision_acme"
+	cleanup := func() {
+		_, _ = store.pool.Exec(ctx, `DELETE FROM narthex_accounts WHERE name=$1`, accountName)
+		_, _ = store.pool.Exec(ctx, `DELETE FROM narthex_connection_namespaces WHERE slug IN ('pg-upsert-revision-source','pg-upsert-revision-target')`)
+	}
+	cleanup()
+	defer cleanup()
+
+	source, err := store.CreateConnectionNamespace(ctx, ConnectionNamespace{Label: "PG Upsert Revision Source"})
+	if err != nil {
+		t.Fatalf("create source namespace: %v", err)
+	}
+	target, err := store.CreateConnectionNamespace(ctx, ConnectionNamespace{Label: "PG Upsert Revision Target"})
+	if err != nil {
+		t.Fatalf("create target namespace: %v", err)
+	}
+
+	// The create path still honors an explicit positive revision.
+	if err := store.Upsert(ctx, Account{
+		Name: accountName, Group: source.Label,
+		ConnectionNamespaceID: source.ID, ConnectionScope: ConnectionScopeShared,
+		URL: "https://acme.example/mcp", AuthMode: "token", BearerToken: "secret",
+		Revision: 3,
+	}); err != nil {
+		t.Fatalf("create via Upsert: %v", err)
+	}
+	created, ok := store.Account(accountName)
+	if !ok || created.Revision != 3 {
+		t.Fatalf("create honoring explicit revision = %+v, want Revision 3", created)
+	}
+
+	// A caller-supplied regression is ignored: unchanged ownership preserves 3.
+	stale := created
+	stale.Revision = 1
+	stale.Label = "Renamed"
+	if err := store.Upsert(ctx, stale); err != nil {
+		t.Fatalf("update via Upsert: %v", err)
+	}
+	after, _ := store.Account(accountName)
+	if after.Revision != 3 || after.Label != "Renamed" {
+		t.Fatalf("caller-supplied revision regressed the row: %+v", after)
+	}
+
+	// An ownership change bumps from the locked prior row, not the caller's value.
+	moved := after
+	moved.Revision = 1
+	moved.ConnectionNamespaceID = target.ID
+	moved.Group = target.Label
+	if err := store.Upsert(ctx, moved); err != nil {
+		t.Fatalf("ownership move via Upsert: %v", err)
+	}
+	afterMove, _ := store.Account(accountName)
+	if afterMove.Revision != 4 || afterMove.ConnectionNamespaceID != target.ID {
+		t.Fatalf("ownership move revision = %+v, want Revision 4 in target namespace", afterMove)
+	}
+}
+
 func TestPgStoreNamespacesPersistCascadeAndShareSlugDomain(t *testing.T) {
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
@@ -769,7 +951,8 @@ func TestPgStoreEncryption(t *testing.T) {
 		t.Fatal("plaintext leaked into the column")
 	}
 	// legacy plaintext (no prefix) passes through
-	if c.Decrypt("legacy-plain") != "legacy-plain" {
+	legacy, err := c.Decrypt("legacy-plain")
+	if err != nil || legacy != "legacy-plain" {
 		t.Fatal("legacy plaintext not passed through")
 	}
 }
@@ -1259,5 +1442,570 @@ SELECT args,result,endpoint_kind,endpoint_generation FROM tool_calls WHERE id=$1
 	_ = s.pool.QueryRow(ctx, `SELECT count(*) FROM tool_calls WHERE account='fr-test' AND tool='old_tool'`).Scan(&oldCount)
 	if oldCount != 0 {
 		t.Fatal("old row still present after purge")
+	}
+}
+
+// TestPgStoreAuditFieldsEncryptedAtRest proves the audit error column goes
+// through the same cipher as the payload columns without needing a live
+// Postgres: encryptAuditFields is the exact value preparation persistAuditCall
+// inserts.
+func TestPgStoreAuditFieldsEncryptedAtRest(t *testing.T) {
+	store := &PgStore{cipher: testCipher(t, 5)}
+	const errorSecret = "upstream 401: https://api.example/mcp?token=secret-echo"
+	args, result, auditErr, err := store.encryptAuditFields(CallRecord{
+		Args:   `{"secret":"payload-in"}`,
+		Result: `{"secret":"payload-out"}`,
+		Error:  errorSecret,
+	})
+	if err != nil {
+		t.Fatalf("encryptAuditFields: %v", err)
+	}
+	for name, value := range map[string]string{"args": args, "result": result, "error": auditErr} {
+		if !strings.HasPrefix(value, encPrefix) {
+			t.Fatalf("%s not encrypted: %q", name, value)
+		}
+	}
+	if strings.Contains(auditErr, "secret-echo") {
+		t.Fatalf("error ciphertext embeds plaintext: %q", auditErr)
+	}
+	plain, err := store.dec(auditErr)
+	if err != nil || plain != errorSecret {
+		t.Fatalf("error round-trip = %q, %v", plain, err)
+	}
+
+	// Clamping happens before encryption, so the stored ciphertext unwraps to
+	// the bounded text rather than failing a size check on read.
+	long := strings.Repeat("x", 600)
+	_, _, clamped, err := store.encryptAuditFields(CallRecord{Error: long})
+	if err != nil {
+		t.Fatalf("encryptAuditFields long error: %v", err)
+	}
+	plain, err = store.dec(clamped)
+	if err != nil || len(plain) > 500 {
+		t.Fatalf("clamped error round-trip len=%d err=%v", len(plain), err)
+	}
+
+	// Legacy plaintext rows (written before encryption covered these columns)
+	// keep reading through the passthrough.
+	legacy, err := store.dec("plain legacy error")
+	if err != nil || legacy != "plain legacy error" {
+		t.Fatalf("legacy dec = %q, %v", legacy, err)
+	}
+
+	// No cipher configured (self-hosted development): values stay plaintext,
+	// same as the token columns.
+	plainStore := &PgStore{}
+	_, _, auditErr, err = plainStore.encryptAuditFields(CallRecord{Error: errorSecret})
+	if err != nil || auditErr != errorSecret {
+		t.Fatalf("cipherless encryptAuditFields = %q, %v", auditErr, err)
+	}
+}
+
+// fakePendingRow feeds scanPendingCall without a database, in pendingCallColumns
+// order.
+type fakePendingRow struct {
+	id          string
+	ts          time.Time
+	connector   string
+	account     string
+	incarnation string
+	revision    int64
+	namespace   string
+	tool        string
+	args        string
+	status      string
+	expires     time.Time
+	decidedAt   *time.Time
+	decidedBy   string
+	note        string
+}
+
+func (f fakePendingRow) Scan(dest ...any) error {
+	if len(dest) != 14 {
+		return errors.New("fake pending row column count mismatch")
+	}
+	*dest[0].(*string) = f.id
+	*dest[1].(*time.Time) = f.ts
+	*dest[2].(*string) = f.connector
+	*dest[3].(*string) = f.account
+	*dest[4].(*string) = f.incarnation
+	*dest[5].(*int64) = f.revision
+	*dest[6].(*string) = f.namespace
+	*dest[7].(*string) = f.tool
+	*dest[8].(*string) = f.args
+	*dest[9].(*string) = f.status
+	*dest[10].(*time.Time) = f.expires
+	*dest[11].(**time.Time) = f.decidedAt
+	*dest[12].(*string) = f.decidedBy
+	*dest[13].(*string) = f.note
+	return nil
+}
+
+func TestScanPendingCallDecryptsDecisionMetadata(t *testing.T) {
+	store := &PgStore{cipher: testCipher(t, 6)}
+	encActor, err := store.enc("platform:admin@example.com")
+	if err != nil {
+		t.Fatalf("enc actor: %v", err)
+	}
+	encNote, err := store.enc("approved while investigating token=secret-note")
+	if err != nil {
+		t.Fatalf("enc note: %v", err)
+	}
+	if !strings.HasPrefix(encActor, encPrefix) || !strings.HasPrefix(encNote, encPrefix) {
+		t.Fatalf("decision metadata not encrypted: actor=%q note=%q", encActor, encNote)
+	}
+	decided := time.Now().Truncate(time.Second)
+	p, err := store.scanPendingCall(fakePendingRow{
+		id: "enc-1", ts: decided, connector: "work", account: "linear",
+		incarnation: "inc-1", revision: 3, namespace: "ns-1",
+		tool: "save", args: `{}`, status: ApprovalApproved,
+		expires: decided.Add(time.Minute), decidedAt: &decided,
+		decidedBy: encActor, note: encNote,
+	})
+	if err != nil {
+		t.Fatalf("scanPendingCall encrypted: %v", err)
+	}
+	if p.DecidedBy != "platform:admin@example.com" || p.DecisionNote != "approved while investigating token=secret-note" {
+		t.Fatalf("decision metadata mismatch: %+v", p)
+	}
+
+	// Rows decided before encryption covered these columns (including the
+	// engine-written SQL literals) stay readable.
+	p, err = store.scanPendingCall(fakePendingRow{
+		id: "legacy-1", ts: decided, connector: "work", account: "linear",
+		incarnation: "inc-1", revision: 3, namespace: "ns-1",
+		tool: "save", args: `{}`, status: ApprovalExpired,
+		expires: decided.Add(-time.Minute), decidedAt: &decided,
+		decidedBy: "engine", note: "approval deadline elapsed",
+	})
+	if err != nil {
+		t.Fatalf("scanPendingCall legacy: %v", err)
+	}
+	if p.DecidedBy != "engine" || p.DecisionNote != "approval deadline elapsed" {
+		t.Fatalf("legacy decision metadata mismatch: %+v", p)
+	}
+}
+
+// TestPgStoreAuditErrorAndDecisionMetadataEncrypted is the live-Postgres proof:
+// encrypted at rest, decrypted on every read path, legacy plaintext intact.
+func TestPgStoreAuditErrorAndDecisionMetadataEncrypted(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("set TEST_DATABASE_URL to run the Postgres integration test")
+	}
+	ctx := context.Background()
+	s, err := NewPgStore(ctx, dsn)
+	if err != nil {
+		t.Fatalf("NewPgStore: %v", err)
+	}
+	defer s.Close()
+	defer s.pool.Exec(ctx, `DELETE FROM tool_calls WHERE account='err-enc-test'`)
+	defer s.pool.Exec(ctx, `DELETE FROM pending_calls WHERE id IN ('err-enc-decide','err-enc-cancel','err-enc-legacy')`)
+	s.SetCipher(testCipher(t, 4))
+
+	const errorSecret = "upstream 401: https://api.example/mcp?token=secret-echo"
+	s.LogCall(CallRecord{Account: "err-enc-test", Tool: "save_issue", OK: false, Ms: 3, Error: errorSecret})
+
+	// LogCall is fire-and-forget — poll for the row.
+	var got CallRecord
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		list, err := s.RecentCalls(ctx, 50)
+		if err != nil {
+			t.Fatalf("RecentCalls: %v", err)
+		}
+		found := false
+		for _, r := range list {
+			if r.Account == "err-enc-test" && r.Tool == "save_issue" {
+				got, found = r, true
+			}
+		}
+		if found {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("audit row never appeared")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got.Error != errorSecret {
+		t.Fatalf("RecentCalls error = %q, want decrypted %q", got.Error, errorSecret)
+	}
+	var rawError string
+	if err := s.pool.QueryRow(ctx, `SELECT error FROM tool_calls WHERE id=$1`, got.ID).Scan(&rawError); err != nil {
+		t.Fatalf("raw error read: %v", err)
+	}
+	if !strings.HasPrefix(rawError, encPrefix) || strings.Contains(rawError, "secret-echo") {
+		t.Fatalf("error not encrypted at rest: %q", rawError)
+	}
+	detail, ok, err := s.CallDetail(ctx, got.ID)
+	if err != nil || !ok {
+		t.Fatalf("CallDetail: ok=%v err=%v", ok, err)
+	}
+	if detail.Error != errorSecret {
+		t.Fatalf("CallDetail error = %q, want decrypted %q", detail.Error, errorSecret)
+	}
+
+	// A legacy plaintext error row still reads through both surfaces.
+	if _, err := s.pool.Exec(ctx, `
+INSERT INTO tool_calls (ts,account,tool,ok,ms,error) VALUES (now(),'err-enc-test','legacy_tool',false,1,'legacy plain error')`); err != nil {
+		t.Fatalf("insert legacy error row: %v", err)
+	}
+	list, err := s.RecentCalls(ctx, 50)
+	if err != nil {
+		t.Fatalf("RecentCalls legacy: %v", err)
+	}
+	legacyFound := false
+	for _, r := range list {
+		if r.Account == "err-enc-test" && r.Tool == "legacy_tool" {
+			if r.Error != "legacy plain error" {
+				t.Fatalf("legacy error via RecentCalls = %q", r.Error)
+			}
+			legacyFound = true
+		}
+	}
+	if !legacyFound {
+		t.Fatal("legacy plaintext error row missing from RecentCalls")
+	}
+
+	// Approval decision metadata: encrypted at rest, decrypted on read.
+	now := time.Now()
+	for _, id := range []string{"err-enc-decide", "err-enc-cancel", "err-enc-legacy"} {
+		if err := s.LogPending(ctx, PendingCall{
+			ID: id, TS: now, ExpiresAt: ptrTime(now.Add(time.Minute)),
+			Connector: "work", Account: "linear", Tool: "save", Status: ApprovalPending,
+		}); err != nil {
+			t.Fatalf("LogPending %s: %v", id, err)
+		}
+	}
+	if _, err := s.DecidePending(ctx, "err-enc-decide", ApprovalDecision{
+		Status: ApprovalApproved, Actor: "platform:admin@example.com", Note: "approved with token=secret-note",
+	}); err != nil {
+		t.Fatalf("DecidePending: %v", err)
+	}
+	if _, err := s.CancelPending(ctx, "err-enc-cancel", "platform:admin@example.com", "cancelled with token=secret-note"); err != nil {
+		t.Fatalf("CancelPending: %v", err)
+	}
+	if _, err := s.pool.Exec(ctx, `
+UPDATE pending_calls SET status='denied', decided_at=now(), decided_by='legacy-admin', decision_note='legacy plain note'
+WHERE id='err-enc-legacy'`); err != nil {
+		t.Fatalf("write legacy decision row: %v", err)
+	}
+
+	for id, want := range map[string][2]string{
+		"err-enc-decide": {"platform:admin@example.com", "approved with token=secret-note"},
+		"err-enc-cancel": {"platform:admin@example.com", "cancelled with token=secret-note"},
+		"err-enc-legacy": {"legacy-admin", "legacy plain note"},
+	} {
+		p, found, err := s.ApprovalCall(ctx, id)
+		if err != nil || !found {
+			t.Fatalf("ApprovalCall %s: found=%v err=%v", id, found, err)
+		}
+		if p.DecidedBy != want[0] || p.DecisionNote != want[1] {
+			t.Fatalf("%s decision = %q/%q, want %q/%q", id, p.DecidedBy, p.DecisionNote, want[0], want[1])
+		}
+	}
+	var rawActor, rawNote string
+	if err := s.pool.QueryRow(ctx, `SELECT decided_by, decision_note FROM pending_calls WHERE id='err-enc-decide'`).Scan(&rawActor, &rawNote); err != nil {
+		t.Fatalf("raw decision read: %v", err)
+	}
+	if !strings.HasPrefix(rawActor, encPrefix) || !strings.HasPrefix(rawNote, encPrefix) ||
+		strings.Contains(rawNote, "secret-note") {
+		t.Fatalf("decision metadata not encrypted at rest: actor=%q note=%q", rawActor, rawNote)
+	}
+}
+
+// TestPgStoreEncryptExistingBackfillsAuditAndDecisionMetadata proves the
+// startup migration (EncryptExisting) covers the write-once tool_calls.error
+// and pending_calls.decided_by/decision_note columns, not just args/result.
+// Those columns are only ever written at insert/decision time and never
+// UPDATEd again, so a row written before this backfill pass existed would
+// otherwise stay plaintext-at-rest permanently, with no remediation path.
+func TestPgStoreEncryptExistingBackfillsAuditAndDecisionMetadata(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("set TEST_DATABASE_URL to run the Postgres integration test")
+	}
+	ctx := context.Background()
+	s, err := NewPgStore(ctx, dsn)
+	if err != nil {
+		t.Fatalf("NewPgStore: %v", err)
+	}
+	defer s.Close()
+	defer s.pool.Exec(ctx, `DELETE FROM tool_calls WHERE account='backfill-test'`)
+	defer s.pool.Exec(ctx, `DELETE FROM pending_calls WHERE id='backfill-pending'`)
+
+	// Simulate rows written in production before this PR's cipher (and this
+	// backfill pass) covered these columns: plain SQL inserts with no cipher
+	// involved, exactly like real pre-existing rows.
+	var callID int64
+	if err := s.pool.QueryRow(ctx, `
+INSERT INTO tool_calls (ts,account,tool,ok,ms,error)
+VALUES (now(),'backfill-test','legacy_tool',false,1,'legacy error token=secret-err')
+RETURNING id`).Scan(&callID); err != nil {
+		t.Fatalf("insert legacy tool_calls row: %v", err)
+	}
+	if _, err := s.pool.Exec(ctx, `
+INSERT INTO pending_calls (id,ts,connector,account,tool,args,status,expires_at,decided_at,decided_by,decision_note)
+VALUES ('backfill-pending',now(),'work','linear','save','{}','denied',now()+interval '1 minute',now(),'legacy-admin','legacy note token=secret-note')`); err != nil {
+		t.Fatalf("insert legacy pending_calls row: %v", err)
+	}
+
+	// Precondition: both rows are plaintext at rest before any cipher exists.
+	var rawErr, rawDecidedBy, rawNote string
+	if err := s.pool.QueryRow(ctx, `SELECT error FROM tool_calls WHERE id=$1`, callID).Scan(&rawErr); err != nil {
+		t.Fatalf("read raw error: %v", err)
+	}
+	if rawErr != "legacy error token=secret-err" {
+		t.Fatalf("precondition: tool_calls.error not plaintext: %q", rawErr)
+	}
+	if err := s.pool.QueryRow(ctx,
+		`SELECT decided_by,decision_note FROM pending_calls WHERE id='backfill-pending'`,
+	).Scan(&rawDecidedBy, &rawNote); err != nil {
+		t.Fatalf("read raw decision metadata: %v", err)
+	}
+	if rawDecidedBy != "legacy-admin" || rawNote != "legacy note token=secret-note" {
+		t.Fatalf("precondition: pending_calls decision metadata not plaintext: %q / %q", rawDecidedBy, rawNote)
+	}
+
+	// Enable encryption and run the startup migration, exactly as
+	// configureStoreEncryption does at boot when ENGINE_ENCRYPTION_KEY is set.
+	s.SetCipher(testCipher(t, 8))
+	if err := s.EncryptExisting(ctx); err != nil {
+		t.Fatalf("EncryptExisting: %v", err)
+	}
+
+	if err := s.pool.QueryRow(ctx, `SELECT error FROM tool_calls WHERE id=$1`, callID).Scan(&rawErr); err != nil {
+		t.Fatalf("read backfilled error: %v", err)
+	}
+	if !strings.HasPrefix(rawErr, encPrefix) || strings.Contains(rawErr, "secret-err") {
+		t.Fatalf("tool_calls.error not encrypted at rest after backfill: %q", rawErr)
+	}
+	if err := s.pool.QueryRow(ctx,
+		`SELECT decided_by,decision_note FROM pending_calls WHERE id='backfill-pending'`,
+	).Scan(&rawDecidedBy, &rawNote); err != nil {
+		t.Fatalf("read backfilled decision metadata: %v", err)
+	}
+	if !strings.HasPrefix(rawDecidedBy, encPrefix) || !strings.HasPrefix(rawNote, encPrefix) ||
+		strings.Contains(rawNote, "secret-note") {
+		t.Fatalf("pending_calls decision metadata not encrypted at rest after backfill: %q / %q", rawDecidedBy, rawNote)
+	}
+
+	// The backfilled values still read back correctly through the normal
+	// decrypt-on-read paths.
+	list, err := s.RecentCalls(ctx, 50)
+	if err != nil {
+		t.Fatalf("RecentCalls: %v", err)
+	}
+	found := false
+	for _, r := range list {
+		if r.ID == callID {
+			if r.Error != "legacy error token=secret-err" {
+				t.Fatalf("RecentCalls error after backfill = %q", r.Error)
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("backfilled tool_calls row missing from RecentCalls")
+	}
+	p, ok, err := s.ApprovalCall(ctx, "backfill-pending")
+	if err != nil || !ok {
+		t.Fatalf("ApprovalCall: ok=%v err=%v", ok, err)
+	}
+	if p.DecidedBy != "legacy-admin" || p.DecisionNote != "legacy note token=secret-note" {
+		t.Fatalf("ApprovalCall decision metadata after backfill = %q / %q", p.DecidedBy, p.DecisionNote)
+	}
+
+	// Idempotent: re-running the migration (as happens on every boot) must not
+	// change already-encrypted ciphertext, mirroring encryptExistingCallPayloads'
+	// existing pattern for args/result.
+	if err := s.EncryptExisting(ctx); err != nil {
+		t.Fatalf("EncryptExisting (second run): %v", err)
+	}
+	var rawErrAgain, rawDecidedByAgain, rawNoteAgain string
+	if err := s.pool.QueryRow(ctx, `SELECT error FROM tool_calls WHERE id=$1`, callID).Scan(&rawErrAgain); err != nil {
+		t.Fatalf("read error after second run: %v", err)
+	}
+	if err := s.pool.QueryRow(ctx,
+		`SELECT decided_by,decision_note FROM pending_calls WHERE id='backfill-pending'`,
+	).Scan(&rawDecidedByAgain, &rawNoteAgain); err != nil {
+		t.Fatalf("read decision metadata after second run: %v", err)
+	}
+	if rawErrAgain != rawErr || rawDecidedByAgain != rawDecidedBy || rawNoteAgain != rawNote {
+		t.Fatal("EncryptExisting is not idempotent: re-running changed already-encrypted ciphertext")
+	}
+}
+
+// TestPgStoreRecentCallsOmitsUndecryptableErrorButKeepsRow proves a single
+// row with a corrupted/undecryptable error field no longer takes down the
+// whole RecentCalls response. Before the fix, s.dec failure on the error
+// column did `continue`, dropping the entire row (id/ts/account/tool/etc,
+// none of which needed decryption) with no log line — and since only
+// non-empty errors are ever ciphertext, that disproportionately hid
+// FAILED-call rows, exactly what an incident investigator needs most.
+func TestPgStoreRecentCallsOmitsUndecryptableErrorButKeepsRow(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("set TEST_DATABASE_URL to run the Postgres integration test")
+	}
+	ctx := context.Background()
+	s, err := NewPgStore(ctx, dsn)
+	if err != nil {
+		t.Fatalf("NewPgStore: %v", err)
+	}
+	defer s.Close()
+	defer s.pool.Exec(ctx, `DELETE FROM tool_calls WHERE account='recentcalls-undecryptable'`)
+	s.SetCipher(testCipher(t, 12))
+
+	s.LogCall(CallRecord{Account: "recentcalls-undecryptable", Tool: "good_call", OK: true, Ms: 1})
+	s.LogCall(CallRecord{Account: "recentcalls-undecryptable", Tool: "bad_call", OK: false, Ms: 2, Error: "will be corrupted"})
+
+	// LogCall is fire-and-forget — poll until both rows land.
+	var badID int64
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		list, err := s.RecentCalls(ctx, 50)
+		if err != nil {
+			t.Fatalf("RecentCalls: %v", err)
+		}
+		goodFound, badFound := false, false
+		for _, r := range list {
+			if r.Account != "recentcalls-undecryptable" {
+				continue
+			}
+			if r.Tool == "good_call" {
+				goodFound = true
+			}
+			if r.Tool == "bad_call" {
+				badFound, badID = true, r.ID
+			}
+		}
+		if goodFound && badFound {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("audit rows never appeared")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Corrupt the bad row's ciphertext directly: a value this cipher can no
+	// longer authenticate (wrong/rotated key, bit rot, truncation).
+	if _, err := s.pool.Exec(ctx, `UPDATE tool_calls SET error=$2 WHERE id=$1`,
+		badID, encPrefix+"not-valid-base64!!"); err != nil {
+		t.Fatalf("corrupt error column: %v", err)
+	}
+
+	var logBuf bytes.Buffer
+	oldOutput := log.Writer()
+	log.SetOutput(&logBuf)
+	t.Cleanup(func() { log.SetOutput(oldOutput) })
+
+	list, err := s.RecentCalls(ctx, 50)
+	if err != nil {
+		t.Fatalf("RecentCalls with corrupted row: %v", err)
+	}
+
+	var good, bad *CallRecord
+	for i := range list {
+		if list[i].Account != "recentcalls-undecryptable" {
+			continue
+		}
+		switch list[i].Tool {
+		case "good_call":
+			good = &list[i]
+		case "bad_call":
+			bad = &list[i]
+		}
+	}
+	if good == nil {
+		t.Fatal("unrelated good row was dropped from RecentCalls")
+	}
+	if bad == nil {
+		t.Fatal("row with an undecryptable error field was dropped from RecentCalls instead of being kept")
+	}
+	if bad.Error != undecryptableAuditErrorPlaceholder {
+		t.Fatalf("bad row error = %q, want placeholder %q", bad.Error, undecryptableAuditErrorPlaceholder)
+	}
+	if bad.ID != badID || bad.Tool != "bad_call" || bad.OK {
+		t.Fatalf("bad row's non-error fields were not preserved intact: %+v", bad)
+	}
+	if !strings.Contains(logBuf.String(), fmt.Sprintf("%d", badID)) {
+		t.Fatalf("omission was not logged with the row id %d: log=%q", badID, logBuf.String())
+	}
+}
+
+// TestPgStorePendingCallsOmitsUndecryptableRowButKeepsRest proves a single
+// pending_calls row with corrupted/undecryptable decision metadata no longer
+// fails the whole PendingCalls list. Before the fix, scanPendingCall's error
+// propagated straight out of PendingCalls, which console.go turns into an
+// HTTP 502 for every user — hiding all pending and historical approvals, not
+// just the one bad record.
+func TestPgStorePendingCallsOmitsUndecryptableRowButKeepsRest(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("set TEST_DATABASE_URL to run the Postgres integration test")
+	}
+	ctx := context.Background()
+	s, err := NewPgStore(ctx, dsn)
+	if err != nil {
+		t.Fatalf("NewPgStore: %v", err)
+	}
+	defer s.Close()
+	defer s.pool.Exec(ctx, `DELETE FROM pending_calls WHERE id IN ('pendingcalls-good','pendingcalls-bad')`)
+	s.SetCipher(testCipher(t, 13))
+
+	now := time.Now()
+	if err := s.LogPending(ctx, PendingCall{
+		ID: "pendingcalls-good", TS: now, ExpiresAt: ptrTime(now.Add(time.Minute)),
+		Connector: "work", Account: "linear", Tool: "save", Status: ApprovalPending,
+	}); err != nil {
+		t.Fatalf("LogPending good: %v", err)
+	}
+	if err := s.LogPending(ctx, PendingCall{
+		ID: "pendingcalls-bad", TS: now, ExpiresAt: ptrTime(now.Add(time.Minute)),
+		Connector: "work", Account: "linear", Tool: "save", Status: ApprovalPending,
+	}); err != nil {
+		t.Fatalf("LogPending bad: %v", err)
+	}
+	if _, err := s.DecidePending(ctx, "pendingcalls-bad", ApprovalDecision{
+		Status: ApprovalDenied, Actor: "admin", Note: "will be corrupted",
+	}); err != nil {
+		t.Fatalf("DecidePending: %v", err)
+	}
+	// Corrupt the decided row's decision_note ciphertext directly: a value
+	// this cipher can no longer authenticate.
+	if _, err := s.pool.Exec(ctx, `UPDATE pending_calls SET decision_note=$2 WHERE id=$1`,
+		"pendingcalls-bad", encPrefix+"not-valid-base64!!"); err != nil {
+		t.Fatalf("corrupt decision_note column: %v", err)
+	}
+
+	var logBuf bytes.Buffer
+	oldOutput := log.Writer()
+	log.SetOutput(&logBuf)
+	t.Cleanup(func() { log.SetOutput(oldOutput) })
+
+	list, err := s.PendingCalls(ctx)
+	if err != nil {
+		t.Fatalf("PendingCalls with one corrupted row: %v", err)
+	}
+	var goodFound, badFound bool
+	for _, p := range list {
+		switch p.ID {
+		case "pendingcalls-good":
+			goodFound = true
+		case "pendingcalls-bad":
+			badFound = true
+		}
+	}
+	if !goodFound {
+		t.Fatal("unrelated good pending row was dropped from PendingCalls")
+	}
+	if badFound {
+		t.Fatal("row with undecryptable decision metadata was returned instead of being skipped")
+	}
+	if !strings.Contains(logBuf.String(), "pendingcalls-bad") {
+		t.Fatalf("omission was not logged with the row id: log=%q", logBuf.String())
 	}
 }

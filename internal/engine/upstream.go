@@ -19,6 +19,7 @@ import (
 	"github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/client/transport"
 	"github.com/mark3labs/mcp-go/mcp"
+	"narthex/backend/internal/upstreamoauth"
 )
 
 // Upstream is one connected backend account (e.g. "tegence_notion").
@@ -46,16 +47,37 @@ type upstreamConnection struct {
 	responses *upstreamResponseLimiter
 }
 
+// newUpstreamTransport is kept as a package-private test seam because the
+// streamable-MCP test servers run on loopback. Production always uses the
+// hardened direct transport, and response limiting wraps it below rather than
+// replacing it.
+var newUpstreamTransport = func() http.RoundTripper {
+	return upstreamoauth.NewHardenedTransport()
+}
+
+// isUnauthorized reports whether err is a TRANSPORT-LEVEL HTTP 401 from the
+// upstream — the only failure that justifies burning a rotating refresh token
+// and re-executing fn. mcp-go surfaces a 401 as *transport.AuthorizationRequiredError
+// (or its OAuth variant), both unwrapping to exported sentinels, so detection
+// is typed. Substring matching on arbitrary error text is deliberately NOT
+// done: a tool-level JSON-RPC error can legitimately contain "401" or
+// "invalid_token", and re-executing a mutating tool call on that basis is
+// unsafe.
 func isUnauthorized(err error) bool {
 	if err == nil {
 		return false
 	}
-	s := strings.ToLower(err.Error())
-	return strings.Contains(s, "401") ||
-		strings.Contains(s, "unauthorized") ||
-		strings.Contains(s, "authorization required") || // mcp-go's phrasing for a 401
-		strings.Contains(s, "invalid_token") ||
-		strings.Contains(s, "invalid access token")
+	if errors.Is(err, transport.ErrAuthorizationRequired) ||
+		errors.Is(err, transport.ErrOAuthAuthorizationRequired) {
+		return true
+	}
+	// Fallback for the known mcp-go 401 phrasing only, in case an intermediate
+	// layer flattens the error chain and just the sentinel's text survives.
+	// Exact matches, so tool-level error text containing these words inside a
+	// longer message can never trip it.
+	s := strings.TrimSpace(strings.ToLower(err.Error()))
+	return s == "authorization required" ||
+		s == "no valid token available, authorization required"
 }
 
 // dial opens a fresh MCP client to the upstream using the CURRENT token, and
@@ -81,8 +103,11 @@ func (u *Upstream) dial(ctx context.Context) (*upstreamConnection, error) {
 			}
 		}
 	}
-	responseLimiter := newUpstreamResponseLimiter(http.DefaultTransport)
-	httpClient := &http.Client{Transport: responseLimiter}
+	responseLimiter := newUpstreamResponseLimiter(newUpstreamTransport())
+	httpClient := &http.Client{
+		Transport:     responseLimiter,
+		CheckRedirect: upstreamoauth.CheckUpstreamRedirect,
+	}
 	c, err := client.NewStreamableHttpClient(
 		u.URL,
 		transport.WithHTTPHeaders(headers),

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -87,6 +88,32 @@ func TestConnectorFilteringBareVsPrefixed(t *testing.T) {
 	want := []string{"linear__get_issue", "notion__search"}
 	if got := connectorNames(t, g, "work"); !eq(got, want) {
 		t.Fatalf("connector tools = %v, want %v", got, want)
+	}
+}
+
+func TestReadOnlyGovernanceFailsClosedWhenAppliedToWriteTool(t *testing.T) {
+	g := newConnectorTestGateway(t, map[string][]string{
+		"linear": {"get_issue", "save_issue"},
+	})
+	ctx := context.Background()
+	account, ok := g.store.Account("linear")
+	if !ok {
+		t.Fatal("account missing")
+	}
+	account.ToolOverrides = map[string]ToolOverride{
+		"save_issue": {GovernancePreset: GovernancePresetReadOnly},
+	}
+	if err := g.store.Upsert(ctx, account); err != nil {
+		t.Fatalf("persist governance profile: %v", err)
+	}
+	if count := g.Aggregate(ctx); count != 1 {
+		t.Fatalf("aggregate count = %d, want only get_issue", count)
+	}
+	g.mu.Lock()
+	names := append([]string(nil), g.byAcct["linear"]...)
+	g.mu.Unlock()
+	if !eq(names, []string{"linear__get_issue"}) {
+		t.Fatalf("read-only profile leaked write tool: %v", names)
 	}
 }
 
@@ -283,8 +310,11 @@ func TestConnectorEpochLifecycle(t *testing.T) {
 	ctx := context.Background()
 	g.Aggregate(ctx)
 
-	var revoked []string
-	g.SetTokenRevoker(func(path string) { revoked = append(revoked, path) })
+	type revocation struct{ path, epoch string }
+	var revoked []revocation
+	g.SetTokenEpochRevoker(func(path, epoch string) {
+		revoked = append(revoked, revocation{path: path, epoch: epoch})
+	})
 
 	if _, ok := g.ConnectorEpoch("team"); ok {
 		t.Fatal("nonexistent connector must not resolve an epoch (pre-authorization)")
@@ -311,8 +341,8 @@ func TestConnectorEpochLifecycle(t *testing.T) {
 	if _, ok := g.ConnectorEpoch("team"); ok {
 		t.Fatal("deleted connector must not resolve an epoch")
 	}
-	if len(revoked) != 1 || revoked[0] != "/mcp/team" {
-		t.Fatalf("delete must revoke refresh grants for /mcp/team, got %v", revoked)
+	if len(revoked) != 1 || revoked[0].path != "/mcp/team" || revoked[0].epoch != e1 {
+		t.Fatalf("delete must revoke the retiring epoch for /mcp/team, got %v", revoked)
 	}
 
 	// Recreating the slug mints a DIFFERENT epoch — old tokens stay dead.
@@ -477,5 +507,113 @@ func TestRefreshAccountCannotPersistIntoReplacementIncarnation(t *testing.T) {
 	if !ok || replacement.IncarnationID == first.IncarnationID || replacement.AuthMode != "token" ||
 		replacement.BearerToken != "replacement-secret" || replacement.AccessToken != "" || replacement.RefreshToken != "" {
 		t.Fatalf("stale refresh mutated replacement: %+v, ok=%v", replacement, ok)
+	}
+}
+
+func TestNamespaceDropsToolsCachedAtPreMoveRevision(t *testing.T) {
+	ctx := context.Background()
+	g := newConnectorTestGateway(t, map[string][]string{"notion": {"search"}})
+	if count := g.Aggregate(ctx); count != 1 {
+		t.Fatalf("aggregate count = %d, want 1", count)
+	}
+	if _, err := g.CreateNamespace(ctx, Namespace{Slug: "bundle", Accounts: []string{"notion"}}); err != nil {
+		t.Fatalf("create namespace: %v", err)
+	}
+	if got := connectorNames(t, g, "bundle"); !eq(got, []string{"notion__search"}) {
+		t.Fatalf("initial namespace tools = %v, want [notion__search]", got)
+	}
+
+	// An ownership-only move bumps the account revision without touching the
+	// incarnation or URL. Before the next aggregation the cached tools still
+	// carry the pre-move revision, so the namespace rebuild must skip them.
+	target, err := g.store.(*FileStore).CreateConnectionNamespace(ctx, ConnectionNamespace{Label: "Target"})
+	if err != nil {
+		t.Fatalf("create target namespace: %v", err)
+	}
+	account, ok := g.store.Account("notion")
+	if !ok {
+		t.Fatal("account missing")
+	}
+	moved, err := g.store.(*FileStore).MoveAccountToConnectionNamespace(ctx, account.Name, account.IncarnationID, AccountConnectionAssignment{
+		ConnectionNamespaceID: target.ID, Scope: ConnectionScopeShared,
+	}, account.Revision)
+	if err != nil {
+		t.Fatalf("move account: %v", err)
+	}
+	if moved.Revision != account.Revision+1 {
+		t.Fatalf("test requires a revision bump: before=%d after=%d", account.Revision, moved.Revision)
+	}
+
+	g.RefreshConnectors(ctx)
+	if got := connectorNames(t, g, "bundle"); len(got) != 0 {
+		t.Fatalf("namespace still lists pre-move revision tools: %v", got)
+	}
+}
+
+// TestRefreshAccountCannotOverwriteConcurrentReauthorization interleaves an
+// in-flight refreshAccount (blocked inside the token endpoint call, holding
+// the per-account lock) with a user completing reauthorization. The completion
+// must queue behind the refresh, and the final stored credentials must be the
+// reauthorization's — without the shared lock, the refresh's stale token
+// family committed last and silently killed the freshly-reconnected account.
+func TestRefreshAccountCannotOverwriteConcurrentReauthorization(t *testing.T) {
+	ctx := context.Background()
+	g := newConnectorTestGateway(t, map[string][]string{"notion": {}})
+	first, _ := g.store.Account("notion")
+	first.URL = "https://notion.example/mcp"
+	first.AuthMode = "oauth"
+	first.ClientID = "client-a"
+	first.AccessToken = "old-access"
+	first.RefreshToken = "old-refresh"
+	first.TokenEndpoint = "https://notion.example/token"
+	if err := g.store.Upsert(ctx, first); err != nil {
+		t.Fatalf("seed OAuth account: %v", err)
+	}
+	first, _ = g.store.Account(first.Name)
+
+	refreshEntered := make(chan struct{})
+	releaseRefresh := make(chan struct{})
+	g.refreshTokens = func(context.Context, *upstreamoauth.Metadata, string, string, string) (*upstreamoauth.Tokens, error) {
+		close(refreshEntered)
+		<-releaseRefresh
+		return &upstreamoauth.Tokens{AccessToken: "stale-access", RefreshToken: "stale-refresh"}, nil
+	}
+
+	refreshDone := make(chan error, 1)
+	go func() { refreshDone <- g.refreshAccount(ctx, first.Name, first.IncarnationID) }()
+	<-refreshEntered // the refresh now holds the per-account lock
+
+	reauthDone := make(chan error, 1)
+	go func() {
+		_, err := g.CompleteOAuthLocked(ctx, oauthCompletionPreconditionForAccount(first), Account{
+			Name: first.Name, ClientID: "client-a",
+			AccessToken: "reauth-access", RefreshToken: "reauth-refresh",
+		})
+		reauthDone <- err
+	}()
+
+	// While the refresh holds the lock the completion cannot commit. FileStore
+	// commits in well under this window, so an early return here means the
+	// lock is not shared.
+	select {
+	case err := <-reauthDone:
+		t.Fatalf("reauthorization committed while a refresh held the account lock: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(releaseRefresh)
+	if err := <-refreshDone; err != nil {
+		t.Fatalf("refreshAccount: %v", err)
+	}
+	if err := <-reauthDone; err != nil {
+		t.Fatalf("CompleteOAuthLocked: %v", err)
+	}
+
+	got, ok := g.store.Account(first.Name)
+	if !ok {
+		t.Fatal("account missing after reauthorization")
+	}
+	if got.AccessToken != "reauth-access" || got.RefreshToken != "reauth-refresh" {
+		t.Fatalf("stale refresh overwrote the reauthorization's credentials: %+v", got)
 	}
 }

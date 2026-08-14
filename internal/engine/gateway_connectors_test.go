@@ -90,6 +90,32 @@ func TestConnectorFilteringBareVsPrefixed(t *testing.T) {
 	}
 }
 
+func TestReadOnlyGovernanceFailsClosedWhenAppliedToWriteTool(t *testing.T) {
+	g := newConnectorTestGateway(t, map[string][]string{
+		"linear": {"get_issue", "save_issue"},
+	})
+	ctx := context.Background()
+	account, ok := g.store.Account("linear")
+	if !ok {
+		t.Fatal("account missing")
+	}
+	account.ToolOverrides = map[string]ToolOverride{
+		"save_issue": {GovernancePreset: GovernancePresetReadOnly},
+	}
+	if err := g.store.Upsert(ctx, account); err != nil {
+		t.Fatalf("persist governance profile: %v", err)
+	}
+	if count := g.Aggregate(ctx); count != 1 {
+		t.Fatalf("aggregate count = %d, want only get_issue", count)
+	}
+	g.mu.Lock()
+	names := append([]string(nil), g.byAcct["linear"]...)
+	g.mu.Unlock()
+	if !eq(names, []string{"linear__get_issue"}) {
+		t.Fatalf("read-only profile leaked write tool: %v", names)
+	}
+}
+
 func TestSameProviderAccountsKeepDistinctToolNamespaces(t *testing.T) {
 	g := newConnectorTestGateway(t, map[string][]string{
 		"notion_work":     {"search", "fetch"},
@@ -283,8 +309,11 @@ func TestConnectorEpochLifecycle(t *testing.T) {
 	ctx := context.Background()
 	g.Aggregate(ctx)
 
-	var revoked []string
-	g.SetTokenRevoker(func(path string) { revoked = append(revoked, path) })
+	type revocation struct{ path, epoch string }
+	var revoked []revocation
+	g.SetTokenEpochRevoker(func(path, epoch string) {
+		revoked = append(revoked, revocation{path: path, epoch: epoch})
+	})
 
 	if _, ok := g.ConnectorEpoch("team"); ok {
 		t.Fatal("nonexistent connector must not resolve an epoch (pre-authorization)")
@@ -311,8 +340,8 @@ func TestConnectorEpochLifecycle(t *testing.T) {
 	if _, ok := g.ConnectorEpoch("team"); ok {
 		t.Fatal("deleted connector must not resolve an epoch")
 	}
-	if len(revoked) != 1 || revoked[0] != "/mcp/team" {
-		t.Fatalf("delete must revoke refresh grants for /mcp/team, got %v", revoked)
+	if len(revoked) != 1 || revoked[0].path != "/mcp/team" || revoked[0].epoch != e1 {
+		t.Fatalf("delete must revoke the retiring epoch for /mcp/team, got %v", revoked)
 	}
 
 	// Recreating the slug mints a DIFFERENT epoch — old tokens stay dead.
@@ -477,5 +506,45 @@ func TestRefreshAccountCannotPersistIntoReplacementIncarnation(t *testing.T) {
 	if !ok || replacement.IncarnationID == first.IncarnationID || replacement.AuthMode != "token" ||
 		replacement.BearerToken != "replacement-secret" || replacement.AccessToken != "" || replacement.RefreshToken != "" {
 		t.Fatalf("stale refresh mutated replacement: %+v, ok=%v", replacement, ok)
+	}
+}
+
+func TestNamespaceDropsToolsCachedAtPreMoveRevision(t *testing.T) {
+	ctx := context.Background()
+	g := newConnectorTestGateway(t, map[string][]string{"notion": {"search"}})
+	if count := g.Aggregate(ctx); count != 1 {
+		t.Fatalf("aggregate count = %d, want 1", count)
+	}
+	if _, err := g.CreateNamespace(ctx, Namespace{Slug: "bundle", Accounts: []string{"notion"}}); err != nil {
+		t.Fatalf("create namespace: %v", err)
+	}
+	if got := connectorNames(t, g, "bundle"); !eq(got, []string{"notion__search"}) {
+		t.Fatalf("initial namespace tools = %v, want [notion__search]", got)
+	}
+
+	// An ownership-only move bumps the account revision without touching the
+	// incarnation or URL. Before the next aggregation the cached tools still
+	// carry the pre-move revision, so the namespace rebuild must skip them.
+	target, err := g.store.(*FileStore).CreateConnectionNamespace(ctx, ConnectionNamespace{Label: "Target"})
+	if err != nil {
+		t.Fatalf("create target namespace: %v", err)
+	}
+	account, ok := g.store.Account("notion")
+	if !ok {
+		t.Fatal("account missing")
+	}
+	moved, err := g.store.(*FileStore).MoveAccountToConnectionNamespace(ctx, account.Name, account.IncarnationID, AccountConnectionAssignment{
+		ConnectionNamespaceID: target.ID, Scope: ConnectionScopeShared,
+	}, account.Revision)
+	if err != nil {
+		t.Fatalf("move account: %v", err)
+	}
+	if moved.Revision != account.Revision+1 {
+		t.Fatalf("test requires a revision bump: before=%d after=%d", account.Revision, moved.Revision)
+	}
+
+	g.RefreshConnectors(ctx)
+	if got := connectorNames(t, g, "bundle"); len(got) != 0 {
+		t.Fatalf("namespace still lists pre-move revision tools: %v", got)
 	}
 }

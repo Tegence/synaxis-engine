@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"narthex/backend/internal/oauthas"
 )
 
 func TestEnginePostgresPoolConfigIsCapacityBounded(t *testing.T) {
@@ -112,6 +114,115 @@ func TestPgStoreTokenGenerationPersistsAndUsesCASRotation(t *testing.T) {
 	}
 	if generation != "generation-two" {
 		t.Fatalf("rotated generation did not persist: %q", generation)
+	}
+}
+
+func TestPgStoreOAuthGrantStateSurvivesRestartAndConsumesCodesOnce(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("set TEST_DATABASE_URL to run the Postgres integration test")
+	}
+	ctx := context.Background()
+	first, err := NewPgStore(ctx, dsn)
+	if err != nil {
+		t.Fatalf("NewPgStore: %v", err)
+	}
+	defer first.Close()
+	for _, table := range []string{
+		"narthex_oauth_authorization_codes",
+		"narthex_oauth_refresh_grants",
+		"narthex_oauth_hosted_consent_replays",
+	} {
+		if _, err := first.pool.Exec(ctx, "DELETE FROM "+table); err != nil {
+			t.Fatalf("reset %s: %v", table, err)
+		}
+	}
+	defer func() {
+		for _, table := range []string{
+			"narthex_oauth_authorization_codes",
+			"narthex_oauth_refresh_grants",
+			"narthex_oauth_hosted_consent_replays",
+		} {
+			_, _ = first.pool.Exec(context.Background(), "DELETE FROM "+table)
+		}
+	}()
+
+	now := time.Date(2026, time.August, 9, 12, 0, 0, 0, time.UTC)
+	code := oauthas.DurableAuthorizationCode{
+		TokenHash: "pg-code-hash-that-is-long-enough-to-be-a-digest-0001",
+		ClientID:  "client-1", RedirectURI: "https://client.example/callback",
+		Challenge: "challenge", Scope: "mcp", Resource: "/mcp/team",
+		ResourceEpoch: "team-v1", Generation: "workspace-v1", ExpiresAt: now.Add(time.Minute),
+	}
+	if err := first.StoreAuthorizationCode(ctx, code); err != nil {
+		t.Fatalf("StoreAuthorizationCode: %v", err)
+	}
+
+	second, err := NewPgStore(ctx, dsn)
+	if err != nil {
+		t.Fatalf("NewPgStore after restart: %v", err)
+	}
+	defer second.Close()
+	got, found, err := second.ConsumeAuthorizationCode(ctx, code.TokenHash, now)
+	if err != nil || !found || got.ClientID != code.ClientID || got.ResourceEpoch != code.ResourceEpoch {
+		t.Fatalf("durable code consume = %+v found=%v err=%v", got, found, err)
+	}
+	if _, found, err := first.ConsumeAuthorizationCode(ctx, code.TokenHash, now); err != nil || found {
+		t.Fatalf("authorization code replay found=%v err=%v", found, err)
+	}
+
+	refresh := oauthas.DurableRefreshGrant{
+		TokenHash: "pg-refresh-hash-that-is-long-enough-to-be-a-digest-01",
+		ClientID:  "client-1", Resource: "/mcp/team", ResourceEpoch: "team-v1",
+		Generation: "workspace-v1", ExpiresAt: now.Add(time.Hour),
+	}
+	replacementRefresh := oauthas.DurableRefreshGrant{
+		TokenHash: "pg-replacement-refresh-hash-long-enough-digest-002",
+		ClientID:  "client-1", Resource: "/mcp/team", ResourceEpoch: "team-v2",
+		Generation: "workspace-v1", ExpiresAt: now.Add(time.Hour),
+	}
+	if err := first.StoreRefreshGrant(ctx, refresh); err != nil {
+		t.Fatalf("StoreRefreshGrant: %v", err)
+	}
+	if err := first.StoreRefreshGrant(ctx, replacementRefresh); err != nil {
+		t.Fatalf("StoreRefreshGrant replacement: %v", err)
+	}
+	if got, found, err := second.LoadRefreshGrant(ctx, refresh.TokenHash, now); err != nil || !found || got.Generation != refresh.Generation {
+		t.Fatalf("durable refresh = %+v found=%v err=%v", got, found, err)
+	}
+
+	reserved, err := first.ReserveHostedConsentReplay(
+		ctx,
+		"pg-reservation-opaque-identifier",
+		"approval:pg-opaque-jti-0001",
+		"request:pg-opaque-request-hash-0001",
+		now.Add(time.Minute),
+		now,
+	)
+	if err != nil || !reserved {
+		t.Fatalf("ReserveHostedConsentReplay = %v, %v", reserved, err)
+	}
+	if reserved, err := second.ReserveHostedConsentReplay(
+		ctx,
+		"pg-second-reservation-opaque-id",
+		"approval:pg-opaque-jti-0001",
+		"request:pg-other-request-hash-0001",
+		now.Add(time.Minute),
+		now,
+	); err != nil || reserved {
+		t.Fatalf("replayed consent reservation = %v, %v", reserved, err)
+	}
+	if err := second.FinalizeHostedConsentReplay(ctx, "pg-reservation-opaque-identifier"); err != nil {
+		t.Fatalf("FinalizeHostedConsentReplay: %v", err)
+	}
+	if err := second.RevokeOAuthGrantsForResourceEpoch(ctx, "/mcp/team", "team-v1"); err != nil {
+		t.Fatalf("RevokeOAuthGrantsForResourceEpoch: %v", err)
+	}
+	if _, found, err := first.LoadRefreshGrant(ctx, refresh.TokenHash, now); err != nil || found {
+		t.Fatalf("resource-revoked refresh found=%v err=%v", found, err)
+	}
+	if _, found, err := first.LoadRefreshGrant(ctx, replacementRefresh.TokenHash, now); err != nil || !found {
+		t.Fatalf("replacement-epoch refresh found=%v err=%v", found, err)
 	}
 }
 
@@ -506,6 +617,74 @@ VALUES ($1,'PG Connection Namespace Legacy','https://legacy.example/mcp','token'
 	}
 }
 
+func TestPgStoreUpsertOwnsRevisionMonotonicity(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("set TEST_DATABASE_URL to run the Postgres integration test")
+	}
+	ctx := context.Background()
+	store, err := NewPgStore(ctx, dsn)
+	if err != nil {
+		t.Fatalf("NewPgStore: %v", err)
+	}
+	defer store.Close()
+	const accountName = "pg_upsert_revision_acme"
+	cleanup := func() {
+		_, _ = store.pool.Exec(ctx, `DELETE FROM narthex_accounts WHERE name=$1`, accountName)
+		_, _ = store.pool.Exec(ctx, `DELETE FROM narthex_connection_namespaces WHERE slug IN ('pg-upsert-revision-source','pg-upsert-revision-target')`)
+	}
+	cleanup()
+	defer cleanup()
+
+	source, err := store.CreateConnectionNamespace(ctx, ConnectionNamespace{Label: "PG Upsert Revision Source"})
+	if err != nil {
+		t.Fatalf("create source namespace: %v", err)
+	}
+	target, err := store.CreateConnectionNamespace(ctx, ConnectionNamespace{Label: "PG Upsert Revision Target"})
+	if err != nil {
+		t.Fatalf("create target namespace: %v", err)
+	}
+
+	// The create path still honors an explicit positive revision.
+	if err := store.Upsert(ctx, Account{
+		Name: accountName, Group: source.Label,
+		ConnectionNamespaceID: source.ID, ConnectionScope: ConnectionScopeShared,
+		URL: "https://acme.example/mcp", AuthMode: "token", BearerToken: "secret",
+		Revision: 3,
+	}); err != nil {
+		t.Fatalf("create via Upsert: %v", err)
+	}
+	created, ok := store.Account(accountName)
+	if !ok || created.Revision != 3 {
+		t.Fatalf("create honoring explicit revision = %+v, want Revision 3", created)
+	}
+
+	// A caller-supplied regression is ignored: unchanged ownership preserves 3.
+	stale := created
+	stale.Revision = 1
+	stale.Label = "Renamed"
+	if err := store.Upsert(ctx, stale); err != nil {
+		t.Fatalf("update via Upsert: %v", err)
+	}
+	after, _ := store.Account(accountName)
+	if after.Revision != 3 || after.Label != "Renamed" {
+		t.Fatalf("caller-supplied revision regressed the row: %+v", after)
+	}
+
+	// An ownership change bumps from the locked prior row, not the caller's value.
+	moved := after
+	moved.Revision = 1
+	moved.ConnectionNamespaceID = target.ID
+	moved.Group = target.Label
+	if err := store.Upsert(ctx, moved); err != nil {
+		t.Fatalf("ownership move via Upsert: %v", err)
+	}
+	afterMove, _ := store.Account(accountName)
+	if afterMove.Revision != 4 || afterMove.ConnectionNamespaceID != target.ID {
+		t.Fatalf("ownership move revision = %+v, want Revision 4 in target namespace", afterMove)
+	}
+}
+
 func TestPgStoreNamespacesPersistCascadeAndShareSlugDomain(t *testing.T) {
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
@@ -769,7 +948,8 @@ func TestPgStoreEncryption(t *testing.T) {
 		t.Fatal("plaintext leaked into the column")
 	}
 	// legacy plaintext (no prefix) passes through
-	if c.Decrypt("legacy-plain") != "legacy-plain" {
+	legacy, err := c.Decrypt("legacy-plain")
+	if err != nil || legacy != "legacy-plain" {
 		t.Fatal("legacy plaintext not passed through")
 	}
 }

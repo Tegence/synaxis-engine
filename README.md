@@ -81,8 +81,10 @@ docker run --rm -p 8080:8080 \
   synaxis-engine
 ```
 
-Use `DATABASE_URL` and `ENGINE_ENCRYPTION_KEY` for a durable deployment. Do not
-expose development credentials.
+Use `DATABASE_URL` and `ENGINE_ENCRYPTION_KEY` for a durable deployment. A
+Platform-managed Engine (`SYNAXIS_WORKSPACE_ID`) refuses to start without an
+encryption key; self-hosted development may omit it only for disposable local
+data. Do not expose development credentials.
 
 ## Health and control access
 
@@ -459,7 +461,7 @@ The complete example is in [`.env.example`](.env.example). Important values:
 | `SYNAXIS_ADMIN_TOKEN` | Optional trusted control-plane credential |
 | `SYNAXIS_ENABLE_LEGACY_ADMIN` | Enables password-bearing `/admin/*` compatibility forms; defaults to `false`, hosted engines force `false` |
 | `DATABASE_URL` | Optional Postgres connection string |
-| `ENGINE_ENCRYPTION_KEY` | Base64 32-byte AES-GCM key for stored secrets |
+| `ENGINE_ENCRYPTION_KEY` | Base64 32-byte AES-GCM key for stored secrets; required when `SYNAXIS_WORKSPACE_ID` is set |
 | `CONSOLE_URL` | Browser destination after upstream OAuth |
 | `CONSOLE_ORIGIN` | Allowed browser origins for the legacy direct console |
 

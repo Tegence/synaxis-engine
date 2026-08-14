@@ -341,3 +341,35 @@ func TestConnectorAPIGuardrailValidation(t *testing.T) {
 		t.Fatalf("rejected PUT mutated redact: %v", list[0]["redact"])
 	}
 }
+
+func TestReservedEndpointSlugRejected(t *testing.T) {
+	mux, tok, _ := newConnectorConsole(t, map[string][]string{
+		"linear": {"get_issue"},
+	})
+
+	// Connector: explicit slug, and a label that slugifies to the reserved word.
+	rec, got := doJSON(t, mux, tok, http.MethodPost, "/api/connectors",
+		`{"slug":"clients","label":"Clients","tools":{"linear":["get_issue"]}}`)
+	if msg, _ := got["error"].(string); rec.Code != http.StatusBadRequest || msg != "that slug is reserved" {
+		t.Fatalf("connector with reserved slug = %d %v, want 400 reserved", rec.Code, got)
+	}
+	rec, got = doJSON(t, mux, tok, http.MethodPost, "/api/connectors",
+		`{"label":"Clients","tools":{"linear":["get_issue"]}}`)
+	if msg, _ := got["error"].(string); rec.Code != http.StatusBadRequest || msg != "that slug is reserved" {
+		t.Fatalf("connector with label-derived reserved slug = %d %v, want 400 reserved", rec.Code, got)
+	}
+
+	// Endpoint bundle: same reservation.
+	rec, got = doJSON(t, mux, tok, http.MethodPost, "/api/endpoints",
+		`{"slug":"clients","label":"Clients","members":["linear"]}`)
+	if msg, _ := got["error"].(string); rec.Code != http.StatusBadRequest || msg != "that slug is reserved" {
+		t.Fatalf("endpoint bundle with reserved slug = %d %v, want 400 reserved", rec.Code, got)
+	}
+
+	// A neighboring slug is unaffected.
+	rec, _ = doJSON(t, mux, tok, http.MethodPost, "/api/connectors",
+		`{"slug":"client_tools","label":"Client Tools","tools":{"linear":["get_issue"]}}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("non-reserved slug = %d, body %s", rec.Code, rec.Body)
+	}
+}

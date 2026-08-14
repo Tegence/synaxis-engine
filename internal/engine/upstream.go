@@ -19,6 +19,7 @@ import (
 	"github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/client/transport"
 	"github.com/mark3labs/mcp-go/mcp"
+	"narthex/backend/internal/upstreamoauth"
 )
 
 // Upstream is one connected backend account (e.g. "tegence_notion").
@@ -44,6 +45,14 @@ type Upstream struct {
 type upstreamConnection struct {
 	client    *client.Client
 	responses *upstreamResponseLimiter
+}
+
+// newUpstreamTransport is kept as a package-private test seam because the
+// streamable-MCP test servers run on loopback. Production always uses the
+// hardened direct transport, and response limiting wraps it below rather than
+// replacing it.
+var newUpstreamTransport = func() http.RoundTripper {
+	return upstreamoauth.NewHardenedTransport()
 }
 
 func isUnauthorized(err error) bool {
@@ -81,8 +90,11 @@ func (u *Upstream) dial(ctx context.Context) (*upstreamConnection, error) {
 			}
 		}
 	}
-	responseLimiter := newUpstreamResponseLimiter(http.DefaultTransport)
-	httpClient := &http.Client{Transport: responseLimiter}
+	responseLimiter := newUpstreamResponseLimiter(newUpstreamTransport())
+	httpClient := &http.Client{
+		Transport:     responseLimiter,
+		CheckRedirect: upstreamoauth.CheckUpstreamRedirect,
+	}
 	c, err := client.NewStreamableHttpClient(
 		u.URL,
 		transport.WithHTTPHeaders(headers),

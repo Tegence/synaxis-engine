@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"narthex/backend/internal/ratelimit"
 	"narthex/backend/internal/upstreamoauth"
 )
 
@@ -52,6 +53,23 @@ type ConsoleAPI struct {
 	selfURL          string   // engine's own public base (issuer)
 	consoleURL       string   // where to bounce the browser after OAuth
 	origins          []string // CORS allowlist (comma-separated CONSOLE_ORIGIN)
+	// readinessCheck verifies the durable store backing this Engine. It is
+	// intentionally separate from the authenticated account-health endpoint:
+	// a readiness probe must not fan out to upstream providers or disclose
+	// provider state.
+	readinessCheck func(context.Context) error
+	// loginThrottle bounds online brute-force attempts against the shared
+	// console password. Denial is backoff-by-429, never a lockout: the engine
+	// is single-user by design and the administrator must not be lockable.
+	loginThrottle *ratelimit.Limiter
+	// trustProxyHeaders switches loginThrottle's key from RemoteAddr to the
+	// trusted last hop of X-Forwarded-For. See WithTrustProxyHeaders: this
+	// must only be enabled behind an operator-controlled reverse proxy.
+	trustProxyHeaders bool
+	// lifecycleCtx is cancelled before graceful HTTP shutdown begins. /readyz
+	// uses it to stop advertising a draining Engine as ready while /healthz
+	// remains the small process-liveness probe.
+	lifecycleCtx context.Context
 }
 
 // ConsoleOption configures optional management API behavior without forcing
@@ -84,6 +102,26 @@ func WithLocalAdminAuth(enabled bool) ConsoleOption {
 	}
 }
 
+// WithTrustProxyHeaders switches the login-throttle rate-limit key from
+// r.RemoteAddr to the last entry of a present X-Forwarded-For header (see
+// ratelimit.ClientIP). Leaving it disabled (the default) preserves the
+// original RemoteAddr-only behavior.
+//
+// Enable this ONLY when the Engine sits directly behind exactly one
+// reverse-proxy hop the operator controls (nginx, Caddy, Traefik, Cloudflare
+// Tunnel, ...). The Engine binary has no TLS of its own, so a self-hosted
+// deployment almost always runs behind such a proxy — without this option,
+// every request's RemoteAddr is the proxy's own fixed address, so every real
+// client shares one rate-limit bucket and a single attacker can exhaust it to
+// lock out the legitimate administrator. Enabling it when the Engine is
+// otherwise directly reachable, or behind more than one untrusted hop, lets
+// an attacker spoof X-Forwarded-For to pick their own rate-limit key instead.
+func WithTrustProxyHeaders(enabled bool) ConsoleOption {
+	return func(c *ConsoleAPI) {
+		c.trustProxyHeaders = enabled
+	}
+}
+
 // WithPlatformActorVerifier enables the hosted Platform-to-Engine identity
 // boundary. When configured, every protected management request must present
 // both the Engine machine token and a valid request-bound Platform assertion.
@@ -110,6 +148,29 @@ func WithUsageGate(gate *UsageGate) ConsoleOption {
 	}
 }
 
+// WithReadinessCheck configures the bounded durable-store check performed by
+// the public /readyz probe. A nil check preserves the lightweight local test
+// and embedded-server behavior; production supplies a query against the
+// token-generation store, which also verifies Postgres connectivity.
+func WithReadinessCheck(check func(context.Context) error) ConsoleOption {
+	return func(c *ConsoleAPI) {
+		c.readinessCheck = check
+	}
+}
+
+// WithLifecycleContext lets /readyz report an Engine as unavailable as soon
+// as shutdown begins. Passing nil deliberately behaves like an uncancelled
+// context so option callers cannot accidentally make a newly-created API
+// permanently unready.
+func WithLifecycleContext(ctx context.Context) ConsoleOption {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return func(c *ConsoleAPI) {
+		c.lifecycleCtx = ctx
+	}
+}
+
 func NewConsoleAPI(store AccountStore, gw *Gateway, conn *Connector, password, secret, selfURL, consoleURL, origin string, options ...ConsoleOption) *ConsoleAPI {
 	var origins []string
 	for _, o := range strings.Split(origin, ",") {
@@ -126,7 +187,8 @@ func NewConsoleAPI(store AccountStore, gw *Gateway, conn *Connector, password, s
 	triage, _ := store.(AuditTriage)
 	api := &ConsoleAPI{
 		store: store, connStore: connStore, nsStore: nsStore, apprLog: apprLog, audit: audit, triage: triage, gw: gw, conn: conn, passwordDigest: sha256.Sum256([]byte(password)), secret: []byte(secret),
-		selfURL: strings.TrimRight(selfURL, "/"), consoleURL: strings.TrimRight(consoleURL, "/"), origins: origins, localAdminAuth: true,
+		selfURL: strings.TrimRight(selfURL, "/"), consoleURL: strings.TrimRight(consoleURL, "/"), origins: origins, localAdminAuth: true, lifecycleCtx: context.Background(),
+		loginThrottle: ratelimit.New(10, 5*time.Minute),
 	}
 	for _, option := range options {
 		if option != nil {
@@ -204,10 +266,11 @@ func (c *ConsoleAPI) Routes(mux *http.ServeMux) {
 			fn(w, authorized)
 		}
 	}
-	// Deliberately separate from /api/health: these public probes report only
-	// process readiness and never expose account or upstream health details.
-	mux.HandleFunc("/healthz", pub(c.handleProbe))
-	mux.HandleFunc("/readyz", pub(c.handleProbe))
+	// Deliberately separate from /api/health: these public probes never expose
+	// account or upstream health details. /healthz is process liveness, while
+	// /readyz verifies the durable store and refuses traffic during draining.
+	mux.HandleFunc("/healthz", pub(c.handleLiveness))
+	mux.HandleFunc("/readyz", pub(c.handleReadiness))
 	mux.HandleFunc("/api/auth", pub(c.handleAuthStatus))
 	if c.localAdminAuth {
 		mux.HandleFunc("/api/login", pub(c.handleLogin))
@@ -517,6 +580,10 @@ func (c *ConsoleAPI) handleConnectors(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "slug must contain letters or numbers"})
 			return
 		}
+		if reservedEndpointSlugs[slug] {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "that slug is reserved"})
+			return
+		}
 		if msg, ok := c.validateConnectorTools(req.Tools); !ok {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": msg})
 			return
@@ -778,6 +845,10 @@ func (c *ConsoleAPI) handleNamespaces(w http.ResponseWriter, r *http.Request) {
 		}
 		if slug == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "slug must contain letters or numbers"})
+			return
+		}
+		if reservedEndpointSlugs[slug] {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "that slug is reserved"})
 			return
 		}
 		if msg, ok := c.validateNamespaceAccounts(req.Members); !ok {
@@ -1188,6 +1259,14 @@ func (c *ConsoleAPI) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (c *ConsoleAPI) handleLogin(w http.ResponseWriter, r *http.Request) {
+	// Throttle by RemoteAddr host by default, so the limit cannot be bypassed
+	// by spoofing X-Forwarded-For. WithTrustProxyHeaders opts into keying on
+	// the trusted last X-Forwarded-For hop instead, for deployments behind an
+	// operator-controlled reverse proxy where RemoteAddr is always the proxy.
+	if !c.loginThrottle.Allow(ratelimit.ClientIP(r, c.trustProxyHeaders)) {
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many attempts, try again later"})
+		return
+	}
 	var req struct{ Password string }
 	_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req)
 	password := sha256.Sum256([]byte(req.Password))
@@ -1198,32 +1277,122 @@ func (c *ConsoleAPI) handleLogin(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"token": c.signToken()})
 }
 
-func (c *ConsoleAPI) handleProbe(w http.ResponseWriter, r *http.Request) {
+const readinessCheckTimeout = 2 * time.Second
+
+// beginProbe applies the common public-probe HTTP contract. It intentionally
+// runs before any readiness work so unsupported methods cannot be used to
+// trigger a store query.
+func beginProbe(w http.ResponseWriter, r *http.Request) bool {
 	w.Header().Set("Cache-Control", "no-store")
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
 		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
+		return false
 	}
+	return true
+}
+
+func writeProbe(w http.ResponseWriter, r *http.Request, statusCode int, ready bool, status string) {
 	if r.Method == http.MethodHead {
-		w.WriteHeader(http.StatusOK)
+		w.WriteHeader(statusCode)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ready":   true,
+	writeJSON(w, statusCode, map[string]any{
+		"ready":   ready,
 		"service": "synaxis-engine",
-		"status":  "ok",
+		"status":  status,
 	})
 }
 
+// handleLiveness is deliberately inexpensive: it only proves that this HTTP
+// process can answer a request. It stays independent from Postgres and from
+// the shutdown lifecycle, which lets an orchestrator distinguish a live but
+// draining or dependency-unready Engine from a dead process.
+func (c *ConsoleAPI) handleLiveness(w http.ResponseWriter, r *http.Request) {
+	if !beginProbe(w, r) {
+		return
+	}
+	writeProbe(w, r, http.StatusOK, true, "ok")
+}
+
+// readinessContext joins a request cancellation, the Engine lifecycle, and a
+// short bounded dependency check. HTTP Server.Shutdown waits for active
+// requests rather than cancelling them, so joining lifecycleCtx prevents a
+// concurrent /readyz request from returning a stale 200 after draining starts.
+func (c *ConsoleAPI) readinessContext(requestCtx context.Context) (context.Context, func()) {
+	ctx, cancelRequest := context.WithCancel(requestCtx)
+	stopLifecycle := func() bool { return false }
+	if c.lifecycleCtx != nil {
+		stopLifecycle = context.AfterFunc(c.lifecycleCtx, cancelRequest)
+	}
+	ctx, cancelTimeout := context.WithTimeout(ctx, readinessCheckTimeout)
+	return ctx, func() {
+		cancelTimeout()
+		stopLifecycle()
+		cancelRequest()
+	}
+}
+
+// handleReadiness verifies the initialized durable store when a check was
+// supplied by the Engine. Failure details are kept out of this public endpoint
+// so provisioning health probes cannot become a database-error disclosure.
+func (c *ConsoleAPI) handleReadiness(w http.ResponseWriter, r *http.Request) {
+	if !beginProbe(w, r) {
+		return
+	}
+	if c.lifecycleCtx != nil && c.lifecycleCtx.Err() != nil {
+		writeProbe(w, r, http.StatusServiceUnavailable, false, "shutting_down")
+		return
+	}
+	if c.readinessCheck != nil {
+		ctx, cancel := c.readinessContext(r.Context())
+		err := c.readinessCheck(ctx)
+		cancel()
+		// Prefer the lifecycle result in the narrow race where shutdown begins
+		// while the dependency check is returning.
+		if c.lifecycleCtx != nil && c.lifecycleCtx.Err() != nil {
+			writeProbe(w, r, http.StatusServiceUnavailable, false, "shutting_down")
+			return
+		}
+		if err != nil {
+			writeProbe(w, r, http.StatusServiceUnavailable, false, "unavailable")
+			return
+		}
+	}
+	writeProbe(w, r, http.StatusOK, true, "ok")
+}
+
+// auditPersistenceReporter is the concrete-store diagnostic facet for the
+// durable audit writer. It deliberately stays off the AuditSink interface so
+// file-backed development stores simply omit the field.
+type auditPersistenceReporter interface {
+	AuditPersistenceStats() AuditPersistenceStats
+}
+
 func (c *ConsoleAPI) handleGateway(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"connectorUrl":     c.selfURL + "/mcp",
 		"oauthCallbackUrl": c.selfURL + "/api/oauth/callback",
 		"endpoint":         "mcp",
 		"namespace":        "narthex",
 		"ready":            true,
-	})
+	}
+	// Audit drop counters make lossy-under-outage auditing visible to the
+	// console. Only counts and the static drop-reason category cross this
+	// boundary — never LastError, which can carry driver error text.
+	if reporter, ok := c.store.(auditPersistenceReporter); ok {
+		stats := reporter.AuditPersistenceStats()
+		resp["auditPersistence"] = map[string]any{
+			"enqueued":       stats.Enqueued,
+			"persisted":      stats.Persisted,
+			"dropped":        stats.Dropped,
+			"failures":       stats.Failures,
+			"retries":        stats.Retries,
+			"queueDepth":     stats.QueueDepth,
+			"lastDropReason": stats.LastDropReason,
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (c *ConsoleAPI) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -1953,6 +2122,11 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }
+
+// reservedEndpointSlugs may never name a shared connector or endpoint bundle:
+// `/mcp/clients/{slug}` is the subject-bound MCP client prefix — sharing the
+// prefix would invite routing confusion.
+var reservedEndpointSlugs = map[string]bool{"clients": true}
 
 // slugify turns "Notion Tegence" into "notion_tegence" — lowercase, non-alnum
 // collapsed to single underscores, trimmed.

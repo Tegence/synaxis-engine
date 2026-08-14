@@ -20,6 +20,7 @@ import (
 // upstream save_issue dispatches.
 func newRecorderGateway(t *testing.T) (*Gateway, *FileStore, *int32) {
 	t.Helper()
+	useLoopbackUpstreamTransport(t)
 	var saves int32
 	up := server.NewMCPServer("up", "0.0.0", server.WithToolCapabilities(true))
 	up.AddTool(mcp.NewTool("save_issue", mcp.WithDescription("mutates")),

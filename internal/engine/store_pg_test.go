@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"narthex/backend/internal/oauthas"
 )
 
 func TestEnginePostgresPoolConfigIsCapacityBounded(t *testing.T) {
@@ -112,6 +114,115 @@ func TestPgStoreTokenGenerationPersistsAndUsesCASRotation(t *testing.T) {
 	}
 	if generation != "generation-two" {
 		t.Fatalf("rotated generation did not persist: %q", generation)
+	}
+}
+
+func TestPgStoreOAuthGrantStateSurvivesRestartAndConsumesCodesOnce(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("set TEST_DATABASE_URL to run the Postgres integration test")
+	}
+	ctx := context.Background()
+	first, err := NewPgStore(ctx, dsn)
+	if err != nil {
+		t.Fatalf("NewPgStore: %v", err)
+	}
+	defer first.Close()
+	for _, table := range []string{
+		"narthex_oauth_authorization_codes",
+		"narthex_oauth_refresh_grants",
+		"narthex_oauth_hosted_consent_replays",
+	} {
+		if _, err := first.pool.Exec(ctx, "DELETE FROM "+table); err != nil {
+			t.Fatalf("reset %s: %v", table, err)
+		}
+	}
+	defer func() {
+		for _, table := range []string{
+			"narthex_oauth_authorization_codes",
+			"narthex_oauth_refresh_grants",
+			"narthex_oauth_hosted_consent_replays",
+		} {
+			_, _ = first.pool.Exec(context.Background(), "DELETE FROM "+table)
+		}
+	}()
+
+	now := time.Date(2026, time.August, 9, 12, 0, 0, 0, time.UTC)
+	code := oauthas.DurableAuthorizationCode{
+		TokenHash: "pg-code-hash-that-is-long-enough-to-be-a-digest-0001",
+		ClientID:  "client-1", RedirectURI: "https://client.example/callback",
+		Challenge: "challenge", Scope: "mcp", Resource: "/mcp/team",
+		ResourceEpoch: "team-v1", Generation: "workspace-v1", ExpiresAt: now.Add(time.Minute),
+	}
+	if err := first.StoreAuthorizationCode(ctx, code); err != nil {
+		t.Fatalf("StoreAuthorizationCode: %v", err)
+	}
+
+	second, err := NewPgStore(ctx, dsn)
+	if err != nil {
+		t.Fatalf("NewPgStore after restart: %v", err)
+	}
+	defer second.Close()
+	got, found, err := second.ConsumeAuthorizationCode(ctx, code.TokenHash, now)
+	if err != nil || !found || got.ClientID != code.ClientID || got.ResourceEpoch != code.ResourceEpoch {
+		t.Fatalf("durable code consume = %+v found=%v err=%v", got, found, err)
+	}
+	if _, found, err := first.ConsumeAuthorizationCode(ctx, code.TokenHash, now); err != nil || found {
+		t.Fatalf("authorization code replay found=%v err=%v", found, err)
+	}
+
+	refresh := oauthas.DurableRefreshGrant{
+		TokenHash: "pg-refresh-hash-that-is-long-enough-to-be-a-digest-01",
+		ClientID:  "client-1", Resource: "/mcp/team", ResourceEpoch: "team-v1",
+		Generation: "workspace-v1", ExpiresAt: now.Add(time.Hour),
+	}
+	replacementRefresh := oauthas.DurableRefreshGrant{
+		TokenHash: "pg-replacement-refresh-hash-long-enough-digest-002",
+		ClientID:  "client-1", Resource: "/mcp/team", ResourceEpoch: "team-v2",
+		Generation: "workspace-v1", ExpiresAt: now.Add(time.Hour),
+	}
+	if err := first.StoreRefreshGrant(ctx, refresh); err != nil {
+		t.Fatalf("StoreRefreshGrant: %v", err)
+	}
+	if err := first.StoreRefreshGrant(ctx, replacementRefresh); err != nil {
+		t.Fatalf("StoreRefreshGrant replacement: %v", err)
+	}
+	if got, found, err := second.LoadRefreshGrant(ctx, refresh.TokenHash, now); err != nil || !found || got.Generation != refresh.Generation {
+		t.Fatalf("durable refresh = %+v found=%v err=%v", got, found, err)
+	}
+
+	reserved, err := first.ReserveHostedConsentReplay(
+		ctx,
+		"pg-reservation-opaque-identifier",
+		"approval:pg-opaque-jti-0001",
+		"request:pg-opaque-request-hash-0001",
+		now.Add(time.Minute),
+		now,
+	)
+	if err != nil || !reserved {
+		t.Fatalf("ReserveHostedConsentReplay = %v, %v", reserved, err)
+	}
+	if reserved, err := second.ReserveHostedConsentReplay(
+		ctx,
+		"pg-second-reservation-opaque-id",
+		"approval:pg-opaque-jti-0001",
+		"request:pg-other-request-hash-0001",
+		now.Add(time.Minute),
+		now,
+	); err != nil || reserved {
+		t.Fatalf("replayed consent reservation = %v, %v", reserved, err)
+	}
+	if err := second.FinalizeHostedConsentReplay(ctx, "pg-reservation-opaque-identifier"); err != nil {
+		t.Fatalf("FinalizeHostedConsentReplay: %v", err)
+	}
+	if err := second.RevokeOAuthGrantsForResourceEpoch(ctx, "/mcp/team", "team-v1"); err != nil {
+		t.Fatalf("RevokeOAuthGrantsForResourceEpoch: %v", err)
+	}
+	if _, found, err := first.LoadRefreshGrant(ctx, refresh.TokenHash, now); err != nil || found {
+		t.Fatalf("resource-revoked refresh found=%v err=%v", found, err)
+	}
+	if _, found, err := first.LoadRefreshGrant(ctx, replacementRefresh.TokenHash, now); err != nil || !found {
+		t.Fatalf("replacement-epoch refresh found=%v err=%v", found, err)
 	}
 }
 
@@ -769,7 +880,8 @@ func TestPgStoreEncryption(t *testing.T) {
 		t.Fatal("plaintext leaked into the column")
 	}
 	// legacy plaintext (no prefix) passes through
-	if c.Decrypt("legacy-plain") != "legacy-plain" {
+	legacy, err := c.Decrypt("legacy-plain")
+	if err != nil || legacy != "legacy-plain" {
 		t.Fatal("legacy plaintext not passed through")
 	}
 }

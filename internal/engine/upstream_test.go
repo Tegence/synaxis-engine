@@ -18,7 +18,29 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"narthex/backend/internal/upstreamoauth"
 )
+
+// useLoopbackUpstreamTransport is restricted to tests that exercise local
+// httptest MCP servers. Production Upstreams always construct the hardened
+// transport; each test restores that default before it exits.
+func useLoopbackUpstreamTransport(t *testing.T) {
+	t.Helper()
+	previous := newUpstreamTransport
+	newUpstreamTransport = func() http.RoundTripper { return http.DefaultTransport }
+	t.Cleanup(func() { newUpstreamTransport = previous })
+}
+
+func TestUpstreamRejectsLoopbackByDefault(t *testing.T) {
+	upstream := &Upstream{Name: "blocked", URL: "http://127.0.0.1:65535/mcp"}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	_, err := upstream.ListTools(ctx)
+	if !errors.Is(err, upstreamoauth.ErrUnsafeOutboundAddress) {
+		t.Fatalf("loopback upstream error = %v, want ErrUnsafeOutboundAddress", err)
+	}
+}
 
 // newMockUpstream returns an MCP server (one "search" tool) fronted by a Bearer
 // check that 401s unless the presented token equals *validToken. Flipping
@@ -53,6 +75,7 @@ func newMockUpstream(t *testing.T, validToken *string, mu *sync.Mutex) *httptest
 // connection recovers — listing the tool. This is exactly what MetaMCP fails to
 // do (it refreshes the stored token but keeps the dead pooled connection).
 func TestRefreshAndRedial(t *testing.T) {
+	useLoopbackUpstreamTransport(t)
 	var mu sync.Mutex
 	valid := "TOKEN_FRESH" // the only token the upstream currently accepts
 
@@ -93,6 +116,7 @@ func TestRefreshAndRedial(t *testing.T) {
 
 // TestNoRefreshWhenHealthy: a valid token from the start needs no refresh.
 func TestNoRefreshWhenHealthy(t *testing.T) {
+	useLoopbackUpstreamTransport(t)
 	var mu sync.Mutex
 	valid := "GOOD"
 	mock := newMockUpstream(t, &valid, &mu)
@@ -206,6 +230,7 @@ func newOversizedResponseUpstream(
 }
 
 func TestUpstreamCapsResponsesBeforeJSONAndSSEDecode(t *testing.T) {
+	useLoopbackUpstreamTransport(t)
 	for _, tc := range []struct {
 		name       string
 		mediaType  string
@@ -234,6 +259,7 @@ func TestUpstreamCapsResponsesBeforeJSONAndSSEDecode(t *testing.T) {
 }
 
 func TestUpstreamBoundsCumulativePaginatedToolDiscovery(t *testing.T) {
+	useLoopbackUpstreamTransport(t)
 	upstream := server.NewMCPServer("paginated", "1.0", server.WithToolCapabilities(true))
 	streamable := server.NewStreamableHTTPServer(upstream, server.WithEndpointPath("/"))
 	description := strings.Repeat("d", int(maxUpstreamMCPResponseBytes/2)+1024)
@@ -286,6 +312,7 @@ func TestUpstreamBoundsCumulativePaginatedToolDiscovery(t *testing.T) {
 }
 
 func TestGatewayMapsPreDecodeCapToStructuredToolError(t *testing.T) {
+	useLoopbackUpstreamTransport(t)
 	mock := newOversizedResponseUpstream(t, "application/json", false)
 	defer mock.Close()
 	fileStore, err := LoadFileStore(t.TempDir() + "/accounts.json")

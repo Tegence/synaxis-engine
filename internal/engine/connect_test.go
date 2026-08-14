@@ -144,6 +144,17 @@ func TestEffectiveStaticCredsRejectsGmailClientWithoutSecret(t *testing.T) {
 	}
 }
 
+func TestValidateStaticCredsForUpstreamRejectsSlackClientWithoutSecret(t *testing.T) {
+	creds := &StaticCreds{ClientID: "slack-client-id", Scope: "channels:read chat:write"}
+	if err := validateStaticCredsForUpstream(creds, slackMCPURL); err == nil {
+		t.Fatal("expected Slack's confidential OAuth client to require a secret")
+	}
+	creds.ClientSecret = "slack-client-secret"
+	if err := validateStaticCredsForUpstream(creds, slackMCPURL); err != nil {
+		t.Errorf("validateStaticCredsForUpstream() with secret set = %v, want nil", err)
+	}
+}
+
 func TestFinishConnectMergesOAuthIntoCurrentAccountAfterMetadataAndPolicyEdits(t *testing.T) {
 	ctx := context.Background()
 	g := newConnectorTestGateway(t, map[string][]string{

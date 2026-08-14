@@ -50,9 +50,11 @@ type Gateway struct {
 	webhook         string                      // optional alert webhook URL
 	consoleURL      string                      // linked in approval webhook messages
 
-	// revokeResource, when wired (SetTokenRevoker), tells the OAuth AS to drop
-	// refresh grants for a deleted connector's resource path.
-	revokeResource func(resourcePath string)
+	// revokeResource is the legacy path-only OAuth cleanup hook. The
+	// epoch-aware hook is used in production so cleanup cannot remove grants
+	// minted for a newly recreated endpoint with the same slug.
+	revokeResource      func(resourcePath string)
+	revokeResourceEpoch func(resourcePath, retiringEpoch string)
 
 	// Flight recorder knobs (set once at startup, before serving).
 	recordDefault bool          // record payloads for calls on the default /mcp endpoint
@@ -291,6 +293,19 @@ func (g *Gateway) aggregateAccount(ctx context.Context, a Account) (int, error) 
 			continue // read-only account: mutating tools are never registered
 		}
 		override := a.ToolOverrides[bare]
+		governance, err := normalizedGovernancePreset(override.GovernancePreset)
+		if err != nil {
+			// A malformed value can exist only through an old/imported durable
+			// record. Do not turn an unrecognised safety policy into a live
+			// capability; a console edit can repair it after discovery.
+			continue
+		}
+		if governance == GovernancePresetReadOnly && !readOnlyTool(t, bare) {
+			// Read-only is an enforced contract, not an optimistic label. If an
+			// upstream changes its metadata or name after the policy was saved,
+			// fail closed until an administrator selects a suitable preset.
+			continue
+		}
 		exposedName := bare
 		if override.Alias != "" {
 			exposedName = override.Alias
@@ -312,6 +327,7 @@ func (g *Gateway) aggregateAccount(ctx context.Context, a Account) (int, error) 
 		t.Title = label + " · " + disp
 		t.Annotations.Title = t.Title
 		handler := g.accountToolHandler(a, up, bare)
+		handler = g.governedAccountToolHandler(a, bare, governance, handler)
 		names = append(names, t.Name)
 		// Cache tool + the SAME closure so connector endpoints dispatch (and
 		// audit) identically without re-dialing the upstream.
@@ -376,9 +392,10 @@ func (g *Gateway) accountToolHandler(a Account, upRef *Upstream, bareName string
 		if execution.usageErr != nil {
 			res, err = UsageToolResult(execution.usageErr), nil
 		}
-		// Response guardrails — CONNECTOR endpoints only. The default /mcp
-		// endpoint never injects an auditScope, so sc is nil there and the result
-		// passes through raw. Order matters: redact → cap → injection scan runs
+		// Response guardrails — CONNECTOR endpoints only. An account-level
+		// governance policy may add an identity-free auditScope on default /mcp,
+		// but it carries no guards, so the result still passes through raw. Order
+		// matters: redact → cap → injection scan runs
 		// BEFORE the audit row below, so recorded payloads never contain what
 		// redaction removed. Protocol errors skip guards; isError tool results are
 		// guarded like any other (their Error field isn't touched — only text).
@@ -398,7 +415,8 @@ func (g *Gateway) accountToolHandler(a Account, upRef *Upstream, bareName string
 			// This closure is shared byte-for-byte between /mcp and every
 			// connector server; the endpoint identity (connector slug, approval
 			// decision, record flag) is layered on by the scope wrapper via ctx.
-			// No scope = the default /mcp endpoint.
+			// No scope is an ordinary default /mcp call. A governed root call has
+			// a scope with an intentionally empty endpoint identity.
 			record := g.recordDefault
 			if sc := auditScopeFrom(ctx); sc != nil {
 				rec.Connector = sc.connector
@@ -517,6 +535,10 @@ type ToolInfo struct {
 	Enabled     bool   `json:"enabled"`
 	ReadOnly    bool   `json:"readOnly"`
 	Destructive bool   `json:"destructive"`
+	// GovernancePreset is empty when the account uses the backwards-compatible
+	// standard policy. Console clients can keep that legacy state explicit
+	// instead of silently tightening an existing tool on first edit.
+	GovernancePreset GovernancePreset `json:"governancePreset,omitempty"`
 }
 
 // ListAccountTools live-lists every tool an account exposes upstream, marked
@@ -546,9 +568,20 @@ func (g *Gateway) ListAccountTools(ctx context.Context, name string) ([]ToolInfo
 		if override.Description != "" {
 			description = override.Description
 		}
-		ro := t.Annotations.ReadOnlyHint != nil && *t.Annotations.ReadOnlyHint
+		// Mirror the actual aggregation check rather than exposing only an
+		// upstream annotation. A tool with no annotation can still be treated as
+		// read-only by the conservative name heuristic, and the policy console
+		// must not offer a conflicting classification.
+		ro := readOnlyTool(t, bare)
 		de := t.Annotations.DestructiveHint != nil && *t.Annotations.DestructiveHint
-		out = append(out, ToolInfo{Name: bare, Alias: override.Alias, Title: title, Description: description, Enabled: !disabled[bare], ReadOnly: ro, Destructive: de})
+		preset, err := normalizedGovernancePreset(override.GovernancePreset)
+		if err != nil {
+			// Keep the management listing available so an administrator can
+			// replace a malformed imported value. The live projection above is
+			// still fail-closed.
+			preset = ""
+		}
+		out = append(out, ToolInfo{Name: bare, Alias: override.Alias, Title: title, Description: description, Enabled: !disabled[bare], ReadOnly: ro, Destructive: de, GovernancePreset: preset})
 	}
 	return out, nil
 }

@@ -110,7 +110,10 @@ func (g *Gateway) buildConnector(vc VirtualConnector) error {
 			if !allowSet[bare] {
 				continue
 			}
-			if approvalSet[bare] {
+			preset, presetErr := normalizedGovernancePreset(
+				account.ToolOverrides[bare].GovernancePreset,
+			)
+			if approvalSet[bare] && (presetErr != nil || !preset.requiresApproval()) {
 				// require_approval: park the call for a human decision first.
 				// ct is a copy — the cached (main /mcp) handler stays unwrapped;
 				// that's safe because access tokens are bound to the endpoint
@@ -509,9 +512,14 @@ func (g *Gateway) retireEndpoint(slug, kind, generation string) {
 		delete(g.connectors, slug)
 	}
 	revoke := g.revokeResource
+	revokeEpoch := g.revokeResourceEpoch
 	g.mu.Unlock()
-	if !reused && revoke != nil {
-		revoke("/mcp/" + slug)
+	if !reused {
+		if revokeEpoch != nil && generation != "" {
+			revokeEpoch("/mcp/"+slug, generation)
+		} else if revoke != nil {
+			revoke("/mcp/" + slug)
+		}
 	}
 }
 
@@ -521,6 +529,15 @@ func (g *Gateway) retireEndpoint(slug, kind, generation string) {
 func (g *Gateway) SetTokenRevoker(fn func(resourcePath string)) {
 	g.mu.Lock()
 	g.revokeResource = fn
+	g.mu.Unlock()
+}
+
+// SetTokenEpochRevoker installs the precise revocation callback used by the
+// durable OAuth store. `retiringEpoch` is the endpoint generation removed or
+// replaced by this Gateway refresh, never the replacement's generation.
+func (g *Gateway) SetTokenEpochRevoker(fn func(resourcePath, retiringEpoch string)) {
+	g.mu.Lock()
+	g.revokeResourceEpoch = fn
 	g.mu.Unlock()
 }
 

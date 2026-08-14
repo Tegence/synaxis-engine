@@ -49,6 +49,7 @@ type StaticCreds struct {
 }
 
 const gmailMCPURL = "https://gmailmcp.googleapis.com/mcp/v1"
+const slackMCPURL = "https://mcp.slack.com/mcp"
 
 // effectiveStaticCreds preserves a pre-registered OAuth client across a
 // reauthorization. Static-client accounts persist their client ID, optional
@@ -86,13 +87,23 @@ func isGmailMCPURL(upstreamURL string) bool {
 	return strings.TrimRight(strings.TrimSpace(upstreamURL), "/") == gmailMCPURL
 }
 
+func isSlackMCPURL(upstreamURL string) bool {
+	return strings.TrimRight(strings.TrimSpace(upstreamURL), "/") == slackMCPURL
+}
+
 // validateStaticCredsForUpstream enforces requirements that are specific to a
-// first-party provider's officially supported OAuth client type. Google
-// documents Gmail's MCP connection as a confidential Web OAuth client, so an
-// empty secret must not start a flow that cannot exchange its code.
+// first-party provider's officially supported OAuth client type. Google and
+// Slack both document their MCP connection as a confidential OAuth client, so
+// an empty secret must not start a flow that cannot exchange its code.
 func validateStaticCredsForUpstream(sc *StaticCreds, upstreamURL string) error {
-	if sc != nil && isGmailMCPURL(upstreamURL) && strings.TrimSpace(sc.ClientSecret) == "" {
+	if sc == nil || strings.TrimSpace(sc.ClientSecret) != "" {
+		return nil
+	}
+	switch {
+	case isGmailMCPURL(upstreamURL):
 		return errors.New("clientSecret is required for Gmail's pre-registered OAuth app")
+	case isSlackMCPURL(upstreamURL):
+		return errors.New("clientSecret is required for Slack's pre-registered OAuth app")
 	}
 	return nil
 }

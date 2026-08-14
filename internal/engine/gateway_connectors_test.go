@@ -90,6 +90,32 @@ func TestConnectorFilteringBareVsPrefixed(t *testing.T) {
 	}
 }
 
+func TestReadOnlyGovernanceFailsClosedWhenAppliedToWriteTool(t *testing.T) {
+	g := newConnectorTestGateway(t, map[string][]string{
+		"linear": {"get_issue", "save_issue"},
+	})
+	ctx := context.Background()
+	account, ok := g.store.Account("linear")
+	if !ok {
+		t.Fatal("account missing")
+	}
+	account.ToolOverrides = map[string]ToolOverride{
+		"save_issue": {GovernancePreset: GovernancePresetReadOnly},
+	}
+	if err := g.store.Upsert(ctx, account); err != nil {
+		t.Fatalf("persist governance profile: %v", err)
+	}
+	if count := g.Aggregate(ctx); count != 1 {
+		t.Fatalf("aggregate count = %d, want only get_issue", count)
+	}
+	g.mu.Lock()
+	names := append([]string(nil), g.byAcct["linear"]...)
+	g.mu.Unlock()
+	if !eq(names, []string{"linear__get_issue"}) {
+		t.Fatalf("read-only profile leaked write tool: %v", names)
+	}
+}
+
 func TestSameProviderAccountsKeepDistinctToolNamespaces(t *testing.T) {
 	g := newConnectorTestGateway(t, map[string][]string{
 		"notion_work":     {"search", "fetch"},
@@ -283,8 +309,11 @@ func TestConnectorEpochLifecycle(t *testing.T) {
 	ctx := context.Background()
 	g.Aggregate(ctx)
 
-	var revoked []string
-	g.SetTokenRevoker(func(path string) { revoked = append(revoked, path) })
+	type revocation struct{ path, epoch string }
+	var revoked []revocation
+	g.SetTokenEpochRevoker(func(path, epoch string) {
+		revoked = append(revoked, revocation{path: path, epoch: epoch})
+	})
 
 	if _, ok := g.ConnectorEpoch("team"); ok {
 		t.Fatal("nonexistent connector must not resolve an epoch (pre-authorization)")
@@ -311,8 +340,8 @@ func TestConnectorEpochLifecycle(t *testing.T) {
 	if _, ok := g.ConnectorEpoch("team"); ok {
 		t.Fatal("deleted connector must not resolve an epoch")
 	}
-	if len(revoked) != 1 || revoked[0] != "/mcp/team" {
-		t.Fatalf("delete must revoke refresh grants for /mcp/team, got %v", revoked)
+	if len(revoked) != 1 || revoked[0].path != "/mcp/team" || revoked[0].epoch != e1 {
+		t.Fatalf("delete must revoke the retiring epoch for /mcp/team, got %v", revoked)
 	}
 
 	// Recreating the slug mints a DIFFERENT epoch — old tokens stay dead.

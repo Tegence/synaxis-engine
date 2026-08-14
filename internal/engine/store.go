@@ -207,8 +207,49 @@ type AccountPolicyMutation struct {
 // Description replaces the upstream description. Empty fields inherit the
 // upstream definition.
 type ToolOverride struct {
-	Alias       string `json:"alias,omitempty"`
-	Description string `json:"description,omitempty"`
+	Alias            string           `json:"alias,omitempty"`
+	Description      string           `json:"description,omitempty"`
+	GovernancePreset GovernancePreset `json:"governancePreset,omitempty"`
+}
+
+// GovernancePreset is an explicit, durable safety policy for a single
+// upstream tool. It is intentionally kept alongside the agent-facing alias
+// and description rather than on a delivery endpoint, because the same tool
+// can be reachable through the aggregate, an endpoint bundle, a connector,
+// or a subject-bound MCP client.
+//
+// The empty value preserves the historical behaviour for existing accounts.
+// Safe-write and high-risk are enforced by the Gateway on every projection;
+// they are not merely console labels that another MCP URL can bypass.
+type GovernancePreset string
+
+const (
+	GovernancePresetReadOnly  GovernancePreset = "read_only"
+	GovernancePresetSafeWrite GovernancePreset = "safe_write"
+	GovernancePresetHighRisk  GovernancePreset = "high_risk"
+)
+
+func normalizedGovernancePreset(preset GovernancePreset) (GovernancePreset, error) {
+	switch GovernancePreset(strings.ToLower(strings.TrimSpace(string(preset)))) {
+	case "":
+		return "", nil
+	case GovernancePresetReadOnly:
+		return GovernancePresetReadOnly, nil
+	case GovernancePresetSafeWrite:
+		return GovernancePresetSafeWrite, nil
+	case GovernancePresetHighRisk:
+		return GovernancePresetHighRisk, nil
+	default:
+		return "", fmt.Errorf("invalid governance preset %q", preset)
+	}
+}
+
+func (preset GovernancePreset) requiresApproval() bool {
+	return preset == GovernancePresetSafeWrite || preset == GovernancePresetHighRisk
+}
+
+func (preset GovernancePreset) recordsPayloads() bool {
+	return preset == GovernancePresetHighRisk
 }
 
 // VirtualConnector is a named, curated subset of the aggregated tools, served
@@ -695,8 +736,14 @@ type FileStore struct {
 	connectionNamespaces []*ConnectionNamespace
 	mcpClients           []*MCPClient
 	oauthTokenGeneration string
-	log                  ring          // in-memory audit ring
-	pending              []PendingCall // approval records (ephemeral, not persisted)
+	// OAuth grants live beside the durable generation so local Engines do not
+	// accept a code on one process and forget it after a restart. Hosted
+	// replicas use PgStore's transactional implementation instead.
+	oauthAuthorizationCodes   map[string]fileOAuthAuthorizationCode
+	oauthRefreshGrants        map[string]fileOAuthRefreshGrant
+	oauthHostedConsentReplays map[string]fileOAuthHostedConsentReplay
+	log                       ring          // in-memory audit ring
+	pending                   []PendingCall // approval records (ephemeral, not persisted)
 }
 
 var _ NamespaceStore = (*FileStore)(nil)
@@ -707,12 +754,15 @@ var _ StaticOAuthConfigStore = (*FileStore)(nil)
 // accounts; LoadFileStore still accepts that, and a missing "connectors"
 // field simply loads as empty.
 type fileStoreData struct {
-	Accounts             []*Account             `json:"accounts"`
-	Connectors           []*VirtualConnector    `json:"connectors,omitempty"`
-	Namespaces           []*Namespace           `json:"namespaces,omitempty"`
-	ConnectionNamespaces []*ConnectionNamespace `json:"connection_namespaces,omitempty"`
-	MCPClients           []*MCPClient           `json:"mcp_clients,omitempty"`
-	OAuthTokenGeneration string                 `json:"oauth_token_generation,omitempty"`
+	Accounts                  []*Account                              `json:"accounts"`
+	Connectors                []*VirtualConnector                     `json:"connectors,omitempty"`
+	Namespaces                []*Namespace                            `json:"namespaces,omitempty"`
+	ConnectionNamespaces      []*ConnectionNamespace                  `json:"connection_namespaces,omitempty"`
+	MCPClients                []*MCPClient                            `json:"mcp_clients,omitempty"`
+	OAuthTokenGeneration      string                                  `json:"oauth_token_generation,omitempty"`
+	OAuthAuthorizationCodes   map[string]fileOAuthAuthorizationCode   `json:"oauth_authorization_codes,omitempty"`
+	OAuthRefreshGrants        map[string]fileOAuthRefreshGrant        `json:"oauth_refresh_grants,omitempty"`
+	OAuthHostedConsentReplays map[string]fileOAuthHostedConsentReplay `json:"oauth_hosted_consent_replays,omitempty"`
 }
 
 func (s *FileStore) LogCall(rec CallRecord) {
@@ -768,6 +818,9 @@ func LoadFileStore(path string) (*FileStore, error) {
 		return nil, fmt.Errorf("parse account store: %w", err)
 	}
 	s.accounts, s.connectors, s.namespaces, s.connectionNamespaces, s.mcpClients, s.oauthTokenGeneration = d.Accounts, d.Connectors, d.Namespaces, d.ConnectionNamespaces, d.MCPClients, d.OAuthTokenGeneration
+	s.oauthAuthorizationCodes = d.OAuthAuthorizationCodes
+	s.oauthRefreshGrants = d.OAuthRefreshGrants
+	s.oauthHostedConsentReplays = d.OAuthHostedConsentReplays
 	connectionChanged, err := s.backfillConnectionNamespacesLocked()
 	if err != nil {
 		return nil, fmt.Errorf("migrate connection namespaces: %w", err)
@@ -870,12 +923,15 @@ func (s *FileStore) SetBearerToken(_ context.Context, name, expectedIncarnationI
 
 func (s *FileStore) saveLocked() error {
 	b, err := json.MarshalIndent(fileStoreData{
-		Accounts:             s.accounts,
-		Connectors:           s.connectors,
-		Namespaces:           s.namespaces,
-		ConnectionNamespaces: s.connectionNamespaces,
-		MCPClients:           s.mcpClients,
-		OAuthTokenGeneration: s.oauthTokenGeneration,
+		Accounts:                  s.accounts,
+		Connectors:                s.connectors,
+		Namespaces:                s.namespaces,
+		ConnectionNamespaces:      s.connectionNamespaces,
+		MCPClients:                s.mcpClients,
+		OAuthTokenGeneration:      s.oauthTokenGeneration,
+		OAuthAuthorizationCodes:   s.oauthAuthorizationCodes,
+		OAuthRefreshGrants:        s.oauthRefreshGrants,
+		OAuthHostedConsentReplays: s.oauthHostedConsentReplays,
 	}, "", "  ")
 	if err != nil {
 		return err

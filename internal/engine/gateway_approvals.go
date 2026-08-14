@@ -318,6 +318,14 @@ func newApprovalID() string {
 // MCP tool error result (isError), NOT a protocol error.
 func (g *Gateway) approvalHandler(connector string, account Account, bare string, inner server.ToolHandlerFunc) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		// A global tool-governance policy can be nested inside a real connector
+		// or client endpoint. Keep the approval/audit record attributed to that
+		// outer delivery surface when one exists; otherwise the stable policy
+		// scope makes the reason for the approval visible to operators.
+		approvalConnector := connector
+		if sc := auditScopeFrom(ctx); sc != nil && sc.connector != "" {
+			approvalConnector = sc.connector
+		}
 		al, hasLog := g.approvalLog()
 		if !hasLog {
 			// FAIL CLOSED: a gated tool must never dispatch without a record.
@@ -338,7 +346,7 @@ func (g *Gateway) approvalHandler(connector string, account Account, bare string
 		now := time.Now()
 		expires := now.Add(g.approvalWait())
 		p := PendingCall{
-			ID: id, TS: now, ExpiresAt: &expires, Connector: connector, Account: account.Name,
+			ID: id, TS: now, ExpiresAt: &expires, Connector: approvalConnector, Account: account.Name,
 			Tool: bare, Args: req.GetArguments(), Status: ApprovalPending,
 			AccountIncarnationID: account.IncarnationID, AccountRevision: account.Revision,
 			ConnectionNamespaceID: account.ConnectionNamespaceID,
@@ -347,7 +355,7 @@ func (g *Gateway) approvalHandler(connector string, account Account, bare string
 			g.dropWait(id)
 			return mcp.NewToolResultError("approval required, but the pending call could not be recorded: " + err.Error()), nil
 		}
-		msg := fmt.Sprintf("⏸️ Synaxis: approval needed — %s: %s·%s.", connector, account.Name, bare)
+		msg := fmt.Sprintf("⏸️ Synaxis: approval needed — %s: %s·%s.", approvalConnector, account.Name, bare)
 		if g.consoleURL != "" {
 			msg += " Approve in console: " + g.consoleURL
 		}
@@ -368,7 +376,7 @@ func (g *Gateway) approvalHandler(connector string, account Account, bare string
 				rec := CallRecord{
 					Account: account.Name, Tool: bare, OK: false,
 					Ms: time.Since(start).Milliseconds(), Error: outcome,
-					Connector: connector, Decision: reason,
+					Connector: approvalConnector, Decision: reason,
 				}
 				// Recording connectors capture what WOULD have been sent, so
 				// a denied/expired call is replayable (with force) later.
@@ -389,7 +397,7 @@ func (g *Gateway) approvalHandler(connector string, account Account, bare string
 				rec := CallRecord{
 					Account: account.Name, Tool: bare, OK: false,
 					Ms: time.Since(start).Milliseconds(), Error: outcome,
-					Connector: connector, Decision: outcome,
+					Connector: approvalConnector, Decision: outcome,
 				}
 				if sc := auditScopeFrom(ctx); sc != nil {
 					rec.EndpointKind = sc.kind

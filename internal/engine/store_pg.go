@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -19,6 +20,14 @@ import (
 type PgStore struct {
 	pool   *pgxpool.Pool
 	cipher *Cipher // nil = no at-rest encryption (passthrough)
+
+	// audit accepts durable activity without letting Postgres latency block an
+	// already-governed tool call. It is initialized only after schema bootstrap
+	// succeeds, so a partially constructed store never owns a worker.
+	audit *auditWriter
+
+	poolCloseOnce           sync.Once
+	poolCloseAfterAuditOnce sync.Once
 }
 
 var _ NamespaceStore = (*PgStore)(nil)
@@ -34,18 +43,162 @@ const (
 // SetCipher enables AES-GCM encryption of token columns at rest.
 func (s *PgStore) SetCipher(c *Cipher) { s.cipher = c }
 
-func (s *PgStore) enc(v string) string { return s.cipher.Encrypt(v) }
-func (s *PgStore) dec(v string) string { return s.cipher.Decrypt(v) }
+func (s *PgStore) enc(v string) (string, error) { return s.cipher.Encrypt(v) }
+func (s *PgStore) dec(v string) (string, error) { return s.cipher.Decrypt(v) }
 
-// EncryptExisting re-writes every account so any legacy plaintext token columns
-// become encrypted. Idempotent: already-encrypted values are left as-is.
+func (s *PgStore) encryptAccountSecrets(a Account) (clientSecret, accessToken, refreshToken, bearerToken string, err error) {
+	if clientSecret, err = s.enc(a.ClientSecret); err != nil {
+		return "", "", "", "", fmt.Errorf("encrypt client secret: %w", err)
+	}
+	if accessToken, err = s.enc(a.AccessToken); err != nil {
+		return "", "", "", "", fmt.Errorf("encrypt access token: %w", err)
+	}
+	if refreshToken, err = s.enc(a.RefreshToken); err != nil {
+		return "", "", "", "", fmt.Errorf("encrypt refresh token: %w", err)
+	}
+	if bearerToken, err = s.enc(a.BearerToken); err != nil {
+		return "", "", "", "", fmt.Errorf("encrypt bearer token: %w", err)
+	}
+	return clientSecret, accessToken, refreshToken, bearerToken, nil
+}
+
+// EncryptExisting re-writes every account so any legacy plaintext token columns,
+// recorded payloads, and audit error/decision metadata become encrypted.
+// Idempotent: already-encrypted values are authenticated and left as-is. A
+// malformed ciphertext or a wrong key stops the migration; silently skipping
+// it would make a hosted Engine appear healthy while credentials were
+// unavailable.
 func (s *PgStore) EncryptExisting(ctx context.Context) error {
 	if s.cipher == nil {
-		return nil
+		return ErrCipherUnavailable
 	}
-	for _, a := range s.Accounts() { // Accounts() returns decrypted values
+	rows, err := s.pool.Query(ctx, `SELECT `+accountCols+` FROM narthex_accounts ORDER BY name`)
+	if err != nil {
+		return fmt.Errorf("list accounts for encryption migration: %w", err)
+	}
+	var accounts []Account
+	for rows.Next() {
+		a, err := s.scanAccount(rows)
+		if err != nil {
+			rows.Close()
+			return fmt.Errorf("read account for encryption migration: %w", err)
+		}
+		accounts = append(accounts, a)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate accounts for encryption migration: %w", err)
+	}
+	rows.Close()
+	for _, a := range accounts {
 		if err := s.Upsert(ctx, a); err != nil { // Upsert re-encrypts
-			return err
+			return fmt.Errorf("encrypt account %q: %w", a.Name, err)
+		}
+	}
+	if err := s.encryptExistingPendingCalls(ctx); err != nil {
+		return err
+	}
+	if err := s.encryptExistingCallPayloads(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+// encryptExistingPendingCalls covers args plus the decided_by/decision_note
+// approval-decision metadata added alongside audit-at-rest encryption. Those
+// two columns are write-once (set only at decision time, never UPDATEd
+// again), so a row decided before this migration existed would otherwise stay
+// plaintext forever without this pass.
+func (s *PgStore) encryptExistingPendingCalls(ctx context.Context) error {
+	rows, err := s.pool.Query(ctx, `SELECT id,args,decided_by,decision_note FROM pending_calls ORDER BY id`)
+	if err != nil {
+		return fmt.Errorf("list pending calls for encryption migration: %w", err)
+	}
+	type pendingPayload struct{ id, args, decidedBy, decisionNote string }
+	var payloads []pendingPayload
+	for rows.Next() {
+		var payload pendingPayload
+		if err := rows.Scan(&payload.id, &payload.args, &payload.decidedBy, &payload.decisionNote); err != nil {
+			rows.Close()
+			return fmt.Errorf("read pending call for encryption migration: %w", err)
+		}
+		payloads = append(payloads, payload)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate pending calls for encryption migration: %w", err)
+	}
+	rows.Close()
+	for _, payload := range payloads {
+		args, err := s.enc(payload.args)
+		if err != nil {
+			return fmt.Errorf("encrypt pending call %q arguments: %w", payload.id, err)
+		}
+		decidedBy, err := s.enc(payload.decidedBy)
+		if err != nil {
+			return fmt.Errorf("encrypt pending call %q decider: %w", payload.id, err)
+		}
+		decisionNote, err := s.enc(payload.decisionNote)
+		if err != nil {
+			return fmt.Errorf("encrypt pending call %q decision note: %w", payload.id, err)
+		}
+		if args == payload.args && decidedBy == payload.decidedBy && decisionNote == payload.decisionNote {
+			continue
+		}
+		if _, err := s.pool.Exec(ctx, `UPDATE pending_calls SET args=$2,decided_by=$3,decision_note=$4 WHERE id=$1`,
+			payload.id, args, decidedBy, decisionNote); err != nil {
+			return fmt.Errorf("write encrypted pending call %q: %w", payload.id, err)
+		}
+	}
+	return nil
+}
+
+// encryptExistingCallPayloads covers args/result plus the error column that
+// encryptAuditFields now encrypts on write. error is write-once (set only at
+// insert, never UPDATEd again), so a row logged before this migration existed
+// would otherwise stay plaintext forever without this pass.
+func (s *PgStore) encryptExistingCallPayloads(ctx context.Context) error {
+	rows, err := s.pool.Query(ctx, `SELECT id,args,result,error FROM tool_calls ORDER BY id`)
+	if err != nil {
+		return fmt.Errorf("list call payloads for encryption migration: %w", err)
+	}
+	type callPayload struct {
+		id                   int64
+		args, result, errTxt string
+	}
+	var payloads []callPayload
+	for rows.Next() {
+		var payload callPayload
+		if err := rows.Scan(&payload.id, &payload.args, &payload.result, &payload.errTxt); err != nil {
+			rows.Close()
+			return fmt.Errorf("read call payload for encryption migration: %w", err)
+		}
+		payloads = append(payloads, payload)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate call payloads for encryption migration: %w", err)
+	}
+	rows.Close()
+	for _, payload := range payloads {
+		args, err := s.enc(payload.args)
+		if err != nil {
+			return fmt.Errorf("encrypt call %d arguments: %w", payload.id, err)
+		}
+		result, err := s.enc(payload.result)
+		if err != nil {
+			return fmt.Errorf("encrypt call %d result: %w", payload.id, err)
+		}
+		errTxt, err := s.enc(payload.errTxt)
+		if err != nil {
+			return fmt.Errorf("encrypt call %d error: %w", payload.id, err)
+		}
+		if args == payload.args && result == payload.result && errTxt == payload.errTxt {
+			continue
+		}
+		if _, err := s.pool.Exec(ctx, `UPDATE tool_calls SET args=$2,result=$3,error=$4 WHERE id=$1`,
+			payload.id, args, result, errTxt); err != nil {
+			return fmt.Errorf("write encrypted call %d payload: %w", payload.id, err)
 		}
 	}
 	return nil
@@ -146,6 +299,8 @@ ALTER TABLE narthex_connection_namespaces ADD COLUMN IF NOT EXISTS updated_at TI
 
 const accountCols = `name,label,workspace,url,auth_mode,connection_namespace_id,connection_scope,owner_subject,revision,incarnation_id,client_id,client_secret,access_token,refresh_token,token_endpoint,resource,scope,bearer_token,disabled_tools,tool_overrides,read_only`
 
+const engineSchemaBootstrapLock = "narthex-engine-schema-bootstrap:v1"
+
 func NewPgStore(ctx context.Context, dsn string) (*PgStore, error) {
 	config, err := enginePostgresPoolConfig(dsn)
 	if err != nil {
@@ -155,71 +310,108 @@ func NewPgStore(ctx context.Context, dsn string) (*PgStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := pool.Exec(ctx, accountsSchema); err != nil {
+	// Keep one pooled connection for all bootstrap work and reserve the other
+	// for a session-level lock. Holding the lock on an acquired connection
+	// serializes DDL plus data backfills across replica startups without
+	// exceeding the store's normal two-connection pool cap.
+	lockConn, err := pool.Acquire(ctx)
+	if err != nil {
 		pool.Close()
+		return nil, fmt.Errorf("acquire schema bootstrap lock connection: %w", err)
+	}
+	releaseBootstrapLock := func() {
+		if lockConn == nil {
+			return
+		}
+		unlockCtx, cancel := context.WithTimeout(context.Background(), engineAuditCloseTimeout)
+		defer cancel()
+		if _, err := lockConn.Exec(unlockCtx, `SELECT pg_advisory_unlock(hashtextextended($1,0))`, engineSchemaBootstrapLock); err != nil {
+			// Releasing the acquired connection also releases a session lock.
+			// Log the explicit unlock failure so a stuck connection is visible.
+			log.Printf("engine: unlock schema bootstrap advisory lock: %v", err)
+		}
+		lockConn.Release()
+		lockConn = nil
+	}
+	defer releaseBootstrapLock()
+	closePool := func() {
+		releaseBootstrapLock()
+		pool.Close()
+	}
+	if _, err := lockConn.Exec(ctx, `SELECT pg_advisory_lock(hashtextextended($1,0))`, engineSchemaBootstrapLock); err != nil {
+		closePool()
+		return nil, fmt.Errorf("lock Engine schema bootstrap: %w", err)
+	}
+	if _, err := pool.Exec(ctx, accountsSchema); err != nil {
+		closePool()
 		return nil, fmt.Errorf("ensure accounts schema: %w", err)
 	}
 	if _, err := pool.Exec(ctx, accountsMigrate); err != nil {
-		pool.Close()
+		closePool()
 		return nil, fmt.Errorf("migrate accounts schema: %w", err)
 	}
 	if _, err := pool.Exec(ctx, connectionNamespacesSchema); err != nil {
-		pool.Close()
+		closePool()
 		return nil, fmt.Errorf("ensure connection namespaces schema: %w", err)
 	}
 	if _, err := pool.Exec(ctx, mcpClientsSchema); err != nil {
-		pool.Close()
+		closePool()
 		return nil, fmt.Errorf("ensure MCP client registry schema: %w", err)
 	}
 	store := &PgStore{pool: pool}
 	if err := store.backfillConnectionNamespaces(ctx); err != nil {
-		pool.Close()
+		closePool()
 		return nil, fmt.Errorf("backfill connection namespaces: %w", err)
 	}
 	if err := store.backfillMCPClients(ctx); err != nil {
-		pool.Close()
+		closePool()
 		return nil, fmt.Errorf("backfill MCP clients: %w", err)
 	}
 	if _, err := pool.Exec(ctx, engineStateSchema); err != nil {
-		pool.Close()
+		closePool()
 		return nil, fmt.Errorf("ensure engine state schema: %w", err)
 	}
+	if err := store.ensureOAuthGrantSchema(ctx); err != nil {
+		closePool()
+		return nil, fmt.Errorf("ensure durable OAuth grant schema: %w", err)
+	}
 	if _, err := pool.Exec(ctx, callsSchema); err != nil {
-		pool.Close()
+		closePool()
 		return nil, fmt.Errorf("ensure tool_calls schema: %w", err)
 	}
 	if _, err := pool.Exec(ctx, callsMigrate); err != nil {
-		pool.Close()
+		closePool()
 		return nil, fmt.Errorf("migrate tool_calls schema: %w", err)
 	}
 	if _, err := pool.Exec(ctx, connectorsSchema); err != nil {
-		pool.Close()
+		closePool()
 		return nil, fmt.Errorf("ensure connectors schema: %w", err)
 	}
 	if _, err := pool.Exec(ctx, connectorsMigrate); err != nil {
-		pool.Close()
+		closePool()
 		return nil, fmt.Errorf("migrate connectors schema: %w", err)
 	}
 	if _, err := pool.Exec(ctx, namespacesSchema); err != nil {
-		pool.Close()
+		closePool()
 		return nil, fmt.Errorf("ensure namespaces schema: %w", err)
 	}
 	if _, err := pool.Exec(ctx, pendingSchema); err != nil {
-		pool.Close()
+		closePool()
 		return nil, fmt.Errorf("ensure pending_calls schema: %w", err)
 	}
 	if _, err := pool.Exec(ctx, pendingMigrate); err != nil {
-		pool.Close()
+		closePool()
 		return nil, fmt.Errorf("migrate pending_calls schema: %w", err)
 	}
 	if _, err := pool.Exec(ctx, usageSchema); err != nil {
-		pool.Close()
+		closePool()
 		return nil, fmt.Errorf("ensure usage schema: %w", err)
 	}
 	if _, err := pool.Exec(ctx, usageMigrate); err != nil {
-		pool.Close()
+		closePool()
 		return nil, fmt.Errorf("migrate usage schema: %w", err)
 	}
+	store.audit = newAuditWriter(store.persistAuditCall, defaultAuditWriterConfig())
 	return store, nil
 }
 
@@ -618,37 +810,127 @@ ALTER TABLE tool_calls ADD COLUMN IF NOT EXISTS result TEXT NOT NULL DEFAULT '';
 ALTER TABLE tool_calls ADD COLUMN IF NOT EXISTS guard TEXT NOT NULL DEFAULT '';
 ALTER TABLE tool_calls ADD COLUMN IF NOT EXISTS triage TEXT NOT NULL DEFAULT '';`
 
-// LogCall is fire-and-forget: a tool call must never fail or block on auditing.
-// Args/Result are clamped and encrypted at rest (nil cipher = plaintext, same
-// as token columns).
+// LogCall is non-blocking: a tool call must never fail or wait on audit
+// persistence. The bounded writer makes any overload explicit through its
+// stats/logs rather than creating one goroutine per governed call. Args/Result
+// are clamped and encrypted by the worker at rest (nil cipher = plaintext,
+// same as token columns).
 func (s *PgStore) LogCall(rec CallRecord) {
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if rec.TS.IsZero() {
-			rec.TS = time.Now()
-		}
-		if _, err := s.pool.Exec(ctx, `INSERT INTO tool_calls (
+	if s == nil || s.audit == nil {
+		return
+	}
+	s.audit.enqueue(rec)
+}
+
+// encryptAuditFields clamps and encrypts the at-rest-sensitive audit columns.
+// The error text joins args/result behind the cipher: upstream errors can
+// embed URLs with query tokens or echoed input, and incident review reads
+// exactly these rows. Legacy plaintext rows predate encryption and keep
+// reading through s.dec's passthrough.
+func (s *PgStore) encryptAuditFields(rec CallRecord) (args, result, auditErr string, err error) {
+	if args, err = s.enc(clampPayload(rec.Args, maxPayloadBytes)); err != nil {
+		return "", "", "", fmt.Errorf("encrypt audit arguments: %w", err)
+	}
+	if result, err = s.enc(clampPayload(rec.Result, maxPayloadBytes)); err != nil {
+		return "", "", "", fmt.Errorf("encrypt audit result: %w", err)
+	}
+	if auditErr, err = s.enc(clampErr(rec.Error)); err != nil {
+		return "", "", "", fmt.Errorf("encrypt audit error: %w", err)
+	}
+	return args, result, auditErr, nil
+}
+
+func (s *PgStore) persistAuditCall(ctx context.Context, rec CallRecord) error {
+	args, result, auditErr, err := s.encryptAuditFields(rec)
+	if err != nil {
+		return err
+	}
+	if s == nil || s.pool == nil {
+		return errors.New("Postgres audit pool is unavailable")
+	}
+	if _, err := s.pool.Exec(ctx, `INSERT INTO tool_calls (
     ts,account,tool,ok,ms,error,connector,endpoint_kind,endpoint_generation,decision,args,result,guard
 )
 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
-			rec.TS, rec.Account, rec.Tool, rec.OK, rec.Ms, clampErr(rec.Error),
-			rec.Connector, rec.EndpointKind, rec.EndpointGeneration, rec.Decision,
-			s.enc(clampPayload(rec.Args, maxPayloadBytes)),
-			s.enc(clampPayload(rec.Result, maxPayloadBytes)),
-			rec.Guard); err != nil {
-			log.Printf("engine: audit insert failed (call %s/%s dropped): %v", rec.Account, rec.Tool, err)
-		}
-	}()
+		rec.TS, rec.Account, rec.Tool, rec.OK, rec.Ms, auditErr,
+		rec.Connector, rec.EndpointKind, rec.EndpointGeneration, rec.Decision,
+		args, result,
+		rec.Guard); err != nil {
+		return fmt.Errorf("insert audit record: %w", err)
+	}
+	return nil
 }
+
+// AuditPersistenceStats returns bounded-writer health without exposing audit
+// payloads. It is deliberately a concrete-store diagnostic rather than part
+// of AuditSink so existing file-backed development stores remain unchanged.
+func (s *PgStore) AuditPersistenceStats() AuditPersistenceStats {
+	if s == nil {
+		return AuditPersistenceStats{}
+	}
+	return s.audit.stats()
+}
+
+// undecryptableAuditErrorPlaceholder replaces an audit error field that fails
+// to decrypt (wrong/rotated key, corrupt ciphertext). Only the error column is
+// ever ciphertext here — successful calls store error="" and never touch the
+// cipher — so a decrypt failure disproportionately affects FAILED-call rows,
+// exactly what an incident investigator needs most. The row's other fields
+// never needed decryption and stay trustworthy, so RecentCalls keeps the row
+// (like PgStore.Accounts omits only the one unreadable field/record, not the
+// whole list) instead of hiding it.
+const undecryptableAuditErrorPlaceholder = "[undecryptable]"
 
 // RecentCalls is summary-only: Args/Result are never selected, so the 100-row
 // list response stays payload-free (and no decryption work happens per row).
-// Guard IS selected — it's tiny and the Activity UI chips on it.
+// Guard IS selected — it's tiny and the Activity UI chips on it. The id
+// tie-break matches RecentCallsBefore's ORDER BY exactly: without it, rows
+// sharing one exact ts could sort differently between this query (which
+// always produces the first /api/logs page) and RecentCallsBefore (which
+// produces every page after it), duplicating some rows across the two pages
+// and permanently losing others at the boundary.
 func (s *PgStore) RecentCalls(ctx context.Context, limit int) ([]CallRecord, error) {
 	rows, err := s.pool.Query(ctx, `
 SELECT id,ts,account,tool,ok,ms,error,connector,endpoint_kind,endpoint_generation,decision,guard,triage
-FROM tool_calls ORDER BY ts DESC LIMIT $1`, limit)
+FROM tool_calls ORDER BY ts DESC, id DESC LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CallRecord
+	for rows.Next() {
+		var c CallRecord
+		if err := rows.Scan(
+			&c.ID, &c.TS, &c.Account, &c.Tool, &c.OK, &c.Ms, &c.Error,
+			&c.Connector, &c.EndpointKind, &c.EndpointGeneration,
+			&c.Decision, &c.Guard, &c.Triage,
+		); err != nil {
+			continue
+		}
+		// Legacy rows hold plaintext errors; s.dec passes them through. A
+		// decrypt failure must not drop the whole row (see
+		// undecryptableAuditErrorPlaceholder) — omit just the unreadable field,
+		// log the row ID only (never decrypted/attempted-decrypt content), and
+		// keep the rest of the row intact.
+		auditErr, err := s.dec(c.Error)
+		if err != nil {
+			log.Printf("engine: omit unreadable audit error for call %d: %v", c.ID, err)
+			auditErr = undecryptableAuditErrorPlaceholder
+		}
+		c.Error = auditErr
+		out = append(out, c)
+	}
+	return out, nil
+}
+
+// RecentCallsBefore pages backward from a keyset cursor for the Activity
+// "Load older" control — RecentCalls alone hard-caps at the newest `limit`
+// rows. Same summary-only contract as RecentCalls: Args/Result are never
+// selected, Guard IS selected (it's tiny, and the Activity UI chips on it).
+func (s *PgStore) RecentCallsBefore(ctx context.Context, beforeTS time.Time, beforeID int64, limit int) ([]CallRecord, error) {
+	rows, err := s.pool.Query(ctx, `
+SELECT id,ts,account,tool,ok,ms,error,connector,endpoint_kind,endpoint_generation,decision,guard,triage
+FROM tool_calls WHERE (ts, id) < ($2, $3) ORDER BY ts DESC, id DESC LIMIT $1`, limit, beforeTS, beforeID)
 	if err != nil {
 		return nil, err
 	}
@@ -683,7 +965,19 @@ FROM tool_calls WHERE id=$1`, id).Scan(
 	if err != nil {
 		return CallRecord{}, false, err
 	}
-	c.Args, c.Result = s.dec(c.Args), s.dec(c.Result)
+	args, err := s.dec(c.Args)
+	if err != nil {
+		return CallRecord{}, false, fmt.Errorf("decrypt call %d arguments: %w", id, err)
+	}
+	result, err := s.dec(c.Result)
+	if err != nil {
+		return CallRecord{}, false, fmt.Errorf("decrypt call %d result: %w", id, err)
+	}
+	auditErr, err := s.dec(c.Error)
+	if err != nil {
+		return CallRecord{}, false, fmt.Errorf("decrypt call %d error: %w", id, err)
+	}
+	c.Args, c.Result, c.Error = args, result, auditErr
 	return c, true, nil
 }
 
@@ -716,7 +1010,59 @@ func (s *PgStore) PurgeCalls(ctx context.Context, olderThan time.Duration) (int6
 	return n + tag.RowsAffected(), nil
 }
 
-func (s *PgStore) Close() { s.pool.Close() }
+// Shutdown drains the bounded audit queue before closing the database pool.
+// It matches the optional Engine dependency hook, so graceful process
+// shutdown does not drop rows simply because the HTTP listener stopped first.
+func (s *PgStore) Shutdown(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	if s.audit != nil {
+		if err := s.audit.Shutdown(ctx); err != nil {
+			// The writer has been cancelled but may still be unwinding an
+			// in-flight driver call. Closing the pool here would race it, so
+			// schedule exactly one final close once that worker exits.
+			s.closePoolAfterAuditExit()
+			return err
+		}
+	}
+	s.closePool()
+	return nil
+}
+
+func (s *PgStore) closePool() {
+	s.poolCloseOnce.Do(func() {
+		if s.pool != nil {
+			s.pool.Close()
+		}
+	})
+}
+
+func (s *PgStore) closePoolAfterAuditExit() {
+	if s == nil || s.audit == nil {
+		return
+	}
+	s.poolCloseAfterAuditOnce.Do(func() {
+		go func() {
+			<-s.audit.done
+			s.closePool()
+		}()
+	})
+}
+
+// Close preserves the legacy no-error cleanup API used by callers and tests.
+// Production lifecycle uses Shutdown with its larger drain budget; direct
+// callers get a bounded best-effort drain rather than an unbounded wait.
+func (s *PgStore) Close() {
+	if s == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), engineAuditCloseTimeout)
+	defer cancel()
+	if err := s.Shutdown(ctx); err != nil {
+		log.Printf("engine: audit shutdown during store close: %v", err)
+	}
+}
 
 type accountScanner interface {
 	Scan(...any) error
@@ -739,22 +1085,42 @@ func (s *PgStore) scanAccount(row accountScanner) (Account, error) {
 	if err := json.Unmarshal(overrides, &a.ToolOverrides); err != nil {
 		return Account{}, err
 	}
-	a.ClientSecret, a.AccessToken, a.RefreshToken, a.BearerToken =
-		s.dec(a.ClientSecret), s.dec(a.AccessToken), s.dec(a.RefreshToken), s.dec(a.BearerToken)
+	if a.ClientSecret, err = s.dec(a.ClientSecret); err != nil {
+		return Account{}, fmt.Errorf("decrypt account %q client secret: %w", a.Name, err)
+	}
+	if a.AccessToken, err = s.dec(a.AccessToken); err != nil {
+		return Account{}, fmt.Errorf("decrypt account %q access token: %w", a.Name, err)
+	}
+	if a.RefreshToken, err = s.dec(a.RefreshToken); err != nil {
+		return Account{}, fmt.Errorf("decrypt account %q refresh token: %w", a.Name, err)
+	}
+	if a.BearerToken, err = s.dec(a.BearerToken); err != nil {
+		return Account{}, fmt.Errorf("decrypt account %q bearer token: %w", a.Name, err)
+	}
 	return a, nil
 }
 
 func (s *PgStore) Accounts() []Account {
 	rows, err := s.pool.Query(context.Background(), `SELECT `+accountCols+` FROM narthex_accounts ORDER BY name`)
 	if err != nil {
+		log.Printf("engine: list accounts failed: %v", err)
 		return nil
 	}
 	defer rows.Close()
 	var out []Account
 	for rows.Next() {
-		if a, err := s.scanAccount(rows); err == nil {
-			out = append(out, a)
+		a, err := s.scanAccount(rows)
+		if err != nil {
+			// AccountStore predates error-returning list methods. Keep this
+			// constrained compatibility API fail-closed, while making the
+			// operational cause explicit without logging secret values.
+			log.Printf("engine: omit unreadable account: %v", err)
+			continue
 		}
+		out = append(out, a)
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("engine: iterate accounts failed: %v", err)
 	}
 	return out
 }
@@ -764,30 +1130,57 @@ func (s *PgStore) Token(name string) string {
 	if err := s.pool.QueryRow(context.Background(),
 		`SELECT auth_mode,access_token,bearer_token FROM narthex_accounts WHERE name=$1`, name).
 		Scan(&auth, &access, &bearer); err != nil {
+		log.Printf("engine: read token for account %q failed: %v", name, err)
 		return ""
 	}
+	var value string
+	var err error
 	if auth == "token" {
-		return s.dec(bearer)
+		value, err = s.dec(bearer)
+	} else {
+		value, err = s.dec(access)
 	}
-	return s.dec(access)
+	if err != nil {
+		log.Printf("engine: credential for account %q is unavailable: %v", name, err)
+		return ""
+	}
+	return value
 }
 
 func (s *PgStore) RefreshToken(name string) string {
 	var rt string
-	_ = s.pool.QueryRow(context.Background(), `SELECT refresh_token FROM narthex_accounts WHERE name=$1`, name).Scan(&rt)
-	return s.dec(rt)
+	if err := s.pool.QueryRow(context.Background(), `SELECT refresh_token FROM narthex_accounts WHERE name=$1`, name).Scan(&rt); err != nil {
+		log.Printf("engine: read refresh token for account %q failed: %v", name, err)
+		return ""
+	}
+	value, err := s.dec(rt)
+	if err != nil {
+		log.Printf("engine: refresh credential for account %q is unavailable: %v", name, err)
+		return ""
+	}
+	return value
 }
 
 func (s *PgStore) UpdateTokens(ctx context.Context, name, expectedIncarnationID, access, refresh string) error {
 	if expectedIncarnationID == "" {
 		return ErrAccountIncarnation
 	}
-	var tag pgconn.CommandTag
-	var err error
+	encryptedAccess, err := s.enc(access)
+	if err != nil {
+		return fmt.Errorf("encrypt access token: %w", err)
+	}
+	var encryptedRefresh string
 	if refresh != "" {
-		tag, err = s.pool.Exec(ctx, `UPDATE narthex_accounts SET access_token=$3, refresh_token=$4 WHERE name=$1 AND incarnation_id=$2`, name, expectedIncarnationID, s.enc(access), s.enc(refresh))
+		encryptedRefresh, err = s.enc(refresh)
+		if err != nil {
+			return fmt.Errorf("encrypt refresh token: %w", err)
+		}
+	}
+	var tag pgconn.CommandTag
+	if refresh != "" {
+		tag, err = s.pool.Exec(ctx, `UPDATE narthex_accounts SET access_token=$3, refresh_token=$4 WHERE name=$1 AND incarnation_id=$2`, name, expectedIncarnationID, encryptedAccess, encryptedRefresh)
 	} else {
-		tag, err = s.pool.Exec(ctx, `UPDATE narthex_accounts SET access_token=$3 WHERE name=$1 AND incarnation_id=$2`, name, expectedIncarnationID, s.enc(access))
+		tag, err = s.pool.Exec(ctx, `UPDATE narthex_accounts SET access_token=$3 WHERE name=$1 AND incarnation_id=$2`, name, expectedIncarnationID, encryptedAccess)
 	}
 	if err != nil {
 		return err
@@ -821,11 +1214,15 @@ func (s *PgStore) SetBearerToken(ctx context.Context, name, expectedIncarnationI
 	if expectedRevision < 1 || current.Revision != expectedRevision {
 		return Account{}, ErrConnectionNamespaceRevision
 	}
+	encryptedToken, err := s.enc(token)
+	if err != nil {
+		return Account{}, fmt.Errorf("encrypt bearer token: %w", err)
+	}
 	updated, err := s.scanAccount(tx.QueryRow(ctx, `
 UPDATE narthex_accounts
 SET auth_mode='token', bearer_token=$2, revision=revision+1
 WHERE name=$1
-RETURNING `+accountCols, name, s.enc(token)))
+RETURNING `+accountCols, name, encryptedToken))
 	if err != nil {
 		return Account{}, err
 	}
@@ -864,14 +1261,18 @@ func (s *PgStore) Create(ctx context.Context, a Account) error {
 	if a.ToolOverrides == nil {
 		ob = []byte(`{}`)
 	}
+	clientSecret, accessToken, refreshToken, bearerToken, err := s.encryptAccountSecrets(a)
+	if err != nil {
+		return err
+	}
 	tag, err := tx.Exec(ctx, `
 INSERT INTO narthex_accounts (`+accountCols+`)
 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
 ON CONFLICT (name) DO NOTHING`,
 		a.Name, a.Label, a.Group, a.URL, a.AuthMode,
 		a.ConnectionNamespaceID, a.ConnectionScope, a.OwnerSubject, a.Revision,
-		a.IncarnationID, a.ClientID, s.enc(a.ClientSecret), s.enc(a.AccessToken), s.enc(a.RefreshToken),
-		a.TokenEndpoint, a.Resource, a.Scope, s.enc(a.BearerToken), a.DisabledTools, ob, a.ReadOnly)
+		a.IncarnationID, a.ClientID, clientSecret, accessToken, refreshToken,
+		a.TokenEndpoint, a.Resource, a.Scope, bearerToken, a.DisabledTools, ob, a.ReadOnly)
 	if err != nil {
 		return err
 	}
@@ -883,13 +1284,15 @@ ON CONFLICT (name) DO NOTHING`,
 
 // Upsert adds or updates an account — used by the console "Connect" flow and by
 // migration. Tokens included so a freshly-connected account works immediately.
+// Caller-supplied revisions are ignored on update: the store owns revision
+// monotonicity, deriving the new revision from the locked prior row (bump on
+// ownership change, preserve otherwise).
 func (s *PgStore) Upsert(ctx context.Context, a Account) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	incomingRevision := a.Revision
 	var previous *Account
 	stored, readErr := s.scanAccount(tx.QueryRow(ctx, `SELECT `+accountCols+` FROM narthex_accounts WHERE name=$1 FOR UPDATE`, a.Name))
 	if readErr == nil {
@@ -935,7 +1338,9 @@ func (s *PgStore) Upsert(ctx context.Context, a Account) error {
 	if err := validatePersonalAccountMCPClientGrantsTx(ctx, tx, a); err != nil {
 		return err
 	}
-	if previous != nil && incomingRevision < 1 {
+	if previous != nil {
+		// The store owns revision monotonicity: derive the new revision from the
+		// locked prior row, ignoring any caller-supplied value.
 		if a.ConnectionNamespaceID != previous.ConnectionNamespaceID || a.ConnectionScope != previous.ConnectionScope || a.OwnerSubject != previous.OwnerSubject {
 			a.Revision = previous.Revision + 1
 		} else {
@@ -948,6 +1353,10 @@ func (s *PgStore) Upsert(ctx context.Context, a Account) error {
 	}
 	if a.ToolOverrides == nil {
 		ob = []byte(`{}`)
+	}
+	clientSecret, accessToken, refreshToken, bearerToken, err := s.encryptAccountSecrets(a)
+	if err != nil {
+		return err
 	}
 	_, err = tx.Exec(ctx, `
 INSERT INTO narthex_accounts (`+accountCols+`)
@@ -964,8 +1373,8 @@ ON CONFLICT (name) DO UPDATE SET
   disabled_tools=$19, tool_overrides=$20, read_only=$21`,
 		a.Name, a.Label, a.Group, a.URL, a.AuthMode,
 		a.ConnectionNamespaceID, a.ConnectionScope, a.OwnerSubject, a.Revision,
-		a.IncarnationID, a.ClientID, s.enc(a.ClientSecret), s.enc(a.AccessToken), s.enc(a.RefreshToken),
-		a.TokenEndpoint, a.Resource, a.Scope, s.enc(a.BearerToken), a.DisabledTools, ob, a.ReadOnly)
+		a.IncarnationID, a.ClientID, clientSecret, accessToken, refreshToken,
+		a.TokenEndpoint, a.Resource, a.Scope, bearerToken, a.DisabledTools, ob, a.ReadOnly)
 	if err != nil {
 		return err
 	}
@@ -1016,12 +1425,24 @@ func (s *PgStore) CompleteOAuth(ctx context.Context, precondition OAuthCompletio
 	if refresh == "" && current.ClientID == completion.ClientID {
 		refresh = current.RefreshToken
 	}
+	encryptedClientSecret, err := s.enc(completion.ClientSecret)
+	if err != nil {
+		return Account{}, fmt.Errorf("encrypt OAuth client secret: %w", err)
+	}
+	encryptedAccessToken, err := s.enc(completion.AccessToken)
+	if err != nil {
+		return Account{}, fmt.Errorf("encrypt OAuth access token: %w", err)
+	}
+	encryptedRefreshToken, err := s.enc(refresh)
+	if err != nil {
+		return Account{}, fmt.Errorf("encrypt OAuth refresh token: %w", err)
+	}
 	if _, err := tx.Exec(ctx, `
 UPDATE narthex_accounts
 SET auth_mode='oauth', client_id=$2, client_secret=$3, access_token=$4,
     refresh_token=$5, token_endpoint=$6, resource=$7, scope=$8, bearer_token=''
-WHERE name=$1`, completion.Name, completion.ClientID, s.enc(completion.ClientSecret),
-		s.enc(completion.AccessToken), s.enc(refresh), completion.TokenEndpoint,
+WHERE name=$1`, completion.Name, completion.ClientID, encryptedClientSecret,
+		encryptedAccessToken, encryptedRefreshToken, completion.TokenEndpoint,
 		completion.Resource, completion.Scope); err != nil {
 		return Account{}, err
 	}
@@ -1065,11 +1486,15 @@ func (s *PgStore) SaveStaticOAuthConfig(ctx context.Context, name string, precon
 		current.OwnerSubject != precondition.OwnerSubject {
 		return Account{}, ErrConnectAccountMoved
 	}
+	encryptedClientSecret, err := s.enc(config.ClientSecret)
+	if err != nil {
+		return Account{}, fmt.Errorf("encrypt OAuth client secret: %w", err)
+	}
 
 	if _, err := tx.Exec(ctx, `
 UPDATE narthex_accounts
 SET client_id=$2, client_secret=$3, scope=$4
-WHERE name=$1`, name, config.ClientID, s.enc(config.ClientSecret), config.Scope); err != nil {
+WHERE name=$1`, name, config.ClientID, encryptedClientSecret, config.Scope); err != nil {
 		return Account{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -1084,6 +1509,7 @@ WHERE name=$1`, name, config.ClientID, s.enc(config.ClientSecret), config.Scope)
 func (s *PgStore) Account(name string) (Account, bool) {
 	a, err := s.scanAccount(s.pool.QueryRow(context.Background(), `SELECT `+accountCols+` FROM narthex_accounts WHERE name=$1`, name))
 	if err != nil {
+		log.Printf("engine: account %q is unavailable: %v", name, err)
 		return Account{}, false
 	}
 	return a, true
@@ -2256,9 +2682,24 @@ func (s *PgStore) scanPendingCall(row pendingCallScanner) (PendingCall, error) {
 		return PendingCall{}, err
 	}
 	p.ExpiresAt = &expires
-	if err := json.Unmarshal([]byte(s.dec(args)), &p.Args); err != nil {
+	plainArgs, err := s.dec(args)
+	if err != nil {
+		return PendingCall{}, fmt.Errorf("decrypt pending call %q arguments: %w", p.ID, err)
+	}
+	if err := json.Unmarshal([]byte(plainArgs), &p.Args); err != nil {
 		return PendingCall{}, fmt.Errorf("pending call %q args: %w", p.ID, err)
 	}
+	// decided_by/decision_note are encrypted at rest like the audit error
+	// column; legacy plaintext rows read through s.dec's passthrough.
+	decidedBy, err := s.dec(p.DecidedBy)
+	if err != nil {
+		return PendingCall{}, fmt.Errorf("decrypt pending call %q decider: %w", p.ID, err)
+	}
+	decisionNote, err := s.dec(p.DecisionNote)
+	if err != nil {
+		return PendingCall{}, fmt.Errorf("decrypt pending call %q decision note: %w", p.ID, err)
+	}
+	p.DecidedBy, p.DecisionNote = decidedBy, decisionNote
 	return p, nil
 }
 
@@ -2274,12 +2715,16 @@ func (s *PgStore) LogPending(ctx context.Context, p PendingCall) error {
 	if err != nil {
 		return err
 	}
+	encryptedArgs, err := s.enc(string(b))
+	if err != nil {
+		return fmt.Errorf("encrypt pending call arguments: %w", err)
+	}
 	_, err = s.pool.Exec(ctx, `
 INSERT INTO pending_calls
     (id,ts,connector,account,account_incarnation_id,account_revision,connection_namespace_id,tool,args,status,expires_at)
 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
 		p.ID, p.TS, p.Connector, p.Account, p.AccountIncarnationID, p.AccountRevision, p.ConnectionNamespaceID,
-		p.Tool, s.enc(string(b)), p.Status, p.ExpiresAt)
+		p.Tool, encryptedArgs, p.Status, p.ExpiresAt)
 	return err
 }
 
@@ -2329,11 +2774,15 @@ func (s *PgStore) DecidePending(ctx context.Context, id string, decision Approva
 	if err != nil {
 		return PendingCall{}, err
 	}
+	actor, note, err := s.encryptDecisionMetadata(decision.Actor, decision.Note)
+	if err != nil {
+		return PendingCall{}, err
+	}
 	p, err := s.scanPendingCall(s.pool.QueryRow(ctx, `
 UPDATE pending_calls
 SET status=$2, decided_at=now(), decided_by=$3, decision_note=$4
 WHERE id=$1 AND status='pending' AND expires_at > now()
-RETURNING `+pendingCallColumns, id, decision.Status, decision.Actor, decision.Note))
+RETURNING `+pendingCallColumns, id, decision.Status, actor, note))
 	if err == nil {
 		return p, nil
 	}
@@ -2341,6 +2790,23 @@ RETURNING `+pendingCallColumns, id, decision.Status, decision.Actor, decision.No
 		return PendingCall{}, err
 	}
 	return s.pendingTransitionResult(ctx, id, decision.Status)
+}
+
+// encryptDecisionMetadata applies the at-rest cipher to caller-supplied
+// approval decision metadata before it is written to decided_by/decision_note.
+// Engine-written constants (for example 'engine' / 'approval deadline
+// elapsed') carry no caller input and stay plaintext literals in SQL; s.dec's
+// passthrough reads both forms.
+func (s *PgStore) encryptDecisionMetadata(actor, note string) (string, string, error) {
+	encActor, err := s.enc(actor)
+	if err != nil {
+		return "", "", fmt.Errorf("encrypt approval actor: %w", err)
+	}
+	encNote, err := s.enc(note)
+	if err != nil {
+		return "", "", fmt.Errorf("encrypt approval note: %w", err)
+	}
+	return encActor, encNote, nil
 }
 
 // ExpirePending atomically transitions only a due pending call. Calling it
@@ -2372,11 +2838,15 @@ func (s *PgStore) CancelPending(ctx context.Context, id, actor, note string) (Pe
 	if len(actor) > maxApprovalActorBytes || len(note) > maxApprovalNoteBytes {
 		return PendingCall{}, errors.New("approval cancellation metadata is too long")
 	}
+	encActor, encNote, err := s.encryptDecisionMetadata(actor, note)
+	if err != nil {
+		return PendingCall{}, err
+	}
 	p, err := s.scanPendingCall(s.pool.QueryRow(ctx, `
 UPDATE pending_calls
 SET status='cancelled', decided_at=now(), decided_by=$2, decision_note=$3
 WHERE id=$1 AND status='pending' AND expires_at > now()
-RETURNING `+pendingCallColumns, id, actor, note))
+RETURNING `+pendingCallColumns, id, encActor, encNote))
 	if err == nil {
 		return p, nil
 	}
@@ -2461,7 +2931,17 @@ func (s *PgStore) PendingCalls(ctx context.Context) ([]PendingCall, error) {
 	for rows.Next() {
 		p, err := s.scanPendingCall(rows)
 		if err != nil {
-			return nil, err
+			// A single unreadable row (e.g. a decrypt failure from a
+			// wrong/rotated key) must not fail the whole list: console.go turns
+			// a PendingCalls error into a 502 for every caller, hiding all
+			// pending and historical approvals instead of just the one bad
+			// record. Match PgStore.Accounts: log (row content, never
+			// decrypted/attempted-decrypt values) and skip just this row.
+			// scanPendingCall's single-row callers (ApprovalCall,
+			// DecidePending, ExpirePending, CancelPending) keep propagating the
+			// error for their one row — only this list path omits-and-logs.
+			log.Printf("engine: omit unreadable pending call: %v", err)
+			continue
 		}
 		out = append(out, p)
 	}

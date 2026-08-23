@@ -61,6 +61,10 @@ source control and build uploads.
   scoped `/mcp/clients/{slug}` endpoint only for the exact owner subject.
 - MCP client grant, account-move, reset, and revocation changes rotate the
   affected endpoint epoch so prior resource tokens fail closed.
+- `library_skill_activation` is a context-only handoff on a verified,
+  subject-bound MCP-client endpoint. Do not expose it on root `/mcp`, accept
+  caller-controlled scope/binding context, or add credentials, connection
+  access, runtime grants, or effective capabilities to its contract.
 - Hosted `/api/activation` is service-actor-only and returns only an aggregate
   connection count. Never expand it with account or provider metadata.
 - Process-local OAuth and pending-connect state, plus each live approval

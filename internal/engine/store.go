@@ -207,8 +207,49 @@ type AccountPolicyMutation struct {
 // Description replaces the upstream description. Empty fields inherit the
 // upstream definition.
 type ToolOverride struct {
-	Alias       string `json:"alias,omitempty"`
-	Description string `json:"description,omitempty"`
+	Alias            string           `json:"alias,omitempty"`
+	Description      string           `json:"description,omitempty"`
+	GovernancePreset GovernancePreset `json:"governancePreset,omitempty"`
+}
+
+// GovernancePreset is an explicit, durable safety policy for a single
+// upstream tool. It is intentionally kept alongside the agent-facing alias
+// and description rather than on a delivery endpoint, because the same tool
+// can be reachable through the aggregate, an endpoint bundle, a connector,
+// or a subject-bound MCP client.
+//
+// The empty value preserves the historical behaviour for existing accounts.
+// Safe-write and high-risk are enforced by the Gateway on every projection;
+// they are not merely console labels that another MCP URL can bypass.
+type GovernancePreset string
+
+const (
+	GovernancePresetReadOnly  GovernancePreset = "read_only"
+	GovernancePresetSafeWrite GovernancePreset = "safe_write"
+	GovernancePresetHighRisk  GovernancePreset = "high_risk"
+)
+
+func normalizedGovernancePreset(preset GovernancePreset) (GovernancePreset, error) {
+	switch GovernancePreset(strings.ToLower(strings.TrimSpace(string(preset)))) {
+	case "":
+		return "", nil
+	case GovernancePresetReadOnly:
+		return GovernancePresetReadOnly, nil
+	case GovernancePresetSafeWrite:
+		return GovernancePresetSafeWrite, nil
+	case GovernancePresetHighRisk:
+		return GovernancePresetHighRisk, nil
+	default:
+		return "", fmt.Errorf("invalid governance preset %q", preset)
+	}
+}
+
+func (preset GovernancePreset) requiresApproval() bool {
+	return preset == GovernancePresetSafeWrite || preset == GovernancePresetHighRisk
+}
+
+func (preset GovernancePreset) recordsPayloads() bool {
+	return preset == GovernancePresetHighRisk
 }
 
 // VirtualConnector is a named, curated subset of the aggregated tools, served
@@ -694,25 +735,94 @@ type FileStore struct {
 	namespaces           []*Namespace
 	connectionNamespaces []*ConnectionNamespace
 	mcpClients           []*MCPClient
-	oauthTokenGeneration string
-	log                  ring          // in-memory audit ring
-	pending              []PendingCall // approval records (ephemeral, not persisted)
+	// Skills domain state (SkillStore facet — see skills_file.go). Kept as
+	// plain slices/maps, same as every other FileStore facet above.
+	skillSources  []*SkillSource
+	skills        []*Skill
+	skillVersions []*SkillVersion
+	skillCarriers []*SkillCarrier
+	skillDrift    []*SkillDriftFinding
+	skillChecks   map[string]*SkillCheckRun // skillID -> latest run
+	// Library v2 is deliberately separate from the legacy Git-backed skills
+	// facet above. It stores portable authored skills, artifacts, and run
+	// provenance without adopting connection-namespace semantics.
+	librarySkills        []*LibrarySkill
+	librarySkillVersions []*LibrarySkillVersion
+	librarySkillDrafts   []*LibrarySkillDraft
+	// librarySkillDraftImports holds only request/payload hashes for the
+	// Platform-to-Engine generated-draft handoff. It is deliberately separate
+	// from the editable draft so no raw request id is persisted.
+	librarySkillDraftImports []*librarySkillDraftImportRecord
+	librarySkillBindings     []*LibrarySkillBinding
+	librarySkillEvaluations  []*LibrarySkillEvaluation
+	libraryArtifacts         []*LibraryArtifact
+	libraryArtifactVersions  []*LibraryArtifactVersion
+	// One private immutable image blob may belong to an image-format artifact
+	// version. It is deliberately per-version rather than content-deduplicated.
+	libraryArtifactMediaBlobs  []*libraryArtifactMediaBlob
+	libraryArtifactGrants      []*LibraryArtifactGrant
+	libraryRuns                []*LibraryRun
+	libraryRuntimeAttestations []*libraryRuntimeAttestationRecord
+	// Authoring leases are a separate, narrow client-MCP capability. Request
+	// records retain only scoped hashes so a retry cannot consume another slot.
+	libraryMCPClientSkillAuthoringLeases      []*LibraryMCPClientSkillAuthoringLease
+	libraryMCPClientSkillAuthoringRequests    []*libraryMCPClientSkillAuthoringRequestRecord
+	libraryMCPClientSkillAuthoringAuditEvents []*LibraryMCPClientSkillAuthoringAuditEvent
+	oauthTokenGeneration                      string
+	// OAuth grants live beside the durable generation so local Engines do not
+	// accept a code on one process and forget it after a restart. Hosted
+	// replicas use PgStore's transactional implementation instead.
+	oauthAuthorizationCodes   map[string]fileOAuthAuthorizationCode
+	oauthRefreshGrants        map[string]fileOAuthRefreshGrant
+	oauthHostedConsentReplays map[string]fileOAuthHostedConsentReplay
+	log                       ring          // in-memory audit ring
+	pending                   []PendingCall // approval records (ephemeral, not persisted)
 }
 
 var _ NamespaceStore = (*FileStore)(nil)
 var _ ConnectionNamespaceStore = (*FileStore)(nil)
 var _ StaticOAuthConfigStore = (*FileStore)(nil)
+var _ LibraryRuntimeAttestationStore = (*FileStore)(nil)
 
 // fileStoreData is the on-disk shape. Older files were a bare JSON array of
 // accounts; LoadFileStore still accepts that, and a missing "connectors"
 // field simply loads as empty.
 type fileStoreData struct {
-	Accounts             []*Account             `json:"accounts"`
-	Connectors           []*VirtualConnector    `json:"connectors,omitempty"`
-	Namespaces           []*Namespace           `json:"namespaces,omitempty"`
-	ConnectionNamespaces []*ConnectionNamespace `json:"connection_namespaces,omitempty"`
-	MCPClients           []*MCPClient           `json:"mcp_clients,omitempty"`
-	OAuthTokenGeneration string                 `json:"oauth_token_generation,omitempty"`
+	Accounts                                  []*Account                                     `json:"accounts"`
+	Connectors                                []*VirtualConnector                            `json:"connectors,omitempty"`
+	Namespaces                                []*Namespace                                   `json:"namespaces,omitempty"`
+	ConnectionNamespaces                      []*ConnectionNamespace                         `json:"connection_namespaces,omitempty"`
+	MCPClients                                []*MCPClient                                   `json:"mcp_clients,omitempty"`
+	SkillSources                              []*SkillSource                                 `json:"skill_sources,omitempty"`
+	Skills                                    []*Skill                                       `json:"skills,omitempty"`
+	SkillVersions                             []*SkillVersion                                `json:"skill_versions,omitempty"`
+	SkillCarriers                             []*SkillCarrier                                `json:"skill_carriers,omitempty"`
+	SkillDrift                                []*SkillDriftFinding                           `json:"skill_drift,omitempty"`
+	SkillChecks                               map[string]*SkillCheckRun                      `json:"skill_checks,omitempty"`
+	LibrarySkills                             []*LibrarySkill                                `json:"library_skills,omitempty"`
+	LibrarySkillVersions                      []*LibrarySkillVersion                         `json:"library_skill_versions,omitempty"`
+	LibrarySkillDrafts                        []*LibrarySkillDraft                           `json:"library_skill_drafts,omitempty"`
+	LibrarySkillDraftImports                  []*librarySkillDraftImportRecord               `json:"library_skill_draft_imports,omitempty"`
+	LibrarySkillBindings                      []*LibrarySkillBinding                         `json:"library_skill_bindings,omitempty"`
+	LibrarySkillEvaluations                   []*LibrarySkillEvaluation                      `json:"library_skill_evaluations,omitempty"`
+	LibraryArtifacts                          []*LibraryArtifact                             `json:"library_artifacts,omitempty"`
+	LibraryArtifactVersions                   []*LibraryArtifactVersion                      `json:"library_artifact_versions,omitempty"`
+	LibraryArtifactMediaBlobs                 []*libraryArtifactMediaBlob                    `json:"library_artifact_media_blobs,omitempty"`
+	LibraryArtifactGrants                     []*LibraryArtifactGrant                        `json:"library_artifact_grants,omitempty"`
+	LibraryRuns                               []*LibraryRun                                  `json:"library_runs,omitempty"`
+	LibraryRuntimeAttestations                []*libraryRuntimeAttestationRecord             `json:"library_runtime_attestations,omitempty"`
+	LibraryMCPClientSkillAuthoringLeases      []*LibraryMCPClientSkillAuthoringLease         `json:"library_mcp_client_skill_authoring_leases,omitempty"`
+	LibraryMCPClientSkillAuthoringRequests    []*libraryMCPClientSkillAuthoringRequestRecord `json:"library_mcp_client_skill_authoring_requests,omitempty"`
+	LibraryMCPClientSkillAuthoringAuditEvents []*LibraryMCPClientSkillAuthoringAuditEvent    `json:"library_mcp_client_skill_authoring_audit_events,omitempty"`
+	// LibraryArtifactSurfaceIDs is a query-only structural projection for
+	// subject-bound direct artifacts. Keep it separate from LibraryArtifact's
+	// public JSON shape so generic/root Library responses retain their existing
+	// provenance boundary.
+	LibraryArtifactSurfaceIDs map[string]string                       `json:"library_artifact_surface_ids,omitempty"`
+	OAuthTokenGeneration      string                                  `json:"oauth_token_generation,omitempty"`
+	OAuthAuthorizationCodes   map[string]fileOAuthAuthorizationCode   `json:"oauth_authorization_codes,omitempty"`
+	OAuthRefreshGrants        map[string]fileOAuthRefreshGrant        `json:"oauth_refresh_grants,omitempty"`
+	OAuthHostedConsentReplays map[string]fileOAuthHostedConsentReplay `json:"oauth_hosted_consent_replays,omitempty"`
 }
 
 func (s *FileStore) LogCall(rec CallRecord) {
@@ -720,6 +830,9 @@ func (s *FileStore) LogCall(rec CallRecord) {
 }
 func (s *FileStore) RecentCalls(ctx context.Context, limit int) ([]CallRecord, error) {
 	return s.log.RecentCalls(ctx, limit)
+}
+func (s *FileStore) RecentCallsBefore(ctx context.Context, beforeTS time.Time, beforeID int64, limit int) ([]CallRecord, error) {
+	return s.log.RecentCallsBefore(ctx, beforeTS, beforeID, limit)
 }
 func (s *FileStore) CallDetail(ctx context.Context, id int64) (CallRecord, bool, error) {
 	return s.log.CallDetail(ctx, id)
@@ -734,7 +847,7 @@ func (s *FileStore) PurgeCalls(_ context.Context, _ time.Duration) (int64, error
 }
 
 func LoadFileStore(path string) (*FileStore, error) {
-	s := &FileStore{path: path}
+	s := &FileStore{path: path, skillChecks: map[string]*SkillCheckRun{}}
 	b, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		return s, nil
@@ -768,6 +881,27 @@ func LoadFileStore(path string) (*FileStore, error) {
 		return nil, fmt.Errorf("parse account store: %w", err)
 	}
 	s.accounts, s.connectors, s.namespaces, s.connectionNamespaces, s.mcpClients, s.oauthTokenGeneration = d.Accounts, d.Connectors, d.Namespaces, d.ConnectionNamespaces, d.MCPClients, d.OAuthTokenGeneration
+	s.skillSources, s.skills, s.skillVersions, s.skillCarriers, s.skillDrift = d.SkillSources, d.Skills, d.SkillVersions, d.SkillCarriers, d.SkillDrift
+	s.skillChecks = d.SkillChecks
+	s.librarySkills, s.librarySkillVersions, s.librarySkillDrafts = d.LibrarySkills, d.LibrarySkillVersions, d.LibrarySkillDrafts
+	s.librarySkillDraftImports = d.LibrarySkillDraftImports
+	s.librarySkillBindings, s.librarySkillEvaluations = d.LibrarySkillBindings, d.LibrarySkillEvaluations
+	s.libraryArtifacts, s.libraryArtifactVersions, s.libraryArtifactMediaBlobs, s.libraryArtifactGrants, s.libraryRuns = d.LibraryArtifacts, d.LibraryArtifactVersions, d.LibraryArtifactMediaBlobs, d.LibraryArtifactGrants, d.LibraryRuns
+	s.libraryRuntimeAttestations = d.LibraryRuntimeAttestations
+	s.libraryMCPClientSkillAuthoringLeases = d.LibraryMCPClientSkillAuthoringLeases
+	s.libraryMCPClientSkillAuthoringRequests = d.LibraryMCPClientSkillAuthoringRequests
+	s.libraryMCPClientSkillAuthoringAuditEvents = d.LibraryMCPClientSkillAuthoringAuditEvents
+	for _, artifact := range s.libraryArtifacts {
+		if artifact != nil {
+			artifact.AgentSurfaceID = d.LibraryArtifactSurfaceIDs[artifact.ID]
+		}
+	}
+	if s.skillChecks == nil {
+		s.skillChecks = map[string]*SkillCheckRun{}
+	}
+	s.oauthAuthorizationCodes = d.OAuthAuthorizationCodes
+	s.oauthRefreshGrants = d.OAuthRefreshGrants
+	s.oauthHostedConsentReplays = d.OAuthHostedConsentReplays
 	connectionChanged, err := s.backfillConnectionNamespacesLocked()
 	if err != nil {
 		return nil, fmt.Errorf("migrate connection namespaces: %w", err)
@@ -776,7 +910,8 @@ func LoadFileStore(path string) (*FileStore, error) {
 	if err != nil {
 		return nil, fmt.Errorf("migrate MCP clients: %w", err)
 	}
-	if connectionChanged || clientChanged {
+	libraryChanged := s.backfillLibraryArtifactSurfaceIDsLocked()
+	if connectionChanged || clientChanged || libraryChanged {
 		if err := s.saveLocked(); err != nil {
 			return nil, fmt.Errorf("persist store migration: %w", err)
 		}
@@ -870,12 +1005,37 @@ func (s *FileStore) SetBearerToken(_ context.Context, name, expectedIncarnationI
 
 func (s *FileStore) saveLocked() error {
 	b, err := json.MarshalIndent(fileStoreData{
-		Accounts:             s.accounts,
-		Connectors:           s.connectors,
-		Namespaces:           s.namespaces,
-		ConnectionNamespaces: s.connectionNamespaces,
-		MCPClients:           s.mcpClients,
-		OAuthTokenGeneration: s.oauthTokenGeneration,
+		Accounts:                               s.accounts,
+		Connectors:                             s.connectors,
+		Namespaces:                             s.namespaces,
+		ConnectionNamespaces:                   s.connectionNamespaces,
+		MCPClients:                             s.mcpClients,
+		SkillSources:                           s.skillSources,
+		Skills:                                 s.skills,
+		SkillVersions:                          s.skillVersions,
+		SkillCarriers:                          s.skillCarriers,
+		SkillDrift:                             s.skillDrift,
+		SkillChecks:                            s.skillChecks,
+		LibrarySkills:                          s.librarySkills,
+		LibrarySkillVersions:                   s.librarySkillVersions,
+		LibrarySkillDrafts:                     s.librarySkillDrafts,
+		LibrarySkillDraftImports:               s.librarySkillDraftImports,
+		LibrarySkillBindings:                   s.librarySkillBindings,
+		LibrarySkillEvaluations:                s.librarySkillEvaluations,
+		LibraryArtifacts:                       s.libraryArtifacts,
+		LibraryArtifactVersions:                s.libraryArtifactVersions,
+		LibraryArtifactMediaBlobs:              s.libraryArtifactMediaBlobs,
+		LibraryArtifactGrants:                  s.libraryArtifactGrants,
+		LibraryRuns:                            s.libraryRuns,
+		LibraryRuntimeAttestations:             s.libraryRuntimeAttestations,
+		LibraryMCPClientSkillAuthoringLeases:   s.libraryMCPClientSkillAuthoringLeases,
+		LibraryMCPClientSkillAuthoringRequests: s.libraryMCPClientSkillAuthoringRequests,
+		LibraryMCPClientSkillAuthoringAuditEvents: s.libraryMCPClientSkillAuthoringAuditEvents,
+		LibraryArtifactSurfaceIDs:                 s.libraryArtifactSurfaceIDsLocked(),
+		OAuthTokenGeneration:                      s.oauthTokenGeneration,
+		OAuthAuthorizationCodes:                   s.oauthAuthorizationCodes,
+		OAuthRefreshGrants:                        s.oauthRefreshGrants,
+		OAuthHostedConsentReplays:                 s.oauthHostedConsentReplays,
 	}, "", "  ")
 	if err != nil {
 		return err
@@ -1008,6 +1168,9 @@ func (s *FileStore) Create(_ context.Context, a Account) error {
 	return nil
 }
 
+// Upsert adds or updates an account. Caller-supplied revisions are ignored on
+// update: the store owns revision monotonicity, deriving the new revision from
+// the prior row (bump on ownership change, preserve otherwise).
 func (s *FileStore) Upsert(_ context.Context, a Account) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1016,7 +1179,6 @@ func (s *FileStore) Upsert(_ context.Context, a Account) error {
 	oldEndpointNamespaces := copyEndpointNamespaces(s.namespaces)
 	oldMCPClients := copyMCPClients(s.mcpClients)
 	cp := copyAccount(a)
-	incomingRevision := cp.Revision
 	var previous *Account
 	var before Account
 	for _, existing := range s.accounts {
@@ -1051,7 +1213,9 @@ func (s *FileStore) Upsert(_ context.Context, a Account) error {
 		s.connectionNamespaces = oldConnectionNamespaces
 		return err
 	}
-	if previous != nil && incomingRevision < 1 {
+	if previous != nil {
+		// The store owns revision monotonicity: derive the new revision from the
+		// prior row, ignoring any caller-supplied value.
 		if cp.ConnectionNamespaceID != previous.ConnectionNamespaceID || cp.ConnectionScope != previous.ConnectionScope || cp.OwnerSubject != previous.OwnerSubject {
 			cp.Revision = previous.Revision + 1
 		} else {

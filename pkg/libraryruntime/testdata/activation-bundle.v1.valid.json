@@ -1,0 +1,38 @@
+{
+  "contractVersion": "synaxis.library.activation.v1",
+  "agentSurface": {
+    "kind": "mcp_client",
+    "id": "mcpcli_example"
+  },
+  "skills": [
+    {
+      "skillId": "skill_release_notes",
+      "skillSlug": "release-notes",
+      "skillName": "Release Notes",
+      "versionId": "version_1",
+      "version": 1,
+      "instructions": "Summarize verified changes. Do not invent deployment status.",
+      "contentDigest": "7a010fb1377c232ab41fb54ca9261a268c31a43d7716dce0d3f68c5c4b125e43",
+      "binding": {
+        "id": "binding_example",
+        "mode": "pin",
+        "priority": 100
+      },
+      "constraints": {
+        "requestedCapabilities": [
+          "repo.read"
+        ],
+        "capabilityCeiling": [
+          "repo.read"
+        ]
+      }
+    }
+  ],
+  "bundleDigest": "0ae2262f7b5c5ddcae6fdf63190f1281f1c952f47cb166424a5e0785cd22861a",
+  "authorityNotice": "This activation bundle is context only. It grants no credentials, OAuth scopes, permissions, tools, connection access, or effective capabilities. Independently authorize and enforce policy for every action.",
+  "hostResponsibilities": [
+    "Decide whether and how to place these instructions into a host-model turn; Synaxis Engine does not inject or execute them in a third-party host.",
+    "Verify each instruction body against contentDigest before use and reject an unsupported contractVersion.",
+    "Independently authenticate and enforce every tool, connection, credential, and capability policy immediately before an action; requestedCapabilities and capabilityCeiling are constraints, never grants."
+  ]
+}

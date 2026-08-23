@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS narthex_mcp_clients (
     name            TEXT NOT NULL,
     subject         TEXT NOT NULL,
     oauth_client_id TEXT NOT NULL DEFAULT '',
+	runtime_attestor_public_key TEXT NOT NULL DEFAULT '',
     status          TEXT NOT NULL DEFAULT 'active',
     epoch           TEXT NOT NULL,
     revision        BIGINT NOT NULL DEFAULT 1 CHECK (revision >= 1),
@@ -45,6 +46,7 @@ CREATE INDEX IF NOT EXISTS narthex_mcp_clients_subject_status_idx
 CREATE INDEX IF NOT EXISTS narthex_mcp_client_namespaces_namespace_idx
     ON narthex_mcp_client_namespaces (connection_namespace_id, client_id);
 ALTER TABLE narthex_mcp_clients ADD COLUMN IF NOT EXISTS oauth_client_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE narthex_mcp_clients ADD COLUMN IF NOT EXISTS runtime_attestor_public_key TEXT NOT NULL DEFAULT '';
 ALTER TABLE narthex_mcp_clients ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active';
 ALTER TABLE narthex_mcp_clients ADD COLUMN IF NOT EXISTS epoch TEXT NOT NULL DEFAULT '';
 ALTER TABLE narthex_mcp_clients ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;
@@ -80,7 +82,7 @@ END $$;`
 var _ MCPClientStore = (*PgStore)(nil)
 
 const mcpClientSelect = `
-SELECT c.id,c.slug,c.name,c.subject,c.oauth_client_id,c.status,c.epoch,c.revision,
+SELECT c.id,c.slug,c.name,c.subject,c.oauth_client_id,c.runtime_attestor_public_key,c.status,c.epoch,c.revision,
        c.created_by,c.created_at,c.updated_at,c.revoked_at,c.revoked_by,
        COALESCE(
            array_agg(g.connection_namespace_id ORDER BY g.connection_namespace_id)
@@ -100,7 +102,7 @@ func scanMCPClient(row pgx.Row) (MCPClient, error) {
 		namespaceIDs []string
 	)
 	if err := row.Scan(
-		&client.ID, &client.Slug, &client.Name, &client.Subject, &client.OAuthClientID,
+		&client.ID, &client.Slug, &client.Name, &client.Subject, &client.OAuthClientID, &client.RuntimeAttestorPublicKey,
 		&client.Status, &client.Epoch, &client.Revision, &client.CreatedBy,
 		&client.CreatedAt, &client.UpdatedAt, &client.RevokedAt, &client.RevokedBy,
 		&namespaceIDs,
@@ -117,7 +119,7 @@ func scanMCPClient(row pgx.Row) (MCPClient, error) {
 func loadMCPClient(ctx context.Context, q mcpClientQueryer, id string) (MCPClient, error) {
 	return scanMCPClient(q.QueryRow(ctx, mcpClientSelect+`
 WHERE c.id=$1
-GROUP BY c.id,c.slug,c.name,c.subject,c.oauth_client_id,c.status,c.epoch,c.revision,
+GROUP BY c.id,c.slug,c.name,c.subject,c.oauth_client_id,c.runtime_attestor_public_key,c.status,c.epoch,c.revision,
          c.created_by,c.created_at,c.updated_at,c.revoked_at,c.revoked_by`, id))
 }
 
@@ -126,12 +128,12 @@ func loadMCPClientForUpdate(ctx context.Context, tx pgx.Tx, id string) (MCPClien
 	// this transaction while all client mutations serialize on the row lock.
 	var client MCPClient
 	err := tx.QueryRow(ctx, `
-SELECT id,slug,name,subject,oauth_client_id,status,epoch,revision,
+SELECT id,slug,name,subject,oauth_client_id,runtime_attestor_public_key,status,epoch,revision,
        created_by,created_at,updated_at,revoked_at,revoked_by
 FROM narthex_mcp_clients
 WHERE id=$1
 FOR UPDATE`, id).Scan(
-		&client.ID, &client.Slug, &client.Name, &client.Subject, &client.OAuthClientID,
+		&client.ID, &client.Slug, &client.Name, &client.Subject, &client.OAuthClientID, &client.RuntimeAttestorPublicKey,
 		&client.Status, &client.Epoch, &client.Revision, &client.CreatedBy,
 		&client.CreatedAt, &client.UpdatedAt, &client.RevokedAt, &client.RevokedBy,
 	)
@@ -412,7 +414,7 @@ SELECT EXISTS(
 
 func (s *PgStore) MCPClients(ctx context.Context) ([]MCPClient, error) {
 	rows, err := s.pool.Query(ctx, mcpClientSelect+`
-GROUP BY c.id,c.slug,c.name,c.subject,c.oauth_client_id,c.status,c.epoch,c.revision,
+GROUP BY c.id,c.slug,c.name,c.subject,c.oauth_client_id,c.runtime_attestor_public_key,c.status,c.epoch,c.revision,
          c.created_by,c.created_at,c.updated_at,c.revoked_at,c.revoked_by
 ORDER BY c.slug,c.id`)
 	if err != nil {
@@ -433,7 +435,7 @@ ORDER BY c.slug,c.id`)
 func (s *PgStore) ActiveMCPClients(ctx context.Context) ([]MCPClient, error) {
 	rows, err := s.pool.Query(ctx, mcpClientSelect+`
 WHERE c.status='active'
-GROUP BY c.id,c.slug,c.name,c.subject,c.oauth_client_id,c.status,c.epoch,c.revision,
+GROUP BY c.id,c.slug,c.name,c.subject,c.oauth_client_id,c.runtime_attestor_public_key,c.status,c.epoch,c.revision,
          c.created_by,c.created_at,c.updated_at,c.revoked_at,c.revoked_by
 ORDER BY c.slug,c.id`)
 	if err != nil {
@@ -462,7 +464,7 @@ func (s *PgStore) MCPClient(ctx context.Context, id string) (MCPClient, bool) {
 func (s *PgStore) MCPClientBySlug(ctx context.Context, slug string) (MCPClient, bool) {
 	client, err := scanMCPClient(s.pool.QueryRow(ctx, mcpClientSelect+`
 WHERE c.slug=$1
-GROUP BY c.id,c.slug,c.name,c.subject,c.oauth_client_id,c.status,c.epoch,c.revision,
+GROUP BY c.id,c.slug,c.name,c.subject,c.oauth_client_id,c.runtime_attestor_public_key,c.status,c.epoch,c.revision,
          c.created_by,c.created_at,c.updated_at,c.revoked_at,c.revoked_by`, normalizeMCPClientSlug(slug)))
 	if err != nil {
 		return MCPClient{}, false
@@ -488,7 +490,7 @@ func (s *PgStore) ActiveMCPClientByOAuthClientID(ctx context.Context, oauthClien
 	}
 	client, err := scanMCPClient(s.pool.QueryRow(ctx, mcpClientSelect+`
 WHERE c.oauth_client_id=$1 AND c.status='active'
-GROUP BY c.id,c.slug,c.name,c.subject,c.oauth_client_id,c.status,c.epoch,c.revision,
+GROUP BY c.id,c.slug,c.name,c.subject,c.oauth_client_id,c.runtime_attestor_public_key,c.status,c.epoch,c.revision,
          c.created_by,c.created_at,c.updated_at,c.revoked_at,c.revoked_by`, oauthClientID))
 	if err != nil {
 		return MCPClient{}, false
@@ -559,9 +561,9 @@ func (s *PgStore) CreateMCPClient(ctx context.Context, client MCPClient) (MCPCli
 	}
 	if _, err := tx.Exec(ctx, `
 INSERT INTO narthex_mcp_clients
-    (id,slug,name,subject,oauth_client_id,status,epoch,revision,created_by,created_at,updated_at,revoked_at,revoked_by)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
-		client.ID, client.Slug, client.Name, client.Subject, client.OAuthClientID,
+    (id,slug,name,subject,oauth_client_id,runtime_attestor_public_key,status,epoch,revision,created_by,created_at,updated_at,revoked_at,revoked_by)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+		client.ID, client.Slug, client.Name, client.Subject, client.OAuthClientID, client.RuntimeAttestorPublicKey,
 		client.Status, client.Epoch, client.Revision, client.CreatedBy,
 		client.CreatedAt, client.UpdatedAt, client.RevokedAt, client.RevokedBy); err != nil {
 		return MCPClient{}, err
@@ -605,7 +607,15 @@ func (s *PgStore) UpdateMCPClient(ctx context.Context, update MCPClient, precond
 	if update.Slug != "" && normalizeMCPClientSlug(update.Slug) != client.Slug {
 		return MCPClient{}, fmt.Errorf("%w: endpoint slug is immutable", ErrInvalidMCPClient)
 	}
-	if name == client.Name {
+	key := client.RuntimeAttestorPublicKey
+	if update.runtimeAttestorKeySet {
+		var keyErr error
+		key, keyErr = normalizeMCPClientRuntimeAttestorPublicKey(update.RuntimeAttestorPublicKey)
+		if keyErr != nil {
+			return MCPClient{}, keyErr
+		}
+	}
+	if name == client.Name && key == client.RuntimeAttestorPublicKey {
 		if err := tx.Commit(ctx); err != nil {
 			return MCPClient{}, err
 		}
@@ -613,12 +623,15 @@ func (s *PgStore) UpdateMCPClient(ctx context.Context, update MCPClient, precond
 	}
 	if err := tx.QueryRow(ctx, `
 UPDATE narthex_mcp_clients
-SET name=$2,revision=revision+1,updated_at=now()
+SET name=$2,runtime_attestor_public_key=$3,
+    epoch=CASE WHEN runtime_attestor_public_key IS DISTINCT FROM $3 THEN $4 ELSE epoch END,
+    revision=revision+1,updated_at=now()
 WHERE id=$1
-RETURNING revision,updated_at`, client.ID, name).Scan(&client.Revision, &client.UpdatedAt); err != nil {
+RETURNING epoch,revision,updated_at`, client.ID, name, key, newEpoch()).Scan(&client.Epoch, &client.Revision, &client.UpdatedAt); err != nil {
 		return MCPClient{}, err
 	}
 	client.Name = name
+	client.RuntimeAttestorPublicKey = key
 	if err := tx.Commit(ctx); err != nil {
 		return MCPClient{}, err
 	}

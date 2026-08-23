@@ -42,8 +42,9 @@ func withAuditScope(ctx context.Context, sc *auditScope) context.Context {
 	return context.WithValue(ctx, auditScopeKey{}, sc)
 }
 
-// auditScopeFrom returns the request's scope, or nil for calls on the default
-// /mcp endpoint (which never injects one).
+// auditScopeFrom returns the request's scope. Ordinary default /mcp calls have
+// none; an account-level high-risk policy may add an identity-free scope there
+// solely to carry its approval decision and payload-recording requirement.
 func auditScopeFrom(ctx context.Context) *auditScope {
 	sc, _ := ctx.Value(auditScopeKey{}).(*auditScope)
 	return sc
@@ -60,6 +61,22 @@ func (g *Gateway) scopedHandler(
 	inner server.ToolHandlerFunc,
 ) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		// A durable tool-governance wrapper may sit inside an endpoint bundle,
+		// connector, or subject-bound client wrapper. Preserve the outermost
+		// endpoint attribution, but merge stricter inner requirements: a
+		// high-risk policy must keep payload recording on even when the selected
+		// connector itself records summaries only. The shared scope pointer also
+		// lets an inner approval wrapper stamp its decision on the final audit
+		// row without erasing the client-facing endpoint name.
+		if current := auditScopeFrom(ctx); current != nil {
+			if record {
+				current.record = true
+			}
+			if current.guards == nil && guards != nil {
+				current.guards = guards
+			}
+			return inner(ctx, req)
+		}
 		return inner(withAuditScope(ctx, &auditScope{
 			connector: connector, kind: kind, generation: generation,
 			record: record, guards: guards,

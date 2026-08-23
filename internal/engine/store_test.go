@@ -183,6 +183,61 @@ func TestFileStoreCreateRejectsExistingAccountAndUpsertStillUpdates(t *testing.T
 	}
 }
 
+func TestFileStoreUpsertOwnsRevisionMonotonicity(t *testing.T) {
+	ctx := context.Background()
+	store, err := LoadFileStore(filepath.Join(t.TempDir(), "accounts.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := store.CreateConnectionNamespace(ctx, ConnectionNamespace{Label: "Source"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := store.CreateConnectionNamespace(ctx, ConnectionNamespace{Label: "Target"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The create path still honors an explicit positive revision.
+	if err := store.Upsert(ctx, Account{
+		Name: "acme", Group: source.Label,
+		ConnectionNamespaceID: source.ID, ConnectionScope: ConnectionScopeShared,
+		URL: "https://acme.example/mcp", AuthMode: "token", BearerToken: "secret",
+		Revision: 3,
+	}); err != nil {
+		t.Fatalf("create via Upsert: %v", err)
+	}
+	created, ok := store.Account("acme")
+	if !ok || created.Revision != 3 {
+		t.Fatalf("create honoring explicit revision = %+v, want Revision 3", created)
+	}
+
+	// A caller-supplied regression is ignored: unchanged ownership preserves 3.
+	stale := created
+	stale.Revision = 1
+	stale.Label = "Renamed"
+	if err := store.Upsert(ctx, stale); err != nil {
+		t.Fatalf("update via Upsert: %v", err)
+	}
+	after, _ := store.Account("acme")
+	if after.Revision != 3 || after.Label != "Renamed" {
+		t.Fatalf("caller-supplied revision regressed the row: %+v", after)
+	}
+
+	// An ownership change bumps from the prior row, not the caller's value.
+	moved := after
+	moved.Revision = 1
+	moved.ConnectionNamespaceID = target.ID
+	moved.Group = target.Label
+	if err := store.Upsert(ctx, moved); err != nil {
+		t.Fatalf("ownership move via Upsert: %v", err)
+	}
+	afterMove, _ := store.Account("acme")
+	if afterMove.Revision != 4 || afterMove.ConnectionNamespaceID != target.ID {
+		t.Fatalf("ownership move revision = %+v, want Revision 4 in target namespace", afterMove)
+	}
+}
+
 func TestFileStoreAccountIncarnationIsStoreOwnedImmutableAndNeverReused(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "accounts.json")

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -19,6 +20,14 @@ import (
 type PgStore struct {
 	pool   *pgxpool.Pool
 	cipher *Cipher // nil = no at-rest encryption (passthrough)
+
+	// audit accepts durable activity without letting Postgres latency block an
+	// already-governed tool call. It is initialized only after schema bootstrap
+	// succeeds, so a partially constructed store never owns a worker.
+	audit *auditWriter
+
+	poolCloseOnce           sync.Once
+	poolCloseAfterAuditOnce sync.Once
 }
 
 var _ NamespaceStore = (*PgStore)(nil)
@@ -31,21 +40,400 @@ const (
 	enginePostgresMaxConnIdleTime       = 5 * time.Minute
 )
 
-// SetCipher enables AES-GCM encryption of token columns at rest.
+// SetCipher enables AES-GCM encryption of PgStore's sensitive content at rest.
 func (s *PgStore) SetCipher(c *Cipher) { s.cipher = c }
 
-func (s *PgStore) enc(v string) string { return s.cipher.Encrypt(v) }
-func (s *PgStore) dec(v string) string { return s.cipher.Decrypt(v) }
+func (s *PgStore) enc(v string) (string, error)      { return s.cipher.Encrypt(v) }
+func (s *PgStore) dec(v string) (string, error)      { return s.cipher.Decrypt(v) }
+func (s *PgStore) encBytes(v []byte) ([]byte, error) { return s.cipher.EncryptBytes(v) }
+func (s *PgStore) decBytes(v []byte) ([]byte, error) { return s.cipher.DecryptBytes(v) }
 
-// EncryptExisting re-writes every account so any legacy plaintext token columns
-// become encrypted. Idempotent: already-encrypted values are left as-is.
+func (s *PgStore) encryptAccountSecrets(a Account) (clientSecret, accessToken, refreshToken, bearerToken string, err error) {
+	if clientSecret, err = s.enc(a.ClientSecret); err != nil {
+		return "", "", "", "", fmt.Errorf("encrypt client secret: %w", err)
+	}
+	if accessToken, err = s.enc(a.AccessToken); err != nil {
+		return "", "", "", "", fmt.Errorf("encrypt access token: %w", err)
+	}
+	if refreshToken, err = s.enc(a.RefreshToken); err != nil {
+		return "", "", "", "", fmt.Errorf("encrypt refresh token: %w", err)
+	}
+	if bearerToken, err = s.enc(a.BearerToken); err != nil {
+		return "", "", "", "", fmt.Errorf("encrypt bearer token: %w", err)
+	}
+	return clientSecret, accessToken, refreshToken, bearerToken, nil
+}
+
+// EncryptExisting re-writes every account so any legacy plaintext token columns,
+// recorded payloads, and audit error/decision metadata become encrypted.
+// Idempotent: already-encrypted values are authenticated and left as-is. A
+// malformed ciphertext or a wrong key stops the migration; silently skipping
+// it would make a hosted Engine appear healthy while credentials were
+// unavailable.
 func (s *PgStore) EncryptExisting(ctx context.Context) error {
 	if s.cipher == nil {
+		return ErrCipherUnavailable
+	}
+	rows, err := s.pool.Query(ctx, `SELECT `+accountCols+` FROM narthex_accounts ORDER BY name`)
+	if err != nil {
+		return fmt.Errorf("list accounts for encryption migration: %w", err)
+	}
+	var accounts []Account
+	for rows.Next() {
+		a, err := s.scanAccount(rows)
+		if err != nil {
+			rows.Close()
+			return fmt.Errorf("read account for encryption migration: %w", err)
+		}
+		accounts = append(accounts, a)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate accounts for encryption migration: %w", err)
+	}
+	rows.Close()
+	for _, a := range accounts {
+		if err := s.Upsert(ctx, a); err != nil { // Upsert re-encrypts
+			return fmt.Errorf("encrypt account %q: %w", a.Name, err)
+		}
+	}
+	if err := s.encryptExistingPendingCalls(ctx); err != nil {
+		return err
+	}
+	if err := s.encryptExistingCallPayloads(ctx); err != nil {
+		return err
+	}
+	if err := s.encryptExistingLibraryPrivateFields(ctx); err != nil {
+		return err
+	}
+	return s.backfillEncryptedLibraryArtifactSurfaceIDs(ctx)
+}
+
+// backfillPlainLibraryArtifactSurfaceIDs covers self-hosted PgStores that do
+// not enable at-rest encryption. It intentionally uses only an exact existing
+// client ID/subject match; encrypted legacy provenance is handled later by the
+// cipher-aware startup migration below.
+func (s *PgStore) backfillPlainLibraryArtifactSurfaceIDs(ctx context.Context) error {
+	_, err := s.pool.Exec(ctx, `
+UPDATE narthex_library_artifacts AS artifact
+SET agent_surface_id=run.surface_ref
+FROM narthex_library_runs AS run
+JOIN narthex_mcp_clients AS client ON client.id=run.surface_ref AND client.subject=run.actor_ref
+WHERE artifact.agent_surface_id=''
+  AND artifact.origin='agent_direct'
+  AND artifact.run_id=run.id
+  AND run.origin='agent_direct'
+  AND artifact.created_by=run.actor_ref`)
+	return err
+}
+
+// backfillEncryptedLibraryArtifactSurfaceIDs is the same conservative
+// migration after a cipher is configured. Actor/surface refs are private
+// AES-GCM values, so a queryable opaque client ID can only be populated after
+// authenticating/decrypting both sides in-process.
+func (s *PgStore) backfillEncryptedLibraryArtifactSurfaceIDs(ctx context.Context) error {
+	type candidate struct {
+		artifactID string
+		createdBy  string
+		actorRef   string
+		surfaceRef string
+	}
+	rows, err := s.pool.Query(ctx, `
+SELECT artifact.id,artifact.created_by,run.actor_ref,run.surface_ref
+FROM narthex_library_artifacts AS artifact
+JOIN narthex_library_runs AS run ON run.id=artifact.run_id
+WHERE artifact.agent_surface_id=''
+  AND artifact.origin='agent_direct'
+  AND run.origin='agent_direct'
+ORDER BY artifact.id`)
+	if err != nil {
+		return fmt.Errorf("list Library artifact surface projections: %w", err)
+	}
+	var candidates []candidate
+	for rows.Next() {
+		var raw candidate
+		if err := rows.Scan(&raw.artifactID, &raw.createdBy, &raw.actorRef, &raw.surfaceRef); err != nil {
+			rows.Close()
+			return fmt.Errorf("read Library artifact surface projection: %w", err)
+		}
+		candidates = append(candidates, raw)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate Library artifact surface projections: %w", err)
+	}
+	rows.Close()
+	for _, raw := range candidates {
+		createdBy, err := s.dec(raw.createdBy)
+		if err != nil {
+			return fmt.Errorf("decrypt Library artifact %q creator for surface projection: %w", raw.artifactID, err)
+		}
+		actorRef, err := s.dec(raw.actorRef)
+		if err != nil {
+			return fmt.Errorf("decrypt Library artifact %q run actor for surface projection: %w", raw.artifactID, err)
+		}
+		surfaceRef, err := s.dec(raw.surfaceRef)
+		if err != nil {
+			return fmt.Errorf("decrypt Library artifact %q run surface for surface projection: %w", raw.artifactID, err)
+		}
+		if createdBy != actorRef || surfaceRef == "" {
+			continue
+		}
+		var matches bool
+		if err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM narthex_mcp_clients WHERE id=$1 AND subject=$2)`, surfaceRef, actorRef).Scan(&matches); err != nil {
+			return fmt.Errorf("verify Library artifact %q client surface: %w", raw.artifactID, err)
+		}
+		if !matches {
+			continue
+		}
+		if _, err := s.pool.Exec(ctx, `UPDATE narthex_library_artifacts SET agent_surface_id=$2 WHERE id=$1 AND agent_surface_id=''`, raw.artifactID, surfaceRef); err != nil {
+			return fmt.Errorf("write Library artifact %q surface projection: %w", raw.artifactID, err)
+		}
+	}
+	return nil
+}
+
+// encryptExistingLibraryPrivateFields upgrades portable Library authored text,
+// generated/manual drafts, evaluation annotations, artifact metadata/body,
+// and user/agent provenance identifiers that were written before an Engine
+// enabled ENGINE_ENCRYPTION_KEY. The rows remain readable during the migration
+// because Cipher.Decrypt accepts legacy plaintext, but a successful hosted
+// startup must not leave a second private text or provenance store in
+// plaintext.
+func (s *PgStore) encryptExistingLibraryPrivateFields(ctx context.Context) error {
+	type libraryPayload struct{ id, content string }
+
+	upgrade := func(table, column, label string) error {
+		rows, err := s.pool.Query(ctx, `SELECT id,`+column+` FROM `+table+` ORDER BY id`)
+		if err != nil {
+			return fmt.Errorf("list library %s for encryption migration: %w", label, err)
+		}
+		var payloads []libraryPayload
+		for rows.Next() {
+			var payload libraryPayload
+			if err := rows.Scan(&payload.id, &payload.content); err != nil {
+				rows.Close()
+				return fmt.Errorf("read library %s for encryption migration: %w", label, err)
+			}
+			payloads = append(payloads, payload)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return fmt.Errorf("iterate library %s for encryption migration: %w", label, err)
+		}
+		rows.Close()
+		for _, payload := range payloads {
+			encrypted, err := s.enc(payload.content)
+			if err != nil {
+				return fmt.Errorf("encrypt library %s %q: %w", label, payload.id, err)
+			}
+			if encrypted == payload.content {
+				continue
+			}
+			if _, err := s.pool.Exec(ctx, `UPDATE `+table+` SET `+column+`=$2 WHERE id=$1`, payload.id, encrypted); err != nil {
+				return fmt.Errorf("write encrypted library %s %q: %w", label, payload.id, err)
+			}
+		}
 		return nil
 	}
-	for _, a := range s.Accounts() { // Accounts() returns decrypted values
-		if err := s.Upsert(ctx, a); err != nil { // Upsert re-encrypts
-			return err
+
+	if err := upgrade("narthex_library_skills", "name", "skill name"); err != nil {
+		return err
+	}
+	if err := upgrade("narthex_library_skills", "description", "skill description"); err != nil {
+		return err
+	}
+	if err := upgrade("narthex_library_skills", "created_by", "skill created by"); err != nil {
+		return err
+	}
+	if err := upgrade("narthex_library_skill_versions", "content", "skill version"); err != nil {
+		return err
+	}
+	if err := upgrade("narthex_library_skill_versions", "created_by", "skill version created by"); err != nil {
+		return err
+	}
+	if err := upgrade("narthex_library_skill_drafts", "name", "skill draft name"); err != nil {
+		return err
+	}
+	if err := upgrade("narthex_library_skill_drafts", "description", "skill draft description"); err != nil {
+		return err
+	}
+	if err := upgrade("narthex_library_skill_drafts", "content", "draft"); err != nil {
+		return err
+	}
+	if err := upgrade("narthex_library_skill_drafts", "generator", "draft generator"); err != nil {
+		return err
+	}
+	if err := upgrade("narthex_library_skill_drafts", "model", "draft model"); err != nil {
+		return err
+	}
+	if err := upgrade("narthex_library_skill_drafts", "created_by", "skill draft created by"); err != nil {
+		return err
+	}
+	if err := upgrade("narthex_library_skill_bindings", "created_by", "skill binding created by"); err != nil {
+		return err
+	}
+	if err := upgrade("narthex_library_skill_evaluations", "evaluator", "skill evaluation evaluator"); err != nil {
+		return err
+	}
+	if err := upgrade("narthex_library_skill_evaluations", "summary", "skill evaluation summary"); err != nil {
+		return err
+	}
+	if err := upgrade("narthex_library_skill_evaluations", "created_by", "skill evaluation created by"); err != nil {
+		return err
+	}
+	if err := upgrade("narthex_library_runs", "actor_ref", "run actor reference"); err != nil {
+		return err
+	}
+	if err := upgrade("narthex_library_runs", "surface_ref", "run surface reference"); err != nil {
+		return err
+	}
+	if err := upgrade("narthex_library_runs", "source_artifact_id", "run source artifact"); err != nil {
+		return err
+	}
+	if err := upgrade("narthex_library_runs", "source_artifact_version_id", "run source artifact version"); err != nil {
+		return err
+	}
+	if err := upgrade("narthex_library_runs", "source_artifact_digest", "run source artifact digest"); err != nil {
+		return err
+	}
+	if err := upgrade("narthex_library_artifacts", "title", "artifact title"); err != nil {
+		return err
+	}
+	if err := upgrade("narthex_library_artifacts", "summary", "artifact summary"); err != nil {
+		return err
+	}
+	if err := upgrade("narthex_library_artifacts", "created_by", "artifact created by"); err != nil {
+		return err
+	}
+	if err := upgrade("narthex_library_artifacts", "source_artifact_id", "artifact source artifact"); err != nil {
+		return err
+	}
+	if err := upgrade("narthex_library_artifacts", "source_artifact_version_id", "artifact source artifact version"); err != nil {
+		return err
+	}
+	if err := upgrade("narthex_library_artifacts", "source_artifact_digest", "artifact source artifact digest"); err != nil {
+		return err
+	}
+	if err := upgrade("narthex_library_artifact_versions", "body", "artifact version"); err != nil {
+		return err
+	}
+	if err := upgrade("narthex_library_artifact_versions", "created_by", "artifact version created by"); err != nil {
+		return err
+	}
+	if err := upgrade("narthex_library_artifact_grants", "created_by", "artifact grant created by"); err != nil {
+		return err
+	}
+	if err := upgrade("narthex_library_artifact_grants", "revoked_by", "artifact grant revoked by"); err != nil {
+		return err
+	}
+	if err := upgrade("narthex_library_mcp_client_skill_authoring_leases", "granted_by", "MCP client skill authoring grant actor"); err != nil {
+		return err
+	}
+	if err := upgrade("narthex_library_mcp_client_skill_authoring_leases", "revoked_by", "MCP client skill authoring revoke actor"); err != nil {
+		return err
+	}
+	if err := upgrade("narthex_library_mcp_client_skill_authoring_audit_events", "actor_ref", "MCP client skill authoring audit actor"); err != nil {
+		return err
+	}
+	return s.encryptExistingLibraryArtifactMedia(ctx)
+}
+
+// encryptExistingPendingCalls covers args plus the decided_by/decision_note
+// approval-decision metadata added alongside audit-at-rest encryption. Those
+// two columns are write-once (set only at decision time, never UPDATEd
+// again), so a row decided before this migration existed would otherwise stay
+// plaintext forever without this pass.
+func (s *PgStore) encryptExistingPendingCalls(ctx context.Context) error {
+	rows, err := s.pool.Query(ctx, `SELECT id,args,decided_by,decision_note FROM pending_calls ORDER BY id`)
+	if err != nil {
+		return fmt.Errorf("list pending calls for encryption migration: %w", err)
+	}
+	type pendingPayload struct{ id, args, decidedBy, decisionNote string }
+	var payloads []pendingPayload
+	for rows.Next() {
+		var payload pendingPayload
+		if err := rows.Scan(&payload.id, &payload.args, &payload.decidedBy, &payload.decisionNote); err != nil {
+			rows.Close()
+			return fmt.Errorf("read pending call for encryption migration: %w", err)
+		}
+		payloads = append(payloads, payload)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate pending calls for encryption migration: %w", err)
+	}
+	rows.Close()
+	for _, payload := range payloads {
+		args, err := s.enc(payload.args)
+		if err != nil {
+			return fmt.Errorf("encrypt pending call %q arguments: %w", payload.id, err)
+		}
+		decidedBy, err := s.enc(payload.decidedBy)
+		if err != nil {
+			return fmt.Errorf("encrypt pending call %q decider: %w", payload.id, err)
+		}
+		decisionNote, err := s.enc(payload.decisionNote)
+		if err != nil {
+			return fmt.Errorf("encrypt pending call %q decision note: %w", payload.id, err)
+		}
+		if args == payload.args && decidedBy == payload.decidedBy && decisionNote == payload.decisionNote {
+			continue
+		}
+		if _, err := s.pool.Exec(ctx, `UPDATE pending_calls SET args=$2,decided_by=$3,decision_note=$4 WHERE id=$1`,
+			payload.id, args, decidedBy, decisionNote); err != nil {
+			return fmt.Errorf("write encrypted pending call %q: %w", payload.id, err)
+		}
+	}
+	return nil
+}
+
+// encryptExistingCallPayloads covers args/result plus the error column that
+// encryptAuditFields now encrypts on write. error is write-once (set only at
+// insert, never UPDATEd again), so a row logged before this migration existed
+// would otherwise stay plaintext forever without this pass.
+func (s *PgStore) encryptExistingCallPayloads(ctx context.Context) error {
+	rows, err := s.pool.Query(ctx, `SELECT id,args,result,error FROM tool_calls ORDER BY id`)
+	if err != nil {
+		return fmt.Errorf("list call payloads for encryption migration: %w", err)
+	}
+	type callPayload struct {
+		id                   int64
+		args, result, errTxt string
+	}
+	var payloads []callPayload
+	for rows.Next() {
+		var payload callPayload
+		if err := rows.Scan(&payload.id, &payload.args, &payload.result, &payload.errTxt); err != nil {
+			rows.Close()
+			return fmt.Errorf("read call payload for encryption migration: %w", err)
+		}
+		payloads = append(payloads, payload)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate call payloads for encryption migration: %w", err)
+	}
+	rows.Close()
+	for _, payload := range payloads {
+		args, err := s.enc(payload.args)
+		if err != nil {
+			return fmt.Errorf("encrypt call %d arguments: %w", payload.id, err)
+		}
+		result, err := s.enc(payload.result)
+		if err != nil {
+			return fmt.Errorf("encrypt call %d result: %w", payload.id, err)
+		}
+		errTxt, err := s.enc(payload.errTxt)
+		if err != nil {
+			return fmt.Errorf("encrypt call %d error: %w", payload.id, err)
+		}
+		if args == payload.args && result == payload.result && errTxt == payload.errTxt {
+			continue
+		}
+		if _, err := s.pool.Exec(ctx, `UPDATE tool_calls SET args=$2,result=$3,error=$4 WHERE id=$1`,
+			payload.id, args, result, errTxt); err != nil {
+			return fmt.Errorf("write encrypted call %d payload: %w", payload.id, err)
 		}
 	}
 	return nil
@@ -144,7 +532,400 @@ CREATE INDEX IF NOT EXISTS narthex_connection_namespaces_slug_idx
 ALTER TABLE narthex_connection_namespaces ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
 ALTER TABLE narthex_connection_namespaces ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();`
 
+// librarySchema is intentionally independent of the legacy narthex_skills
+// tables. It is idempotent DDL so an Engine can be restarted onto an existing
+// database without a migration framework.
+const librarySchema = `
+CREATE TABLE IF NOT EXISTS narthex_library_skills (
+    id          TEXT PRIMARY KEY,
+    slug        TEXT NOT NULL UNIQUE,
+    name        TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    created_by  TEXT NOT NULL DEFAULT '',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS narthex_library_skills_created_id_idx ON narthex_library_skills (created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS narthex_library_skills_updated_id_idx ON narthex_library_skills (updated_at DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS narthex_library_skill_versions (
+    id                     TEXT PRIMARY KEY,
+    skill_id               TEXT NOT NULL REFERENCES narthex_library_skills(id) ON DELETE RESTRICT,
+    version_number         INT NOT NULL,
+    content                TEXT NOT NULL DEFAULT '',
+    digest                 TEXT NOT NULL,
+    requested_capabilities JSONB NOT NULL DEFAULT '[]'::jsonb,
+    created_by             TEXT NOT NULL DEFAULT '',
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (skill_id, version_number)
+);
+CREATE INDEX IF NOT EXISTS narthex_library_skill_versions_skill_idx ON narthex_library_skill_versions (skill_id, version_number DESC);
+
+CREATE TABLE IF NOT EXISTS narthex_library_skill_drafts (
+    id                     TEXT PRIMARY KEY,
+    name                   TEXT NOT NULL,
+    description            TEXT NOT NULL DEFAULT '',
+    content                TEXT NOT NULL DEFAULT '',
+    requested_capabilities JSONB NOT NULL DEFAULT '[]'::jsonb,
+    origin                 TEXT NOT NULL,
+    generator              TEXT NOT NULL DEFAULT '',
+    model                  TEXT NOT NULL DEFAULT '',
+    prompt_digest          TEXT NOT NULL DEFAULT '',
+    created_by             TEXT NOT NULL DEFAULT '',
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT narthex_library_skill_drafts_origin_check CHECK (origin IN ('generated','manual'))
+);
+
+-- This table is intentionally hash-only. A Platform request id is an opaque
+-- correlation value, and persisting the raw value would add a needless second
+-- private identifier store. The payload digest catches a request-id replay
+-- with different generated content before it could mint another draft.
+CREATE TABLE IF NOT EXISTS narthex_library_skill_draft_imports (
+    request_id_hash TEXT PRIMARY KEY,
+    payload_digest  TEXT NOT NULL,
+    draft_id        TEXT NOT NULL REFERENCES narthex_library_skill_drafts(id) ON DELETE RESTRICT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT narthex_library_skill_draft_imports_request_hash_check CHECK (request_id_hash ~ '^[a-f0-9]{64}$'),
+    CONSTRAINT narthex_library_skill_draft_imports_payload_digest_check CHECK (payload_digest ~ '^[a-f0-9]{64}$')
+);
+
+CREATE TABLE IF NOT EXISTS narthex_library_skill_bindings (
+    id                   TEXT PRIMARY KEY,
+    skill_id             TEXT NOT NULL REFERENCES narthex_library_skills(id) ON DELETE RESTRICT,
+    scope_kind           TEXT NOT NULL,
+    scope_id             TEXT NOT NULL,
+    mode                 TEXT NOT NULL,
+    pinned_version_id    TEXT NOT NULL DEFAULT '',
+    capability_ceiling   JSONB NOT NULL DEFAULT '[]'::jsonb,
+    priority             INT NOT NULL DEFAULT 0,
+    created_by           TEXT NOT NULL DEFAULT '',
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (skill_id, scope_kind, scope_id),
+    CONSTRAINT narthex_library_skill_bindings_mode_check CHECK (mode IN ('pin','track')),
+    CONSTRAINT narthex_library_skill_bindings_scope_check CHECK (scope_kind IN ('workspace','namespace','folder','repository','project','agent_surface'))
+);
+CREATE INDEX IF NOT EXISTS narthex_library_skill_bindings_skill_idx ON narthex_library_skill_bindings (skill_id, priority DESC);
+
+CREATE TABLE IF NOT EXISTS narthex_library_skill_evaluations (
+    id               TEXT PRIMARY KEY,
+    skill_id         TEXT NOT NULL REFERENCES narthex_library_skills(id) ON DELETE RESTRICT,
+    skill_version_id TEXT NOT NULL REFERENCES narthex_library_skill_versions(id) ON DELETE RESTRICT,
+    evaluator        TEXT NOT NULL,
+    score            INT NOT NULL,
+    passed           BOOLEAN NOT NULL,
+    summary          TEXT NOT NULL DEFAULT '',
+    evidence_digest  TEXT NOT NULL DEFAULT '',
+    created_by       TEXT NOT NULL DEFAULT '',
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT narthex_library_skill_evaluations_score_check CHECK (score >= 0 AND score <= 100)
+);
+CREATE INDEX IF NOT EXISTS narthex_library_skill_evaluations_skill_idx ON narthex_library_skill_evaluations (skill_id, created_at);
+
+CREATE TABLE IF NOT EXISTS narthex_library_runs (
+    id                     TEXT PRIMARY KEY,
+    origin                 TEXT NOT NULL,
+    attestation            TEXT NOT NULL DEFAULT '',
+    skill_id               TEXT NOT NULL DEFAULT '',
+    skill_version_id       TEXT NOT NULL DEFAULT '',
+    binding_id             TEXT NOT NULL DEFAULT '',
+    actor_ref              TEXT NOT NULL DEFAULT '',
+    surface_ref            TEXT NOT NULL DEFAULT '',
+    effective_capabilities JSONB NOT NULL DEFAULT '[]'::jsonb,
+    status                 TEXT NOT NULL,
+    input_digest           TEXT NOT NULL DEFAULT '',
+    output_digest          TEXT NOT NULL DEFAULT '',
+		source_artifact_id       TEXT NOT NULL DEFAULT '',
+		source_artifact_version_id TEXT NOT NULL DEFAULT '',
+		source_artifact_digest   TEXT NOT NULL DEFAULT '',
+    started_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT narthex_library_runs_origin_check CHECK (origin IN ('skill_run','agent_direct','automation','human')),
+    CONSTRAINT narthex_library_runs_attestation_check CHECK (attestation='' OR (attestation='host_attested' AND origin='skill_run'))
+);
+CREATE INDEX IF NOT EXISTS narthex_library_runs_started_idx ON narthex_library_runs (started_at DESC);
+CREATE INDEX IF NOT EXISTS narthex_library_runs_started_id_idx ON narthex_library_runs (started_at DESC, id DESC);
+
+-- Host-attestation replay protection stores only scoped verifier hashes. The
+-- raw execution ID, nonce, signature, and request body never enter PgStore.
+CREATE TABLE IF NOT EXISTS narthex_library_runtime_attestations (
+    run_id          TEXT PRIMARY KEY REFERENCES narthex_library_runs(id) ON DELETE RESTRICT,
+    client_id       TEXT NOT NULL REFERENCES narthex_mcp_clients(id) ON DELETE RESTRICT,
+    client_epoch    TEXT NOT NULL,
+    execution_hash  TEXT NOT NULL,
+    nonce_hash      TEXT NOT NULL,
+    request_digest  TEXT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT narthex_library_runtime_attestations_execution_hash_check CHECK (execution_hash ~ '^[a-f0-9]{64}$'),
+    CONSTRAINT narthex_library_runtime_attestations_nonce_hash_check CHECK (nonce_hash ~ '^[a-f0-9]{64}$'),
+    CONSTRAINT narthex_library_runtime_attestations_request_digest_check CHECK (request_digest ~ '^[a-f0-9]{64}$'),
+    UNIQUE (client_id, client_epoch, execution_hash),
+    UNIQUE (client_id, client_epoch, nonce_hash)
+);
+
+CREATE TABLE IF NOT EXISTS narthex_library_artifacts (
+    id               TEXT PRIMARY KEY,
+    title            TEXT NOT NULL,
+    summary          TEXT NOT NULL DEFAULT '',
+    origin           TEXT NOT NULL,
+    run_id           TEXT NOT NULL DEFAULT '',
+    skill_id         TEXT NOT NULL DEFAULT '',
+    skill_version_id TEXT NOT NULL DEFAULT '',
+    binding_id       TEXT NOT NULL DEFAULT '',
+		agent_surface_id TEXT NOT NULL DEFAULT '',
+		source_artifact_id TEXT NOT NULL DEFAULT '',
+		source_artifact_version_id TEXT NOT NULL DEFAULT '',
+		source_artifact_digest TEXT NOT NULL DEFAULT '',
+    created_by       TEXT NOT NULL DEFAULT '',
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT narthex_library_artifacts_origin_check CHECK (origin IN ('skill_run','agent_direct','automation','human'))
+);
+CREATE INDEX IF NOT EXISTS narthex_library_artifacts_created_idx ON narthex_library_artifacts (created_at DESC);
+CREATE INDEX IF NOT EXISTS narthex_library_artifacts_created_id_idx ON narthex_library_artifacts (created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS narthex_library_artifacts_surface_created_idx ON narthex_library_artifacts (agent_surface_id, created_at DESC, id DESC) WHERE agent_surface_id <> '';
+
+CREATE TABLE IF NOT EXISTS narthex_library_artifact_versions (
+    id               TEXT PRIMARY KEY,
+    artifact_id      TEXT NOT NULL REFERENCES narthex_library_artifacts(id) ON DELETE RESTRICT,
+    version_number   INT NOT NULL,
+    format           TEXT NOT NULL,
+    body             TEXT NOT NULL DEFAULT '',
+    digest           TEXT NOT NULL,
+    size_bytes       BIGINT NOT NULL,
+    redaction_status TEXT NOT NULL DEFAULT 'pending',
+		created_by       TEXT NOT NULL DEFAULT '',
+    reviewed_by      TEXT NOT NULL DEFAULT '',
+    reviewed_at      TIMESTAMPTZ,
+	publication_claimed_at TIMESTAMPTZ,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (artifact_id, version_number),
+    CONSTRAINT narthex_library_artifact_versions_format_check CHECK (format IN ('markdown','text','image')),
+    CONSTRAINT narthex_library_artifact_versions_redaction_check CHECK (redaction_status IN ('pending','approved','rejected'))
+);
+CREATE INDEX IF NOT EXISTS narthex_library_artifact_versions_artifact_idx ON narthex_library_artifact_versions (artifact_id, version_number DESC);
+
+-- One immutable private image blob belongs to one image-format artifact
+-- version. There is intentionally no digest uniqueness constraint: two
+-- independent artifact versions may contain identical bytes without sharing
+-- authorization, retention, or deletion semantics.
+CREATE TABLE IF NOT EXISTS narthex_library_artifact_media_blobs (
+    artifact_version_id TEXT PRIMARY KEY REFERENCES narthex_library_artifact_versions(id) ON DELETE RESTRICT,
+    mime_type           TEXT NOT NULL,
+    digest              TEXT NOT NULL,
+    size_bytes          BIGINT NOT NULL,
+    width               INT NOT NULL DEFAULT 0,
+    height              INT NOT NULL DEFAULT 0,
+    alt_text            TEXT NOT NULL DEFAULT '',
+    delivery_mode       TEXT NOT NULL,
+    encrypted_data      BYTEA NOT NULL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT narthex_library_artifact_media_blobs_mime_check
+        CHECK (mime_type IN ('image/png','image/jpeg','image/svg+xml')),
+    CONSTRAINT narthex_library_artifact_media_blobs_digest_check
+        CHECK (digest ~ '^[a-f0-9]{64}$'),
+    CONSTRAINT narthex_library_artifact_media_blobs_size_check
+        CHECK (size_bytes > 0 AND size_bytes <= 524288),
+    CONSTRAINT narthex_library_artifact_media_blobs_dimensions_check
+        CHECK ((width = 0 AND height = 0) OR (width > 0 AND height > 0)),
+    CONSTRAINT narthex_library_artifact_media_blobs_delivery_check
+        CHECK ((mime_type='image/svg+xml' AND delivery_mode='download_only') OR
+               (mime_type <> 'image/svg+xml' AND delivery_mode='inline'))
+);
+
+CREATE TABLE IF NOT EXISTS narthex_library_artifact_grants (
+    id                      TEXT PRIMARY KEY,
+    artifact_id             TEXT NOT NULL REFERENCES narthex_library_artifacts(id) ON DELETE RESTRICT,
+    artifact_version_id     TEXT NOT NULL REFERENCES narthex_library_artifact_versions(id) ON DELETE RESTRICT,
+    artifact_version_digest TEXT NOT NULL,
+    agent_surface_id        TEXT NOT NULL REFERENCES narthex_mcp_clients(id) ON DELETE RESTRICT,
+    created_by              TEXT NOT NULL DEFAULT '',
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+    revoked_by              TEXT NOT NULL DEFAULT '',
+    revoked_at              TIMESTAMPTZ,
+    CONSTRAINT narthex_library_artifact_grants_digest_check CHECK (artifact_version_digest ~ '^[a-f0-9]{64}$')
+);
+CREATE INDEX IF NOT EXISTS narthex_library_artifact_grants_artifact_idx ON narthex_library_artifact_grants (artifact_id, created_at);
+CREATE INDEX IF NOT EXISTS narthex_library_artifact_grants_surface_idx ON narthex_library_artifact_grants (agent_surface_id, artifact_id) WHERE revoked_at IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS narthex_library_artifact_grants_live_target_idx ON narthex_library_artifact_grants (artifact_id, agent_surface_id) WHERE revoked_at IS NULL;
+
+-- Subject-bound artifact revision replay receipts. The operation is generic
+-- so text and media appends can share a
+-- durable idempotency boundary without persisting a raw request ID or body.
+CREATE TABLE IF NOT EXISTS narthex_library_mcp_client_artifact_version_requests (
+    client_id           TEXT NOT NULL REFERENCES narthex_mcp_clients(id) ON DELETE RESTRICT,
+    client_epoch        TEXT NOT NULL,
+    artifact_id         TEXT NOT NULL REFERENCES narthex_library_artifacts(id) ON DELETE RESTRICT,
+    operation           TEXT NOT NULL,
+    request_id_hash     TEXT NOT NULL,
+    payload_digest      TEXT NOT NULL,
+    artifact_version_id TEXT NOT NULL REFERENCES narthex_library_artifact_versions(id) ON DELETE RESTRICT,
+    created_at          TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (client_id, client_epoch, artifact_id, operation, request_id_hash),
+    CONSTRAINT narthex_library_mcp_client_artifact_version_requests_operation_check CHECK (operation <> ''),
+    CONSTRAINT narthex_library_mcp_client_artifact_version_requests_request_hash_check CHECK (request_id_hash ~ '^[a-f0-9]{64}$'),
+    CONSTRAINT narthex_library_mcp_client_artifact_version_requests_payload_digest_check CHECK (payload_digest ~ '^[a-f0-9]{64}$')
+);
+CREATE INDEX IF NOT EXISTS narthex_library_mcp_client_artifact_version_requests_artifact_idx
+    ON narthex_library_mcp_client_artifact_version_requests (artifact_id, created_at DESC);
+
+-- A lease is a short, server-clock-bounded exception for one durable
+-- subject-bound MCP client. It holds no bearer secret: client_id + epoch are
+-- structural fences, while administrative actor references are encrypted by
+-- the PgStore write path.
+CREATE TABLE IF NOT EXISTS narthex_library_mcp_client_skill_authoring_leases (
+    id                TEXT PRIMARY KEY,
+    client_id         TEXT NOT NULL REFERENCES narthex_mcp_clients(id) ON DELETE RESTRICT,
+    client_epoch      TEXT NOT NULL,
+    granted_by        TEXT NOT NULL DEFAULT '',
+    granted_at        TIMESTAMPTZ NOT NULL,
+    expires_at        TIMESTAMPTZ NOT NULL,
+    remaining_creates INT NOT NULL,
+    revoked_at        TIMESTAMPTZ,
+    revoked_by        TEXT NOT NULL DEFAULT '',
+    created_at        TIMESTAMPTZ NOT NULL,
+    updated_at        TIMESTAMPTZ NOT NULL,
+    CONSTRAINT narthex_library_mcp_client_skill_authoring_leases_remaining_check CHECK (remaining_creates >= 0),
+    CONSTRAINT narthex_library_mcp_client_skill_authoring_leases_expiry_check CHECK (expires_at > granted_at)
+);
+CREATE INDEX IF NOT EXISTS narthex_library_mcp_client_skill_authoring_leases_client_idx
+    ON narthex_library_mcp_client_skill_authoring_leases (client_id, granted_at DESC, id DESC);
+
+-- Replay records retain scoped request/payload hashes only. The raw MCP
+-- requestId and instruction body never become a second metadata store.
+CREATE TABLE IF NOT EXISTS narthex_library_mcp_client_skill_authoring_requests (
+    client_id       TEXT NOT NULL REFERENCES narthex_mcp_clients(id) ON DELETE RESTRICT,
+    client_epoch    TEXT NOT NULL,
+    request_id_hash TEXT NOT NULL,
+    payload_digest  TEXT NOT NULL,
+    lease_id        TEXT NOT NULL REFERENCES narthex_library_mcp_client_skill_authoring_leases(id) ON DELETE RESTRICT,
+    skill_id        TEXT NOT NULL REFERENCES narthex_library_skills(id) ON DELETE RESTRICT,
+    version_id      TEXT NOT NULL REFERENCES narthex_library_skill_versions(id) ON DELETE RESTRICT,
+    created_at      TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (client_id, client_epoch, request_id_hash),
+    CONSTRAINT narthex_library_mcp_client_skill_authoring_requests_request_hash_check CHECK (request_id_hash ~ '^[a-f0-9]{64}$'),
+    CONSTRAINT narthex_library_mcp_client_skill_authoring_requests_payload_digest_check CHECK (payload_digest ~ '^[a-f0-9]{64}$')
+);
+
+-- Append-only receipts intentionally outlive a lease and are kept separate
+-- from the lossy asynchronous general call audit. They contain only opaque
+-- references and one-way request/payload hashes; actor_ref is encrypted by
+-- PgStore before every write.
+CREATE TABLE IF NOT EXISTS narthex_library_mcp_client_skill_authoring_audit_events (
+    id              TEXT PRIMARY KEY,
+    lease_id        TEXT NOT NULL DEFAULT '',
+    client_id       TEXT NOT NULL REFERENCES narthex_mcp_clients(id) ON DELETE RESTRICT,
+    client_epoch    TEXT NOT NULL,
+    action          TEXT NOT NULL,
+    operation       TEXT NOT NULL,
+    actor_ref       TEXT NOT NULL DEFAULT '',
+    request_id_hash TEXT NOT NULL DEFAULT '',
+    payload_digest  TEXT NOT NULL DEFAULT '',
+    skill_id        TEXT NOT NULL DEFAULT '',
+    version_id      TEXT NOT NULL DEFAULT '',
+    created_at      TIMESTAMPTZ NOT NULL,
+    CONSTRAINT narthex_library_mcp_client_skill_authoring_audit_events_action_check
+        CHECK (action IN ('granted','revoked','consumed','rejected')),
+    CONSTRAINT narthex_library_mcp_client_skill_authoring_audit_events_operation_check
+        CHECK (operation IN ('grant','revoke','create','update')),
+    CONSTRAINT narthex_library_mcp_client_skill_authoring_audit_events_request_hash_check
+        CHECK (request_id_hash = '' OR request_id_hash ~ '^[a-f0-9]{64}$'),
+    CONSTRAINT narthex_library_mcp_client_skill_authoring_audit_events_payload_digest_check
+        CHECK (payload_digest = '' OR payload_digest ~ '^[a-f0-9]{64}$')
+);
+CREATE INDEX IF NOT EXISTS narthex_library_mcp_client_skill_authoring_audit_events_client_idx
+    ON narthex_library_mcp_client_skill_authoring_audit_events (client_id, created_at DESC, id DESC);
+`
+
+// libraryMigrate is intentionally additive: Engine schema bootstrap runs on
+// every replica start, so it must tolerate old workspace databases and rolling
+// image updates. The claim marker is non-sensitive durability metadata; private
+// artifact body and reviewer identity remain encrypted in their existing
+// columns.
+const libraryMigrate = `
+ALTER TABLE narthex_library_artifact_versions
+    ADD COLUMN IF NOT EXISTS publication_claimed_at TIMESTAMPTZ;
+ALTER TABLE narthex_library_artifact_versions
+    ADD COLUMN IF NOT EXISTS created_by TEXT NOT NULL DEFAULT '';
+ALTER TABLE narthex_library_runs
+    ADD COLUMN IF NOT EXISTS source_artifact_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE narthex_library_runs
+    ADD COLUMN IF NOT EXISTS attestation TEXT NOT NULL DEFAULT '';
+ALTER TABLE narthex_library_runs
+    ADD COLUMN IF NOT EXISTS source_artifact_version_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE narthex_library_runs
+    ADD COLUMN IF NOT EXISTS source_artifact_digest TEXT NOT NULL DEFAULT '';
+ALTER TABLE narthex_library_artifacts
+    ADD COLUMN IF NOT EXISTS source_artifact_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE narthex_library_artifacts
+    ADD COLUMN IF NOT EXISTS source_artifact_version_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE narthex_library_artifacts
+    ADD COLUMN IF NOT EXISTS source_artifact_digest TEXT NOT NULL DEFAULT '';
+ALTER TABLE narthex_library_artifacts
+    ADD COLUMN IF NOT EXISTS agent_surface_id TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS narthex_library_artifacts_surface_created_idx ON narthex_library_artifacts (agent_surface_id, created_at DESC, id DESC) WHERE agent_surface_id <> '';
+DO $$
+BEGIN
+	-- Older installations accepted only text/Markdown versions. Replace that
+	-- one named check exactly once when image support is absent; this remains
+	-- additive for all other artifact columns and preserves existing rows.
+	IF NOT EXISTS (
+		SELECT 1 FROM pg_constraint
+		WHERE conname='narthex_library_artifact_versions_format_check'
+		  AND conrelid='narthex_library_artifact_versions'::regclass
+		  AND pg_get_constraintdef(oid) LIKE '%image%'
+	) THEN
+		ALTER TABLE narthex_library_artifact_versions
+			DROP CONSTRAINT IF EXISTS narthex_library_artifact_versions_format_check;
+		ALTER TABLE narthex_library_artifact_versions
+			ADD CONSTRAINT narthex_library_artifact_versions_format_check
+			CHECK (format IN ('markdown','text','image'));
+	END IF;
+	-- Keep the SQL admission limit equal to the bounded MCP/base64 transport
+	-- limit. Replacing the named check is idempotent and prevents a direct SQL
+	-- write or an older bootstrap from inserting a blob that the Engine cannot
+	-- safely deliver.
+	IF NOT EXISTS (
+		SELECT 1 FROM pg_constraint
+		WHERE conname='narthex_library_artifact_media_blobs_size_check'
+		  AND conrelid='narthex_library_artifact_media_blobs'::regclass
+		  AND pg_get_constraintdef(oid) LIKE '%524288%'
+	) THEN
+		ALTER TABLE narthex_library_artifact_media_blobs
+			DROP CONSTRAINT IF EXISTS narthex_library_artifact_media_blobs_size_check;
+		ALTER TABLE narthex_library_artifact_media_blobs
+			ADD CONSTRAINT narthex_library_artifact_media_blobs_size_check
+			CHECK (size_bytes > 0 AND size_bytes <= 524288);
+	END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname='narthex_library_runs_attestation_check'
+          AND conrelid='narthex_library_runs'::regclass
+    ) THEN
+        ALTER TABLE narthex_library_runs
+            ADD CONSTRAINT narthex_library_runs_attestation_check
+            CHECK (attestation='' OR (attestation='host_attested' AND origin='skill_run'));
+    END IF;
+	-- The original lease audit admitted only create operations. A version
+	-- update is the same bounded authoring write, but must remain a distinct
+	-- append-only operation for review and incident analysis.
+	IF NOT EXISTS (
+		SELECT 1 FROM pg_constraint
+		WHERE conname='narthex_library_mcp_client_skill_authoring_audit_events_operation_check'
+		  AND conrelid='narthex_library_mcp_client_skill_authoring_audit_events'::regclass
+		  AND pg_get_constraintdef(oid) LIKE '%update%'
+	) THEN
+		ALTER TABLE narthex_library_mcp_client_skill_authoring_audit_events
+			DROP CONSTRAINT IF EXISTS narthex_library_mcp_client_skill_authoring_audit_events_operation_check;
+		ALTER TABLE narthex_library_mcp_client_skill_authoring_audit_events
+			ADD CONSTRAINT narthex_library_mcp_client_skill_authoring_audit_events_operation_check
+			CHECK (operation IN ('grant','revoke','create','update'));
+	END IF;
+END $$;
+`
+
 const accountCols = `name,label,workspace,url,auth_mode,connection_namespace_id,connection_scope,owner_subject,revision,incarnation_id,client_id,client_secret,access_token,refresh_token,token_endpoint,resource,scope,bearer_token,disabled_tools,tool_overrides,read_only`
+
+const engineSchemaBootstrapLock = "narthex-engine-schema-bootstrap:v1"
 
 func NewPgStore(ctx context.Context, dsn string) (*PgStore, error) {
 	config, err := enginePostgresPoolConfig(dsn)
@@ -155,71 +936,124 @@ func NewPgStore(ctx context.Context, dsn string) (*PgStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := pool.Exec(ctx, accountsSchema); err != nil {
+	// Keep one pooled connection for all bootstrap work and reserve the other
+	// for a session-level lock. Holding the lock on an acquired connection
+	// serializes DDL plus data backfills across replica startups without
+	// exceeding the store's normal two-connection pool cap.
+	lockConn, err := pool.Acquire(ctx)
+	if err != nil {
 		pool.Close()
+		return nil, fmt.Errorf("acquire schema bootstrap lock connection: %w", err)
+	}
+	releaseBootstrapLock := func() {
+		if lockConn == nil {
+			return
+		}
+		unlockCtx, cancel := context.WithTimeout(context.Background(), engineAuditCloseTimeout)
+		defer cancel()
+		if _, err := lockConn.Exec(unlockCtx, `SELECT pg_advisory_unlock(hashtextextended($1,0))`, engineSchemaBootstrapLock); err != nil {
+			// Releasing the acquired connection also releases a session lock.
+			// Log the explicit unlock failure so a stuck connection is visible.
+			log.Printf("engine: unlock schema bootstrap advisory lock: %v", err)
+		}
+		lockConn.Release()
+		lockConn = nil
+	}
+	defer releaseBootstrapLock()
+	closePool := func() {
+		releaseBootstrapLock()
+		pool.Close()
+	}
+	if _, err := lockConn.Exec(ctx, `SELECT pg_advisory_lock(hashtextextended($1,0))`, engineSchemaBootstrapLock); err != nil {
+		closePool()
+		return nil, fmt.Errorf("lock Engine schema bootstrap: %w", err)
+	}
+	if _, err := pool.Exec(ctx, accountsSchema); err != nil {
+		closePool()
 		return nil, fmt.Errorf("ensure accounts schema: %w", err)
 	}
 	if _, err := pool.Exec(ctx, accountsMigrate); err != nil {
-		pool.Close()
+		closePool()
 		return nil, fmt.Errorf("migrate accounts schema: %w", err)
 	}
 	if _, err := pool.Exec(ctx, connectionNamespacesSchema); err != nil {
-		pool.Close()
+		closePool()
 		return nil, fmt.Errorf("ensure connection namespaces schema: %w", err)
 	}
 	if _, err := pool.Exec(ctx, mcpClientsSchema); err != nil {
-		pool.Close()
+		closePool()
 		return nil, fmt.Errorf("ensure MCP client registry schema: %w", err)
 	}
 	store := &PgStore{pool: pool}
 	if err := store.backfillConnectionNamespaces(ctx); err != nil {
-		pool.Close()
+		closePool()
 		return nil, fmt.Errorf("backfill connection namespaces: %w", err)
 	}
 	if err := store.backfillMCPClients(ctx); err != nil {
-		pool.Close()
+		closePool()
 		return nil, fmt.Errorf("backfill MCP clients: %w", err)
 	}
 	if _, err := pool.Exec(ctx, engineStateSchema); err != nil {
-		pool.Close()
+		closePool()
 		return nil, fmt.Errorf("ensure engine state schema: %w", err)
 	}
+	if err := store.ensureOAuthGrantSchema(ctx); err != nil {
+		closePool()
+		return nil, fmt.Errorf("ensure durable OAuth grant schema: %w", err)
+	}
 	if _, err := pool.Exec(ctx, callsSchema); err != nil {
-		pool.Close()
+		closePool()
 		return nil, fmt.Errorf("ensure tool_calls schema: %w", err)
 	}
 	if _, err := pool.Exec(ctx, callsMigrate); err != nil {
-		pool.Close()
+		closePool()
 		return nil, fmt.Errorf("migrate tool_calls schema: %w", err)
 	}
 	if _, err := pool.Exec(ctx, connectorsSchema); err != nil {
-		pool.Close()
+		closePool()
 		return nil, fmt.Errorf("ensure connectors schema: %w", err)
 	}
 	if _, err := pool.Exec(ctx, connectorsMigrate); err != nil {
-		pool.Close()
+		closePool()
 		return nil, fmt.Errorf("migrate connectors schema: %w", err)
 	}
 	if _, err := pool.Exec(ctx, namespacesSchema); err != nil {
-		pool.Close()
+		closePool()
 		return nil, fmt.Errorf("ensure namespaces schema: %w", err)
 	}
 	if _, err := pool.Exec(ctx, pendingSchema); err != nil {
-		pool.Close()
+		closePool()
 		return nil, fmt.Errorf("ensure pending_calls schema: %w", err)
 	}
 	if _, err := pool.Exec(ctx, pendingMigrate); err != nil {
-		pool.Close()
+		closePool()
 		return nil, fmt.Errorf("migrate pending_calls schema: %w", err)
 	}
 	if _, err := pool.Exec(ctx, usageSchema); err != nil {
-		pool.Close()
+		closePool()
 		return nil, fmt.Errorf("ensure usage schema: %w", err)
 	}
 	if _, err := pool.Exec(ctx, usageMigrate); err != nil {
-		pool.Close()
+		closePool()
 		return nil, fmt.Errorf("migrate usage schema: %w", err)
 	}
+	if _, err := pool.Exec(ctx, skillSourcesSchema); err != nil {
+		closePool()
+		return nil, fmt.Errorf("ensure skills schema: %w", err)
+	}
+	if _, err := pool.Exec(ctx, librarySchema); err != nil {
+		closePool()
+		return nil, fmt.Errorf("ensure library schema: %w", err)
+	}
+	if _, err := pool.Exec(ctx, libraryMigrate); err != nil {
+		closePool()
+		return nil, fmt.Errorf("migrate library schema: %w", err)
+	}
+	if err := store.backfillPlainLibraryArtifactSurfaceIDs(ctx); err != nil {
+		closePool()
+		return nil, fmt.Errorf("backfill library artifact surface projections: %w", err)
+	}
+	store.audit = newAuditWriter(store.persistAuditCall, defaultAuditWriterConfig())
 	return store, nil
 }
 
@@ -561,7 +1395,8 @@ CREATE TABLE IF NOT EXISTS pending_calls (
     expires_at              TIMESTAMPTZ NOT NULL DEFAULT (now() + interval '3 minutes'),
     decided_at              TIMESTAMPTZ,
     decided_by              TEXT NOT NULL DEFAULT '',
-    decision_note           TEXT NOT NULL DEFAULT ''
+    decision_note           TEXT NOT NULL DEFAULT '',
+    kind                    TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS pending_calls_ts_idx ON pending_calls (ts DESC);`
 
@@ -578,6 +1413,7 @@ ALTER TABLE pending_calls ADD COLUMN IF NOT EXISTS decision_note TEXT NOT NULL D
 ALTER TABLE pending_calls ADD COLUMN IF NOT EXISTS account_incarnation_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE pending_calls ADD COLUMN IF NOT EXISTS account_revision BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE pending_calls ADD COLUMN IF NOT EXISTS connection_namespace_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE pending_calls ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT '';
 UPDATE pending_calls
 SET expires_at = ts + interval '3 minutes'
 WHERE expires_at IS NULL;
@@ -618,37 +1454,127 @@ ALTER TABLE tool_calls ADD COLUMN IF NOT EXISTS result TEXT NOT NULL DEFAULT '';
 ALTER TABLE tool_calls ADD COLUMN IF NOT EXISTS guard TEXT NOT NULL DEFAULT '';
 ALTER TABLE tool_calls ADD COLUMN IF NOT EXISTS triage TEXT NOT NULL DEFAULT '';`
 
-// LogCall is fire-and-forget: a tool call must never fail or block on auditing.
-// Args/Result are clamped and encrypted at rest (nil cipher = plaintext, same
-// as token columns).
+// LogCall is non-blocking: a tool call must never fail or wait on audit
+// persistence. The bounded writer makes any overload explicit through its
+// stats/logs rather than creating one goroutine per governed call. Args/Result
+// are clamped and encrypted by the worker at rest (nil cipher = plaintext,
+// same as token columns).
 func (s *PgStore) LogCall(rec CallRecord) {
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if rec.TS.IsZero() {
-			rec.TS = time.Now()
-		}
-		if _, err := s.pool.Exec(ctx, `INSERT INTO tool_calls (
+	if s == nil || s.audit == nil {
+		return
+	}
+	s.audit.enqueue(rec)
+}
+
+// encryptAuditFields clamps and encrypts the at-rest-sensitive audit columns.
+// The error text joins args/result behind the cipher: upstream errors can
+// embed URLs with query tokens or echoed input, and incident review reads
+// exactly these rows. Legacy plaintext rows predate encryption and keep
+// reading through s.dec's passthrough.
+func (s *PgStore) encryptAuditFields(rec CallRecord) (args, result, auditErr string, err error) {
+	if args, err = s.enc(clampPayload(rec.Args, maxPayloadBytes)); err != nil {
+		return "", "", "", fmt.Errorf("encrypt audit arguments: %w", err)
+	}
+	if result, err = s.enc(clampPayload(rec.Result, maxPayloadBytes)); err != nil {
+		return "", "", "", fmt.Errorf("encrypt audit result: %w", err)
+	}
+	if auditErr, err = s.enc(clampErr(rec.Error)); err != nil {
+		return "", "", "", fmt.Errorf("encrypt audit error: %w", err)
+	}
+	return args, result, auditErr, nil
+}
+
+func (s *PgStore) persistAuditCall(ctx context.Context, rec CallRecord) error {
+	args, result, auditErr, err := s.encryptAuditFields(rec)
+	if err != nil {
+		return err
+	}
+	if s == nil || s.pool == nil {
+		return errors.New("Postgres audit pool is unavailable")
+	}
+	if _, err := s.pool.Exec(ctx, `INSERT INTO tool_calls (
     ts,account,tool,ok,ms,error,connector,endpoint_kind,endpoint_generation,decision,args,result,guard
 )
 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
-			rec.TS, rec.Account, rec.Tool, rec.OK, rec.Ms, clampErr(rec.Error),
-			rec.Connector, rec.EndpointKind, rec.EndpointGeneration, rec.Decision,
-			s.enc(clampPayload(rec.Args, maxPayloadBytes)),
-			s.enc(clampPayload(rec.Result, maxPayloadBytes)),
-			rec.Guard); err != nil {
-			log.Printf("engine: audit insert failed (call %s/%s dropped): %v", rec.Account, rec.Tool, err)
-		}
-	}()
+		rec.TS, rec.Account, rec.Tool, rec.OK, rec.Ms, auditErr,
+		rec.Connector, rec.EndpointKind, rec.EndpointGeneration, rec.Decision,
+		args, result,
+		rec.Guard); err != nil {
+		return fmt.Errorf("insert audit record: %w", err)
+	}
+	return nil
 }
+
+// AuditPersistenceStats returns bounded-writer health without exposing audit
+// payloads. It is deliberately a concrete-store diagnostic rather than part
+// of AuditSink so existing file-backed development stores remain unchanged.
+func (s *PgStore) AuditPersistenceStats() AuditPersistenceStats {
+	if s == nil {
+		return AuditPersistenceStats{}
+	}
+	return s.audit.stats()
+}
+
+// undecryptableAuditErrorPlaceholder replaces an audit error field that fails
+// to decrypt (wrong/rotated key, corrupt ciphertext). Only the error column is
+// ever ciphertext here — successful calls store error="" and never touch the
+// cipher — so a decrypt failure disproportionately affects FAILED-call rows,
+// exactly what an incident investigator needs most. The row's other fields
+// never needed decryption and stay trustworthy, so RecentCalls keeps the row
+// (like PgStore.Accounts omits only the one unreadable field/record, not the
+// whole list) instead of hiding it.
+const undecryptableAuditErrorPlaceholder = "[undecryptable]"
 
 // RecentCalls is summary-only: Args/Result are never selected, so the 100-row
 // list response stays payload-free (and no decryption work happens per row).
-// Guard IS selected — it's tiny and the Activity UI chips on it.
+// Guard IS selected — it's tiny and the Activity UI chips on it. The id
+// tie-break matches RecentCallsBefore's ORDER BY exactly: without it, rows
+// sharing one exact ts could sort differently between this query (which
+// always produces the first /api/logs page) and RecentCallsBefore (which
+// produces every page after it), duplicating some rows across the two pages
+// and permanently losing others at the boundary.
 func (s *PgStore) RecentCalls(ctx context.Context, limit int) ([]CallRecord, error) {
 	rows, err := s.pool.Query(ctx, `
 SELECT id,ts,account,tool,ok,ms,error,connector,endpoint_kind,endpoint_generation,decision,guard,triage
-FROM tool_calls ORDER BY ts DESC LIMIT $1`, limit)
+FROM tool_calls ORDER BY ts DESC, id DESC LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CallRecord
+	for rows.Next() {
+		var c CallRecord
+		if err := rows.Scan(
+			&c.ID, &c.TS, &c.Account, &c.Tool, &c.OK, &c.Ms, &c.Error,
+			&c.Connector, &c.EndpointKind, &c.EndpointGeneration,
+			&c.Decision, &c.Guard, &c.Triage,
+		); err != nil {
+			continue
+		}
+		// Legacy rows hold plaintext errors; s.dec passes them through. A
+		// decrypt failure must not drop the whole row (see
+		// undecryptableAuditErrorPlaceholder) — omit just the unreadable field,
+		// log the row ID only (never decrypted/attempted-decrypt content), and
+		// keep the rest of the row intact.
+		auditErr, err := s.dec(c.Error)
+		if err != nil {
+			log.Printf("engine: omit unreadable audit error for call %d: %v", c.ID, err)
+			auditErr = undecryptableAuditErrorPlaceholder
+		}
+		c.Error = auditErr
+		out = append(out, c)
+	}
+	return out, nil
+}
+
+// RecentCallsBefore pages backward from a keyset cursor for the Activity
+// "Load older" control — RecentCalls alone hard-caps at the newest `limit`
+// rows. Same summary-only contract as RecentCalls: Args/Result are never
+// selected, Guard IS selected (it's tiny, and the Activity UI chips on it).
+func (s *PgStore) RecentCallsBefore(ctx context.Context, beforeTS time.Time, beforeID int64, limit int) ([]CallRecord, error) {
+	rows, err := s.pool.Query(ctx, `
+SELECT id,ts,account,tool,ok,ms,error,connector,endpoint_kind,endpoint_generation,decision,guard,triage
+FROM tool_calls WHERE (ts, id) < ($2, $3) ORDER BY ts DESC, id DESC LIMIT $1`, limit, beforeTS, beforeID)
 	if err != nil {
 		return nil, err
 	}
@@ -683,7 +1609,19 @@ FROM tool_calls WHERE id=$1`, id).Scan(
 	if err != nil {
 		return CallRecord{}, false, err
 	}
-	c.Args, c.Result = s.dec(c.Args), s.dec(c.Result)
+	args, err := s.dec(c.Args)
+	if err != nil {
+		return CallRecord{}, false, fmt.Errorf("decrypt call %d arguments: %w", id, err)
+	}
+	result, err := s.dec(c.Result)
+	if err != nil {
+		return CallRecord{}, false, fmt.Errorf("decrypt call %d result: %w", id, err)
+	}
+	auditErr, err := s.dec(c.Error)
+	if err != nil {
+		return CallRecord{}, false, fmt.Errorf("decrypt call %d error: %w", id, err)
+	}
+	c.Args, c.Result, c.Error = args, result, auditErr
 	return c, true, nil
 }
 
@@ -716,7 +1654,59 @@ func (s *PgStore) PurgeCalls(ctx context.Context, olderThan time.Duration) (int6
 	return n + tag.RowsAffected(), nil
 }
 
-func (s *PgStore) Close() { s.pool.Close() }
+// Shutdown drains the bounded audit queue before closing the database pool.
+// It matches the optional Engine dependency hook, so graceful process
+// shutdown does not drop rows simply because the HTTP listener stopped first.
+func (s *PgStore) Shutdown(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	if s.audit != nil {
+		if err := s.audit.Shutdown(ctx); err != nil {
+			// The writer has been cancelled but may still be unwinding an
+			// in-flight driver call. Closing the pool here would race it, so
+			// schedule exactly one final close once that worker exits.
+			s.closePoolAfterAuditExit()
+			return err
+		}
+	}
+	s.closePool()
+	return nil
+}
+
+func (s *PgStore) closePool() {
+	s.poolCloseOnce.Do(func() {
+		if s.pool != nil {
+			s.pool.Close()
+		}
+	})
+}
+
+func (s *PgStore) closePoolAfterAuditExit() {
+	if s == nil || s.audit == nil {
+		return
+	}
+	s.poolCloseAfterAuditOnce.Do(func() {
+		go func() {
+			<-s.audit.done
+			s.closePool()
+		}()
+	})
+}
+
+// Close preserves the legacy no-error cleanup API used by callers and tests.
+// Production lifecycle uses Shutdown with its larger drain budget; direct
+// callers get a bounded best-effort drain rather than an unbounded wait.
+func (s *PgStore) Close() {
+	if s == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), engineAuditCloseTimeout)
+	defer cancel()
+	if err := s.Shutdown(ctx); err != nil {
+		log.Printf("engine: audit shutdown during store close: %v", err)
+	}
+}
 
 type accountScanner interface {
 	Scan(...any) error
@@ -739,22 +1729,42 @@ func (s *PgStore) scanAccount(row accountScanner) (Account, error) {
 	if err := json.Unmarshal(overrides, &a.ToolOverrides); err != nil {
 		return Account{}, err
 	}
-	a.ClientSecret, a.AccessToken, a.RefreshToken, a.BearerToken =
-		s.dec(a.ClientSecret), s.dec(a.AccessToken), s.dec(a.RefreshToken), s.dec(a.BearerToken)
+	if a.ClientSecret, err = s.dec(a.ClientSecret); err != nil {
+		return Account{}, fmt.Errorf("decrypt account %q client secret: %w", a.Name, err)
+	}
+	if a.AccessToken, err = s.dec(a.AccessToken); err != nil {
+		return Account{}, fmt.Errorf("decrypt account %q access token: %w", a.Name, err)
+	}
+	if a.RefreshToken, err = s.dec(a.RefreshToken); err != nil {
+		return Account{}, fmt.Errorf("decrypt account %q refresh token: %w", a.Name, err)
+	}
+	if a.BearerToken, err = s.dec(a.BearerToken); err != nil {
+		return Account{}, fmt.Errorf("decrypt account %q bearer token: %w", a.Name, err)
+	}
 	return a, nil
 }
 
 func (s *PgStore) Accounts() []Account {
 	rows, err := s.pool.Query(context.Background(), `SELECT `+accountCols+` FROM narthex_accounts ORDER BY name`)
 	if err != nil {
+		log.Printf("engine: list accounts failed: %v", err)
 		return nil
 	}
 	defer rows.Close()
 	var out []Account
 	for rows.Next() {
-		if a, err := s.scanAccount(rows); err == nil {
-			out = append(out, a)
+		a, err := s.scanAccount(rows)
+		if err != nil {
+			// AccountStore predates error-returning list methods. Keep this
+			// constrained compatibility API fail-closed, while making the
+			// operational cause explicit without logging secret values.
+			log.Printf("engine: omit unreadable account: %v", err)
+			continue
 		}
+		out = append(out, a)
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("engine: iterate accounts failed: %v", err)
 	}
 	return out
 }
@@ -764,30 +1774,57 @@ func (s *PgStore) Token(name string) string {
 	if err := s.pool.QueryRow(context.Background(),
 		`SELECT auth_mode,access_token,bearer_token FROM narthex_accounts WHERE name=$1`, name).
 		Scan(&auth, &access, &bearer); err != nil {
+		log.Printf("engine: read token for account %q failed: %v", name, err)
 		return ""
 	}
+	var value string
+	var err error
 	if auth == "token" {
-		return s.dec(bearer)
+		value, err = s.dec(bearer)
+	} else {
+		value, err = s.dec(access)
 	}
-	return s.dec(access)
+	if err != nil {
+		log.Printf("engine: credential for account %q is unavailable: %v", name, err)
+		return ""
+	}
+	return value
 }
 
 func (s *PgStore) RefreshToken(name string) string {
 	var rt string
-	_ = s.pool.QueryRow(context.Background(), `SELECT refresh_token FROM narthex_accounts WHERE name=$1`, name).Scan(&rt)
-	return s.dec(rt)
+	if err := s.pool.QueryRow(context.Background(), `SELECT refresh_token FROM narthex_accounts WHERE name=$1`, name).Scan(&rt); err != nil {
+		log.Printf("engine: read refresh token for account %q failed: %v", name, err)
+		return ""
+	}
+	value, err := s.dec(rt)
+	if err != nil {
+		log.Printf("engine: refresh credential for account %q is unavailable: %v", name, err)
+		return ""
+	}
+	return value
 }
 
 func (s *PgStore) UpdateTokens(ctx context.Context, name, expectedIncarnationID, access, refresh string) error {
 	if expectedIncarnationID == "" {
 		return ErrAccountIncarnation
 	}
-	var tag pgconn.CommandTag
-	var err error
+	encryptedAccess, err := s.enc(access)
+	if err != nil {
+		return fmt.Errorf("encrypt access token: %w", err)
+	}
+	var encryptedRefresh string
 	if refresh != "" {
-		tag, err = s.pool.Exec(ctx, `UPDATE narthex_accounts SET access_token=$3, refresh_token=$4 WHERE name=$1 AND incarnation_id=$2`, name, expectedIncarnationID, s.enc(access), s.enc(refresh))
+		encryptedRefresh, err = s.enc(refresh)
+		if err != nil {
+			return fmt.Errorf("encrypt refresh token: %w", err)
+		}
+	}
+	var tag pgconn.CommandTag
+	if refresh != "" {
+		tag, err = s.pool.Exec(ctx, `UPDATE narthex_accounts SET access_token=$3, refresh_token=$4 WHERE name=$1 AND incarnation_id=$2`, name, expectedIncarnationID, encryptedAccess, encryptedRefresh)
 	} else {
-		tag, err = s.pool.Exec(ctx, `UPDATE narthex_accounts SET access_token=$3 WHERE name=$1 AND incarnation_id=$2`, name, expectedIncarnationID, s.enc(access))
+		tag, err = s.pool.Exec(ctx, `UPDATE narthex_accounts SET access_token=$3 WHERE name=$1 AND incarnation_id=$2`, name, expectedIncarnationID, encryptedAccess)
 	}
 	if err != nil {
 		return err
@@ -821,11 +1858,15 @@ func (s *PgStore) SetBearerToken(ctx context.Context, name, expectedIncarnationI
 	if expectedRevision < 1 || current.Revision != expectedRevision {
 		return Account{}, ErrConnectionNamespaceRevision
 	}
+	encryptedToken, err := s.enc(token)
+	if err != nil {
+		return Account{}, fmt.Errorf("encrypt bearer token: %w", err)
+	}
 	updated, err := s.scanAccount(tx.QueryRow(ctx, `
 UPDATE narthex_accounts
 SET auth_mode='token', bearer_token=$2, revision=revision+1
 WHERE name=$1
-RETURNING `+accountCols, name, s.enc(token)))
+RETURNING `+accountCols, name, encryptedToken))
 	if err != nil {
 		return Account{}, err
 	}
@@ -864,14 +1905,18 @@ func (s *PgStore) Create(ctx context.Context, a Account) error {
 	if a.ToolOverrides == nil {
 		ob = []byte(`{}`)
 	}
+	clientSecret, accessToken, refreshToken, bearerToken, err := s.encryptAccountSecrets(a)
+	if err != nil {
+		return err
+	}
 	tag, err := tx.Exec(ctx, `
 INSERT INTO narthex_accounts (`+accountCols+`)
 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
 ON CONFLICT (name) DO NOTHING`,
 		a.Name, a.Label, a.Group, a.URL, a.AuthMode,
 		a.ConnectionNamespaceID, a.ConnectionScope, a.OwnerSubject, a.Revision,
-		a.IncarnationID, a.ClientID, s.enc(a.ClientSecret), s.enc(a.AccessToken), s.enc(a.RefreshToken),
-		a.TokenEndpoint, a.Resource, a.Scope, s.enc(a.BearerToken), a.DisabledTools, ob, a.ReadOnly)
+		a.IncarnationID, a.ClientID, clientSecret, accessToken, refreshToken,
+		a.TokenEndpoint, a.Resource, a.Scope, bearerToken, a.DisabledTools, ob, a.ReadOnly)
 	if err != nil {
 		return err
 	}
@@ -883,13 +1928,15 @@ ON CONFLICT (name) DO NOTHING`,
 
 // Upsert adds or updates an account — used by the console "Connect" flow and by
 // migration. Tokens included so a freshly-connected account works immediately.
+// Caller-supplied revisions are ignored on update: the store owns revision
+// monotonicity, deriving the new revision from the locked prior row (bump on
+// ownership change, preserve otherwise).
 func (s *PgStore) Upsert(ctx context.Context, a Account) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	incomingRevision := a.Revision
 	var previous *Account
 	stored, readErr := s.scanAccount(tx.QueryRow(ctx, `SELECT `+accountCols+` FROM narthex_accounts WHERE name=$1 FOR UPDATE`, a.Name))
 	if readErr == nil {
@@ -935,7 +1982,9 @@ func (s *PgStore) Upsert(ctx context.Context, a Account) error {
 	if err := validatePersonalAccountMCPClientGrantsTx(ctx, tx, a); err != nil {
 		return err
 	}
-	if previous != nil && incomingRevision < 1 {
+	if previous != nil {
+		// The store owns revision monotonicity: derive the new revision from the
+		// locked prior row, ignoring any caller-supplied value.
 		if a.ConnectionNamespaceID != previous.ConnectionNamespaceID || a.ConnectionScope != previous.ConnectionScope || a.OwnerSubject != previous.OwnerSubject {
 			a.Revision = previous.Revision + 1
 		} else {
@@ -948,6 +1997,10 @@ func (s *PgStore) Upsert(ctx context.Context, a Account) error {
 	}
 	if a.ToolOverrides == nil {
 		ob = []byte(`{}`)
+	}
+	clientSecret, accessToken, refreshToken, bearerToken, err := s.encryptAccountSecrets(a)
+	if err != nil {
+		return err
 	}
 	_, err = tx.Exec(ctx, `
 INSERT INTO narthex_accounts (`+accountCols+`)
@@ -964,8 +2017,8 @@ ON CONFLICT (name) DO UPDATE SET
   disabled_tools=$19, tool_overrides=$20, read_only=$21`,
 		a.Name, a.Label, a.Group, a.URL, a.AuthMode,
 		a.ConnectionNamespaceID, a.ConnectionScope, a.OwnerSubject, a.Revision,
-		a.IncarnationID, a.ClientID, s.enc(a.ClientSecret), s.enc(a.AccessToken), s.enc(a.RefreshToken),
-		a.TokenEndpoint, a.Resource, a.Scope, s.enc(a.BearerToken), a.DisabledTools, ob, a.ReadOnly)
+		a.IncarnationID, a.ClientID, clientSecret, accessToken, refreshToken,
+		a.TokenEndpoint, a.Resource, a.Scope, bearerToken, a.DisabledTools, ob, a.ReadOnly)
 	if err != nil {
 		return err
 	}
@@ -1016,12 +2069,24 @@ func (s *PgStore) CompleteOAuth(ctx context.Context, precondition OAuthCompletio
 	if refresh == "" && current.ClientID == completion.ClientID {
 		refresh = current.RefreshToken
 	}
+	encryptedClientSecret, err := s.enc(completion.ClientSecret)
+	if err != nil {
+		return Account{}, fmt.Errorf("encrypt OAuth client secret: %w", err)
+	}
+	encryptedAccessToken, err := s.enc(completion.AccessToken)
+	if err != nil {
+		return Account{}, fmt.Errorf("encrypt OAuth access token: %w", err)
+	}
+	encryptedRefreshToken, err := s.enc(refresh)
+	if err != nil {
+		return Account{}, fmt.Errorf("encrypt OAuth refresh token: %w", err)
+	}
 	if _, err := tx.Exec(ctx, `
 UPDATE narthex_accounts
 SET auth_mode='oauth', client_id=$2, client_secret=$3, access_token=$4,
     refresh_token=$5, token_endpoint=$6, resource=$7, scope=$8, bearer_token=''
-WHERE name=$1`, completion.Name, completion.ClientID, s.enc(completion.ClientSecret),
-		s.enc(completion.AccessToken), s.enc(refresh), completion.TokenEndpoint,
+WHERE name=$1`, completion.Name, completion.ClientID, encryptedClientSecret,
+		encryptedAccessToken, encryptedRefreshToken, completion.TokenEndpoint,
 		completion.Resource, completion.Scope); err != nil {
 		return Account{}, err
 	}
@@ -1065,11 +2130,15 @@ func (s *PgStore) SaveStaticOAuthConfig(ctx context.Context, name string, precon
 		current.OwnerSubject != precondition.OwnerSubject {
 		return Account{}, ErrConnectAccountMoved
 	}
+	encryptedClientSecret, err := s.enc(config.ClientSecret)
+	if err != nil {
+		return Account{}, fmt.Errorf("encrypt OAuth client secret: %w", err)
+	}
 
 	if _, err := tx.Exec(ctx, `
 UPDATE narthex_accounts
 SET client_id=$2, client_secret=$3, scope=$4
-WHERE name=$1`, name, config.ClientID, s.enc(config.ClientSecret), config.Scope); err != nil {
+WHERE name=$1`, name, config.ClientID, encryptedClientSecret, config.Scope); err != nil {
 		return Account{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -1084,6 +2153,7 @@ WHERE name=$1`, name, config.ClientID, s.enc(config.ClientSecret), config.Scope)
 func (s *PgStore) Account(name string) (Account, bool) {
 	a, err := s.scanAccount(s.pool.QueryRow(context.Background(), `SELECT `+accountCols+` FROM narthex_accounts WHERE name=$1`, name))
 	if err != nil {
+		log.Printf("engine: account %q is unavailable: %v", name, err)
 		return Account{}, false
 	}
 	return a, true
@@ -2237,7 +3307,7 @@ WHERE name=$1`, current.Name, current.Group, current.ConnectionNamespaceID, curr
 // This prevents a late Approve from reviving a timed-out call and gives every
 // Engine instance one authoritative result to observe.
 
-const pendingCallColumns = `id,ts,connector,account,account_incarnation_id,account_revision,connection_namespace_id,tool,args,status,expires_at,decided_at,decided_by,decision_note`
+const pendingCallColumns = `id,ts,connector,account,account_incarnation_id,account_revision,connection_namespace_id,tool,args,status,expires_at,decided_at,decided_by,decision_note,kind`
 
 type pendingCallScanner interface {
 	Scan(...any) error
@@ -2251,14 +3321,29 @@ func (s *PgStore) scanPendingCall(row pendingCallScanner) (PendingCall, error) {
 	)
 	if err := row.Scan(
 		&p.ID, &p.TS, &p.Connector, &p.Account, &p.AccountIncarnationID, &p.AccountRevision, &p.ConnectionNamespaceID, &p.Tool, &args, &p.Status,
-		&expires, &p.DecidedAt, &p.DecidedBy, &p.DecisionNote,
+		&expires, &p.DecidedAt, &p.DecidedBy, &p.DecisionNote, &p.Kind,
 	); err != nil {
 		return PendingCall{}, err
 	}
 	p.ExpiresAt = &expires
-	if err := json.Unmarshal([]byte(s.dec(args)), &p.Args); err != nil {
+	plainArgs, err := s.dec(args)
+	if err != nil {
+		return PendingCall{}, fmt.Errorf("decrypt pending call %q arguments: %w", p.ID, err)
+	}
+	if err := json.Unmarshal([]byte(plainArgs), &p.Args); err != nil {
 		return PendingCall{}, fmt.Errorf("pending call %q args: %w", p.ID, err)
 	}
+	// decided_by/decision_note are encrypted at rest like the audit error
+	// column; legacy plaintext rows read through s.dec's passthrough.
+	decidedBy, err := s.dec(p.DecidedBy)
+	if err != nil {
+		return PendingCall{}, fmt.Errorf("decrypt pending call %q decider: %w", p.ID, err)
+	}
+	decisionNote, err := s.dec(p.DecisionNote)
+	if err != nil {
+		return PendingCall{}, fmt.Errorf("decrypt pending call %q decision note: %w", p.ID, err)
+	}
+	p.DecidedBy, p.DecisionNote = decidedBy, decisionNote
 	return p, nil
 }
 
@@ -2274,12 +3359,16 @@ func (s *PgStore) LogPending(ctx context.Context, p PendingCall) error {
 	if err != nil {
 		return err
 	}
+	encryptedArgs, err := s.enc(string(b))
+	if err != nil {
+		return fmt.Errorf("encrypt pending call arguments: %w", err)
+	}
 	_, err = s.pool.Exec(ctx, `
 INSERT INTO pending_calls
-    (id,ts,connector,account,account_incarnation_id,account_revision,connection_namespace_id,tool,args,status,expires_at)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+    (id,ts,connector,account,account_incarnation_id,account_revision,connection_namespace_id,tool,args,status,expires_at,kind)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
 		p.ID, p.TS, p.Connector, p.Account, p.AccountIncarnationID, p.AccountRevision, p.ConnectionNamespaceID,
-		p.Tool, s.enc(string(b)), p.Status, p.ExpiresAt)
+		p.Tool, encryptedArgs, p.Status, p.ExpiresAt, p.Kind)
 	return err
 }
 
@@ -2329,11 +3418,15 @@ func (s *PgStore) DecidePending(ctx context.Context, id string, decision Approva
 	if err != nil {
 		return PendingCall{}, err
 	}
+	actor, note, err := s.encryptDecisionMetadata(decision.Actor, decision.Note)
+	if err != nil {
+		return PendingCall{}, err
+	}
 	p, err := s.scanPendingCall(s.pool.QueryRow(ctx, `
 UPDATE pending_calls
 SET status=$2, decided_at=now(), decided_by=$3, decision_note=$4
 WHERE id=$1 AND status='pending' AND expires_at > now()
-RETURNING `+pendingCallColumns, id, decision.Status, decision.Actor, decision.Note))
+RETURNING `+pendingCallColumns, id, decision.Status, actor, note))
 	if err == nil {
 		return p, nil
 	}
@@ -2341,6 +3434,23 @@ RETURNING `+pendingCallColumns, id, decision.Status, decision.Actor, decision.No
 		return PendingCall{}, err
 	}
 	return s.pendingTransitionResult(ctx, id, decision.Status)
+}
+
+// encryptDecisionMetadata applies the at-rest cipher to caller-supplied
+// approval decision metadata before it is written to decided_by/decision_note.
+// Engine-written constants (for example 'engine' / 'approval deadline
+// elapsed') carry no caller input and stay plaintext literals in SQL; s.dec's
+// passthrough reads both forms.
+func (s *PgStore) encryptDecisionMetadata(actor, note string) (string, string, error) {
+	encActor, err := s.enc(actor)
+	if err != nil {
+		return "", "", fmt.Errorf("encrypt approval actor: %w", err)
+	}
+	encNote, err := s.enc(note)
+	if err != nil {
+		return "", "", fmt.Errorf("encrypt approval note: %w", err)
+	}
+	return encActor, encNote, nil
 }
 
 // ExpirePending atomically transitions only a due pending call. Calling it
@@ -2372,11 +3482,15 @@ func (s *PgStore) CancelPending(ctx context.Context, id, actor, note string) (Pe
 	if len(actor) > maxApprovalActorBytes || len(note) > maxApprovalNoteBytes {
 		return PendingCall{}, errors.New("approval cancellation metadata is too long")
 	}
+	encActor, encNote, err := s.encryptDecisionMetadata(actor, note)
+	if err != nil {
+		return PendingCall{}, err
+	}
 	p, err := s.scanPendingCall(s.pool.QueryRow(ctx, `
 UPDATE pending_calls
 SET status='cancelled', decided_at=now(), decided_by=$2, decision_note=$3
 WHERE id=$1 AND status='pending' AND expires_at > now()
-RETURNING `+pendingCallColumns, id, actor, note))
+RETURNING `+pendingCallColumns, id, encActor, encNote))
 	if err == nil {
 		return p, nil
 	}
@@ -2461,7 +3575,17 @@ func (s *PgStore) PendingCalls(ctx context.Context) ([]PendingCall, error) {
 	for rows.Next() {
 		p, err := s.scanPendingCall(rows)
 		if err != nil {
-			return nil, err
+			// A single unreadable row (e.g. a decrypt failure from a
+			// wrong/rotated key) must not fail the whole list: console.go turns
+			// a PendingCalls error into a 502 for every caller, hiding all
+			// pending and historical approvals instead of just the one bad
+			// record. Match PgStore.Accounts: log (row content, never
+			// decrypted/attempted-decrypt values) and skip just this row.
+			// scanPendingCall's single-row callers (ApprovalCall,
+			// DecidePending, ExpirePending, CancelPending) keep propagating the
+			// error for their one row — only this list path omits-and-logs.
+			log.Printf("engine: omit unreadable pending call: %v", err)
+			continue
 		}
 		out = append(out, p)
 	}

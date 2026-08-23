@@ -63,6 +63,18 @@ func (g *Gateway) PendingApprovals(ctx context.Context) ([]PendingCall, error) {
 	return al.PendingCalls(ctx)
 }
 
+// ApprovalByID looks up one approval record by its durable id, for the
+// unauthenticated one-time decide link (see console_decide.go / MOBI-15).
+// Returns found=false when the store has no lifecycle facet at all, same
+// fail-closed posture as approvalHandler.
+func (g *Gateway) ApprovalByID(ctx context.Context, id string) (PendingCall, bool, error) {
+	al, ok := g.approvalLifecycle()
+	if !ok {
+		return PendingCall{}, false, nil
+	}
+	return al.ApprovalCall(ctx, id)
+}
+
 // registerWait creates the decision channel for id. Called BEFORE the pending
 // row and webhook exist, so a fast console decision can never miss the waiter.
 func (g *Gateway) registerWait(id string) chan string {
@@ -153,9 +165,11 @@ func (g *Gateway) DecideWithMetadata(ctx context.Context, id string, decision Ap
 	// case approvalHandler and the cached dispatch closure both revalidate again
 	// immediately before upstream work, so an ownership move can never turn a
 	// previously-authorized decision into credential access.
-	if existing, found, readErr := al.ApprovalCall(writeCtx, id); readErr != nil {
+	existing, found, readErr := al.ApprovalCall(writeCtx, id)
+	if readErr != nil {
 		return PendingCall{}, readErr
-	} else if found && existing.Status == ApprovalPending && !g.pendingCallBindingLive(existing) {
+	}
+	if found && existing.Status == ApprovalPending && !g.pendingCallBindingLive(existing) {
 		cancelled, cancelErr := al.CancelPending(writeCtx, id, "engine", "connection ownership changed while approval was pending")
 		if cancelErr == nil {
 			if ch, live := g.takeWait(id); live {
@@ -165,6 +179,11 @@ func (g *Gateway) DecideWithMetadata(ctx context.Context, id string, decision Ap
 		}
 		return cancelled, cancelErr
 	}
+	// wasPending gates the call.decided/call.timed_out notification below: it
+	// is a best-effort "this call is the one that produced the transition"
+	// signal (a narrow concurrent-decide race can double-fire a notification;
+	// the durable CAS itself is unaffected — see notify.go).
+	wasPending := found && existing.Status == ApprovalPending
 	p, err := al.DecidePending(writeCtx, id, decision)
 	if err != nil {
 		// A move/cancel or another Engine's terminal decision may have won after
@@ -180,6 +199,11 @@ func (g *Gateway) DecideWithMetadata(ctx context.Context, id string, decision Ap
 		// after the persisted deadline but before a waiter/sweeper marked it.
 		if errors.Is(err, ErrApprovalExpired) {
 			if expired, expireErr := al.ExpirePending(writeCtx, id, time.Now()); expireErr == nil {
+				if wasPending {
+					g.fireEvent(g.buildCallTimedOutEvent(expired, fmt.Sprintf(
+						"⏳ Synaxis: approval timed out — %s: %s·%s.", expired.Connector, expired.Account, expired.Tool,
+					)))
+				}
 				return expired, ErrApprovalExpired
 			}
 		}
@@ -191,6 +215,14 @@ func (g *Gateway) DecideWithMetadata(ctx context.Context, id string, decision Ap
 	// the durable row and will see the same state.
 	if ch, live := g.takeWait(id); live {
 		ch <- p.Status
+	}
+	if wasPending {
+		verb, icon := "approved", "✅"
+		if p.Status == ApprovalDenied {
+			verb, icon = "denied", "🚫"
+		}
+		legacy := fmt.Sprintf("%s Synaxis: %s — %s: %s·%s (by %s).", icon, verb, p.Connector, p.Account, p.Tool, p.DecidedBy)
+		g.fireEvent(g.buildCallDecidedEvent(p, legacy))
 	}
 	return p, nil
 }
@@ -262,9 +294,9 @@ func (g *Gateway) observeDurableDecision(ctx context.Context, id string, ch chan
 
 // finishWait reaches the terminal state through the store's conditional
 // transition. If another actor won the race, the row returned with the error
-// is inspected and honored. If persistence is unavailable we keep the waiter
-// registered and fail closed; a later durable decision can never trigger an
-// unsafe automatic replay because this handler has already returned an error.
+// is inspected and honored. If persistence is unavailable at the terminal
+// time we drop the waiter and fail closed: the durable row remains the
+// authority, and the waiter map is only a wake-up optimization.
 func (g *Gateway) finishWait(ctx context.Context, id string, ch chan string, wanted string) (approved bool, reason string) {
 	al, ok := g.approvalLifecycle()
 	if !ok {
@@ -273,12 +305,21 @@ func (g *Gateway) finishWait(ctx context.Context, id string, ch chan string, wan
 	writeCtx, cancel := approvalWriteContext(ctx)
 	defer cancel()
 	now := time.Now()
+	// wasPending is the same best-effort "this call performed the transition"
+	// signal used by DecideWithMetadata — see notify.go and the comment there.
+	preexisting, preFound, preErr := al.ApprovalCall(writeCtx, id)
+	wasPending := preErr == nil && preFound && preexisting.Status == ApprovalPending
 	var (
 		p   PendingCall
 		err error
 	)
 	if wanted == ApprovalExpired {
 		p, err = al.ExpirePending(writeCtx, id, now)
+		if err == nil && wasPending {
+			g.fireEvent(g.buildCallTimedOutEvent(p, fmt.Sprintf(
+				"⏳ Synaxis: approval timed out — %s: %s·%s.", p.Connector, p.Account, p.Tool,
+			)))
+		}
 	} else {
 		// If the actual persisted deadline elapsed while the request context
 		// was being cancelled, expire rather than mislabel it cancelled.
@@ -302,6 +343,7 @@ func (g *Gateway) finishWait(ctx context.Context, id string, ch chan string, wan
 		g.dropWaitIf(id, ch)
 		return p.Status == ApprovalApproved, p.Status
 	}
+	g.dropWaitIf(id, ch)
 	return false, "unavailable"
 }
 
@@ -316,8 +358,16 @@ func newApprovalID() string {
 // approvalHandler wraps a cached tool handler so calls on this connector park
 // for a human decision before dispatching upstream. Deny/timeout returns an
 // MCP tool error result (isError), NOT a protocol error.
-func (g *Gateway) approvalHandler(connector string, account Account, bare string, inner server.ToolHandlerFunc) server.ToolHandlerFunc {
+func (g *Gateway) approvalHandler(connector string, account Account, bare string, readOnly bool, inner server.ToolHandlerFunc) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		// A global tool-governance policy can be nested inside a real connector
+		// or client endpoint. Keep the approval/audit record attributed to that
+		// outer delivery surface when one exists; otherwise the stable policy
+		// scope makes the reason for the approval visible to operators.
+		approvalConnector := connector
+		if sc := auditScopeFrom(ctx); sc != nil && sc.connector != "" {
+			approvalConnector = sc.connector
+		}
 		al, hasLog := g.approvalLog()
 		if !hasLog {
 			// FAIL CLOSED: a gated tool must never dispatch without a record.
@@ -338,8 +388,8 @@ func (g *Gateway) approvalHandler(connector string, account Account, bare string
 		now := time.Now()
 		expires := now.Add(g.approvalWait())
 		p := PendingCall{
-			ID: id, TS: now, ExpiresAt: &expires, Connector: connector, Account: account.Name,
-			Tool: bare, Args: req.GetArguments(), Status: ApprovalPending,
+			ID: id, TS: now, ExpiresAt: &expires, Connector: approvalConnector, Account: account.Name,
+			Tool: bare, Args: req.GetArguments(), Status: ApprovalPending, Kind: approvalKind(readOnly),
 			AccountIncarnationID: account.IncarnationID, AccountRevision: account.Revision,
 			ConnectionNamespaceID: account.ConnectionNamespaceID,
 		}
@@ -347,11 +397,11 @@ func (g *Gateway) approvalHandler(connector string, account Account, bare string
 			g.dropWait(id)
 			return mcp.NewToolResultError("approval required, but the pending call could not be recorded: " + err.Error()), nil
 		}
-		msg := fmt.Sprintf("⏸️ Synaxis: approval needed — %s: %s·%s.", connector, account.Name, bare)
+		msg := fmt.Sprintf("⏸️ Synaxis: approval needed — %s: %s·%s.", approvalConnector, account.Name, bare)
 		if g.consoleURL != "" {
 			msg += " Approve in console: " + g.consoleURL
 		}
-		g.fireAlert(msg)
+		g.fireEvent(g.buildCallParkedEvent(p, msg))
 		start := time.Now()
 		ok, reason := g.WaitDecision(ctx, id, g.approvalWait())
 		if !ok {
@@ -368,7 +418,7 @@ func (g *Gateway) approvalHandler(connector string, account Account, bare string
 				rec := CallRecord{
 					Account: account.Name, Tool: bare, OK: false,
 					Ms: time.Since(start).Milliseconds(), Error: outcome,
-					Connector: connector, Decision: reason,
+					Connector: approvalConnector, Decision: reason,
 				}
 				// Recording connectors capture what WOULD have been sent, so
 				// a denied/expired call is replayable (with force) later.
@@ -389,7 +439,7 @@ func (g *Gateway) approvalHandler(connector string, account Account, bare string
 				rec := CallRecord{
 					Account: account.Name, Tool: bare, OK: false,
 					Ms: time.Since(start).Milliseconds(), Error: outcome,
-					Connector: connector, Decision: outcome,
+					Connector: approvalConnector, Decision: outcome,
 				}
 				if sc := auditScopeFrom(ctx); sc != nil {
 					rec.EndpointKind = sc.kind

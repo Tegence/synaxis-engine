@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"narthex/backend/internal/ratelimit"
 	"narthex/backend/internal/upstreamoauth"
 )
 
@@ -34,12 +35,16 @@ type connector interface {
 // immediately (no separate service, no cross-process reload).
 type ConsoleAPI struct {
 	store            AccountStore
-	connStore        ConnectorStore // store's connector facet; nil = connectors unsupported (501)
-	nsStore          NamespaceStore // store's endpoint-bundle facet; nil = endpoints unsupported (501)
-	apprLog          ApprovalLog    // store's approval facet; nil = approvals unsupported (501)
-	audit            AuditSink      // store's audit facet; nil = call detail/replay unsupported (501)
-	triage           AuditTriage    // store's triage facet; nil = flagged decisions unsupported (501)
-	usage            *UsageGate     // nil = self-hosted/unlimited
+	connStore        ConnectorStore      // store's connector facet; nil = connectors unsupported (501)
+	nsStore          NamespaceStore      // store's endpoint-bundle facet; nil = endpoints unsupported (501)
+	apprLog          ApprovalLog         // store's approval facet; nil = approvals unsupported (501)
+	audit            AuditSink           // store's audit facet; nil = call detail/replay unsupported (501)
+	triage           AuditTriage         // store's triage facet; nil = flagged decisions unsupported (501)
+	usage            *UsageGate          // nil = self-hosted/unlimited
+	skillStore       SkillStore          // store's skills facet; nil = skills unsupported (501)
+	skillFetcher     SkillSourceFetcher  // git-fetch seam for skill-source sync; defaults to gitFetcher
+	libraryStore     LibraryStore        // store's portable Library v2 facet; nil = library unsupported (501)
+	draftGenerator   SkillDraftGenerator // server-side only; nil = creator unavailable (503)
 	gw               *Gateway
 	conn             connector
 	passwordDigest   [sha256.Size]byte
@@ -52,6 +57,23 @@ type ConsoleAPI struct {
 	selfURL          string   // engine's own public base (issuer)
 	consoleURL       string   // where to bounce the browser after OAuth
 	origins          []string // CORS allowlist (comma-separated CONSOLE_ORIGIN)
+	// readinessCheck verifies the durable store backing this Engine. It is
+	// intentionally separate from the authenticated account-health endpoint:
+	// a readiness probe must not fan out to upstream providers or disclose
+	// provider state.
+	readinessCheck func(context.Context) error
+	// loginThrottle bounds online brute-force attempts against the shared
+	// console password. Denial is backoff-by-429, never a lockout: the engine
+	// is single-user by design and the administrator must not be lockable.
+	loginThrottle *ratelimit.Limiter
+	// trustProxyHeaders switches loginThrottle's key from RemoteAddr to the
+	// trusted last hop of X-Forwarded-For. See WithTrustProxyHeaders: this
+	// must only be enabled behind an operator-controlled reverse proxy.
+	trustProxyHeaders bool
+	// lifecycleCtx is cancelled before graceful HTTP shutdown begins. /readyz
+	// uses it to stop advertising a draining Engine as ready while /healthz
+	// remains the small process-liveness probe.
+	lifecycleCtx context.Context
 }
 
 // ConsoleOption configures optional management API behavior without forcing
@@ -84,6 +106,26 @@ func WithLocalAdminAuth(enabled bool) ConsoleOption {
 	}
 }
 
+// WithTrustProxyHeaders switches the login-throttle rate-limit key from
+// r.RemoteAddr to the last entry of a present X-Forwarded-For header (see
+// ratelimit.ClientIP). Leaving it disabled (the default) preserves the
+// original RemoteAddr-only behavior.
+//
+// Enable this ONLY when the Engine sits directly behind exactly one
+// reverse-proxy hop the operator controls (nginx, Caddy, Traefik, Cloudflare
+// Tunnel, ...). The Engine binary has no TLS of its own, so a self-hosted
+// deployment almost always runs behind such a proxy — without this option,
+// every request's RemoteAddr is the proxy's own fixed address, so every real
+// client shares one rate-limit bucket and a single attacker can exhaust it to
+// lock out the legitimate administrator. Enabling it when the Engine is
+// otherwise directly reachable, or behind more than one untrusted hop, lets
+// an attacker spoof X-Forwarded-For to pick their own rate-limit key instead.
+func WithTrustProxyHeaders(enabled bool) ConsoleOption {
+	return func(c *ConsoleAPI) {
+		c.trustProxyHeaders = enabled
+	}
+}
+
 // WithPlatformActorVerifier enables the hosted Platform-to-Engine identity
 // boundary. When configured, every protected management request must present
 // both the Engine machine token and a valid request-bound Platform assertion.
@@ -110,6 +152,49 @@ func WithUsageGate(gate *UsageGate) ConsoleOption {
 	}
 }
 
+// WithReadinessCheck configures the bounded durable-store check performed by
+// the public /readyz probe. A nil check preserves the lightweight local test
+// and embedded-server behavior; production supplies a query against the
+// token-generation store, which also verifies Postgres connectivity.
+func WithReadinessCheck(check func(context.Context) error) ConsoleOption {
+	return func(c *ConsoleAPI) {
+		c.readinessCheck = check
+	}
+}
+
+// WithLifecycleContext lets /readyz report an Engine as unavailable as soon
+// as shutdown begins. Passing nil deliberately behaves like an uncancelled
+// context so option callers cannot accidentally make a newly-created API
+// permanently unready.
+func WithLifecycleContext(ctx context.Context) ConsoleOption {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return func(c *ConsoleAPI) {
+		c.lifecycleCtx = ctx
+	}
+}
+
+// WithSkillFetcher overrides the git-fetch seam used by skill-source sync
+// (default: gitFetcher, which shells out to the system `git` binary). Tests
+// use this to supply a fake fetcher with canned files, so skills console
+// tests never touch a real repository or subprocess.
+func WithSkillFetcher(f SkillSourceFetcher) ConsoleOption {
+	return func(c *ConsoleAPI) {
+		c.skillFetcher = f
+	}
+}
+
+// WithSkillDraftGenerator enables server-side LLM-backed draft creation. The
+// generator receives a bounded prompt but no browser credentials, connection
+// secrets, or ability to publish/bind a skill. A nil generator deliberately
+// leaves POST /api/library/skill-drafts unavailable.
+func WithSkillDraftGenerator(generator SkillDraftGenerator) ConsoleOption {
+	return func(c *ConsoleAPI) {
+		c.draftGenerator = generator
+	}
+}
+
 func NewConsoleAPI(store AccountStore, gw *Gateway, conn *Connector, password, secret, selfURL, consoleURL, origin string, options ...ConsoleOption) *ConsoleAPI {
 	var origins []string
 	for _, o := range strings.Split(origin, ",") {
@@ -124,9 +209,13 @@ func NewConsoleAPI(store AccountStore, gw *Gateway, conn *Connector, password, s
 	apprLog, _ := store.(ApprovalLog)
 	audit, _ := store.(AuditSink)
 	triage, _ := store.(AuditTriage)
+	skillStore, _ := store.(SkillStore)
+	libraryStore, _ := store.(LibraryStore)
 	api := &ConsoleAPI{
-		store: store, connStore: connStore, nsStore: nsStore, apprLog: apprLog, audit: audit, triage: triage, gw: gw, conn: conn, passwordDigest: sha256.Sum256([]byte(password)), secret: []byte(secret),
-		selfURL: strings.TrimRight(selfURL, "/"), consoleURL: strings.TrimRight(consoleURL, "/"), origins: origins, localAdminAuth: true,
+		store: store, connStore: connStore, nsStore: nsStore, apprLog: apprLog, audit: audit, triage: triage, skillStore: skillStore, libraryStore: libraryStore, gw: gw, conn: conn, passwordDigest: sha256.Sum256([]byte(password)), secret: []byte(secret),
+		selfURL: strings.TrimRight(selfURL, "/"), consoleURL: strings.TrimRight(consoleURL, "/"), origins: origins, localAdminAuth: true, lifecycleCtx: context.Background(),
+		loginThrottle: ratelimit.New(10, 5*time.Minute),
+		skillFetcher:  newGitFetcher(),
 	}
 	for _, option := range options {
 		if option != nil {
@@ -204,10 +293,11 @@ func (c *ConsoleAPI) Routes(mux *http.ServeMux) {
 			fn(w, authorized)
 		}
 	}
-	// Deliberately separate from /api/health: these public probes report only
-	// process readiness and never expose account or upstream health details.
-	mux.HandleFunc("/healthz", pub(c.handleProbe))
-	mux.HandleFunc("/readyz", pub(c.handleProbe))
+	// Deliberately separate from /api/health: these public probes never expose
+	// account or upstream health details. /healthz is process liveness, while
+	// /readyz verifies the durable store and refuses traffic during draining.
+	mux.HandleFunc("/healthz", pub(c.handleLiveness))
+	mux.HandleFunc("/readyz", pub(c.handleReadiness))
 	mux.HandleFunc("/api/auth", pub(c.handleAuthStatus))
 	if c.localAdminAuth {
 		mux.HandleFunc("/api/login", pub(c.handleLogin))
@@ -240,6 +330,11 @@ func (c *ConsoleAPI) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/mcp-clients/{id}/namespaces", sec(c.handleMCPClientNamespaces))
 	mux.HandleFunc("/api/mcp-clients/{id}/oauth-client/reset", sec(c.handleMCPClientOAuthReset))
 	mux.HandleFunc("/api/mcp-clients/{id}/revoke", sec(c.handleMCPClientRevoke))
+	// Skill authoring is intentionally narrower than generic MCP-client
+	// management: only an owner/admin can open or revoke a temporary window.
+	mux.HandleFunc("/api/mcp-clients/{id}/skill-authoring-lease", sec(c.handleMCPClientSkillAuthoringLease))
+	mux.HandleFunc("/api/mcp-clients/{id}/skill-authoring-adoption", sec(c.handleMCPClientSkillAuthoringAdoption))
+	mux.HandleFunc("/api/mcp-clients/{id}/skill-authoring-lease/revoke", sec(c.handleMCPClientSkillAuthoringLeaseRevoke))
 	mux.HandleFunc("/api/connectors", sec(c.handleConnectors))
 	mux.HandleFunc("/api/connectors/{slug}", sec(c.handleConnectorBySlug))
 	// Endpoint is the preferred product term for a reusable M:N account
@@ -267,6 +362,60 @@ func (c *ConsoleAPI) Routes(mux *http.ServeMux) {
 	}))
 	mux.HandleFunc("/api/approvals/{id}/deny", sec(func(w http.ResponseWriter, r *http.Request) {
 		c.handleApprovalDecision(w, r, "denied")
+	}))
+	// Skills: versioned procedure files tracked from a git source and
+	// delivered through the virtual-connector "carrier" they're attached to.
+	// See skills_console.go for handlers/DTOs and skills.go for the domain
+	// model and the design decisions made where the report flagged an open
+	// question.
+	mux.HandleFunc("/api/skill-sources", sec(c.handleSkillSources))
+	mux.HandleFunc("/api/skill-sources/{id}", sec(c.handleSkillSourceByID))
+	mux.HandleFunc("/api/skill-sources/{id}/sync", sec(c.handleSkillSourceSync))
+	mux.HandleFunc("/api/skills", sec(c.handleSkills))
+	mux.HandleFunc("/api/skills/{id}", sec(c.handleSkillByID))
+	mux.HandleFunc("/api/skills/{id}/versions", sec(c.handleSkillVersions))
+	mux.HandleFunc("/api/skills/{id}/checks", sec(c.handleSkillChecks))
+	mux.HandleFunc("/api/skills/{id}/pins", sec(c.handleSkillPins))
+	mux.HandleFunc("/api/skills/{id}/pins/{slug}", sec(c.handleSkillPinBySlug))
+	// Library v2 is deliberately distinct from the legacy /api/skills Git
+	// source surface above. Its binding scopes are generic opaque references,
+	// never credential-owning connection namespaces.
+	mux.HandleFunc("/api/library/resolve", sec(c.handleLibraryResolve))
+	mux.HandleFunc("/api/library/skills", sec(c.handleLibrarySkills))
+	mux.HandleFunc("/api/library/skills/{id}", sec(c.handleLibrarySkillByID))
+	mux.HandleFunc("/api/library/skills/{id}/versions", sec(c.handleLibrarySkillVersions))
+	mux.HandleFunc("/api/library/skills/{id}/bindings", sec(c.handleLibrarySkillBindings))
+	mux.HandleFunc("/api/library/skills/{id}/bindings/{binding}", sec(c.handleLibrarySkillBindingByID))
+	mux.HandleFunc("/api/library/skills/{id}/evaluations", sec(c.handleLibrarySkillEvaluations))
+	mux.HandleFunc("/api/library/skill-drafts", sec(c.handleLibrarySkillDrafts))
+	// Platform-only handoff for hosted LLM drafting. This is intentionally not
+	// an extension of the browser-facing skill-drafts route: the handler
+	// requires a verified owner/admin actor assertion and remains outside the
+	// Platform browser proxy allowlist.
+	mux.HandleFunc("/api/library/skill-drafts/platform-import", sec(c.handleLibraryPlatformSkillDraftImport))
+	mux.HandleFunc("/api/library/artifacts", sec(c.handleLibraryArtifacts))
+	mux.HandleFunc("/api/library/artifacts/{id}", sec(c.handleLibraryArtifactByID))
+	mux.HandleFunc("/api/library/artifacts/{id}/versions", sec(c.handleLibraryArtifactVersions))
+	mux.HandleFunc("/api/library/artifacts/{id}/grants", sec(c.handleLibraryArtifactGrants))
+	mux.HandleFunc("/api/library/artifacts/{id}/grants/{grant}/revoke", sec(c.handleLibraryArtifactGrantRevoke))
+	mux.HandleFunc("/api/library/artifacts/{id}/review", sec(c.handleLibraryArtifactReview))
+	mux.HandleFunc("/api/library/artifacts/{id}/publication-candidate", sec(c.handleLibraryPublicationCandidate))
+	mux.HandleFunc("/api/library/artifacts/{id}/publication-claim", sec(c.handleLibraryPublicationClaim))
+	mux.HandleFunc("/api/library/runs", sec(c.handleLibraryRuns))
+	mux.HandleFunc("/api/library/runs/{id}", sec(c.handleLibraryRunByID))
+	// One-time decide link (MOBI-15): the "decide_url" carried on webhook-v2
+	// call.parked events (notify.go) and, later, the approval email/Slack
+	// buttons. Deliberately public/unauthenticated — knowledge of the
+	// unguessable id (128-bit random hex) is the whole capability, same
+	// trust model as a magic link. GET only renders a confirm page; the
+	// actual decision requires a POST so an email link-scanner's GET
+	// prefetch can never silently approve or deny a call.
+	mux.HandleFunc("/a/{id}", pub(c.handleOneTimeDecide))
+	mux.HandleFunc("/a/{id}/approve", pub(func(w http.ResponseWriter, r *http.Request) {
+		c.handleOneTimeDecideAction(w, r, ApprovalApproved)
+	}))
+	mux.HandleFunc("/a/{id}/deny", pub(func(w http.ResponseWriter, r *http.Request) {
+		c.handleOneTimeDecideAction(w, r, ApprovalDenied)
 	}))
 }
 
@@ -515,6 +664,10 @@ func (c *ConsoleAPI) handleConnectors(w http.ResponseWriter, r *http.Request) {
 		}
 		if slug == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "slug must contain letters or numbers"})
+			return
+		}
+		if reservedEndpointSlugs[slug] {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "that slug is reserved"})
 			return
 		}
 		if msg, ok := c.validateConnectorTools(req.Tools); !ok {
@@ -778,6 +931,10 @@ func (c *ConsoleAPI) handleNamespaces(w http.ResponseWriter, r *http.Request) {
 		}
 		if slug == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "slug must contain letters or numbers"})
+			return
+		}
+		if reservedEndpointSlugs[slug] {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "that slug is reserved"})
 			return
 		}
 		if msg, ok := c.validateNamespaceAccounts(req.Members); !ok {
@@ -1106,7 +1263,13 @@ func (c *ConsoleAPI) cors(w http.ResponseWriter, r *http.Request) bool {
 		}
 	}
 	w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Authorization,Content-Type")
+	// Keyset cursors for Activity and Library lists use headers rather than
+	// query strings deliberately: a hosted Platform-to-Engine actor assertion
+	// binds and accepts only a bare path with no query string. These headers
+	// therefore cross both the browser and Platform proxy without changing the
+	// signed actor path.
+	w.Header().Set("Access-Control-Allow-Headers", "Authorization,Content-Type,X-Synaxis-Logs-Before-Ts,X-Synaxis-Logs-Before-Id,X-Synaxis-Library-Cursor,X-Synaxis-Library-Limit")
+	w.Header().Set("Access-Control-Expose-Headers", "X-Synaxis-Library-Next-Cursor")
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
 		return true
@@ -1188,6 +1351,14 @@ func (c *ConsoleAPI) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (c *ConsoleAPI) handleLogin(w http.ResponseWriter, r *http.Request) {
+	// Throttle by RemoteAddr host by default, so the limit cannot be bypassed
+	// by spoofing X-Forwarded-For. WithTrustProxyHeaders opts into keying on
+	// the trusted last X-Forwarded-For hop instead, for deployments behind an
+	// operator-controlled reverse proxy where RemoteAddr is always the proxy.
+	if !c.loginThrottle.Allow(ratelimit.ClientIP(r, c.trustProxyHeaders)) {
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many attempts, try again later"})
+		return
+	}
 	var req struct{ Password string }
 	_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req)
 	password := sha256.Sum256([]byte(req.Password))
@@ -1198,32 +1369,122 @@ func (c *ConsoleAPI) handleLogin(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"token": c.signToken()})
 }
 
-func (c *ConsoleAPI) handleProbe(w http.ResponseWriter, r *http.Request) {
+const readinessCheckTimeout = 2 * time.Second
+
+// beginProbe applies the common public-probe HTTP contract. It intentionally
+// runs before any readiness work so unsupported methods cannot be used to
+// trigger a store query.
+func beginProbe(w http.ResponseWriter, r *http.Request) bool {
 	w.Header().Set("Cache-Control", "no-store")
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
 		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
+		return false
 	}
+	return true
+}
+
+func writeProbe(w http.ResponseWriter, r *http.Request, statusCode int, ready bool, status string) {
 	if r.Method == http.MethodHead {
-		w.WriteHeader(http.StatusOK)
+		w.WriteHeader(statusCode)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ready":   true,
+	writeJSON(w, statusCode, map[string]any{
+		"ready":   ready,
 		"service": "synaxis-engine",
-		"status":  "ok",
+		"status":  status,
 	})
 }
 
+// handleLiveness is deliberately inexpensive: it only proves that this HTTP
+// process can answer a request. It stays independent from Postgres and from
+// the shutdown lifecycle, which lets an orchestrator distinguish a live but
+// draining or dependency-unready Engine from a dead process.
+func (c *ConsoleAPI) handleLiveness(w http.ResponseWriter, r *http.Request) {
+	if !beginProbe(w, r) {
+		return
+	}
+	writeProbe(w, r, http.StatusOK, true, "ok")
+}
+
+// readinessContext joins a request cancellation, the Engine lifecycle, and a
+// short bounded dependency check. HTTP Server.Shutdown waits for active
+// requests rather than cancelling them, so joining lifecycleCtx prevents a
+// concurrent /readyz request from returning a stale 200 after draining starts.
+func (c *ConsoleAPI) readinessContext(requestCtx context.Context) (context.Context, func()) {
+	ctx, cancelRequest := context.WithCancel(requestCtx)
+	stopLifecycle := func() bool { return false }
+	if c.lifecycleCtx != nil {
+		stopLifecycle = context.AfterFunc(c.lifecycleCtx, cancelRequest)
+	}
+	ctx, cancelTimeout := context.WithTimeout(ctx, readinessCheckTimeout)
+	return ctx, func() {
+		cancelTimeout()
+		stopLifecycle()
+		cancelRequest()
+	}
+}
+
+// handleReadiness verifies the initialized durable store when a check was
+// supplied by the Engine. Failure details are kept out of this public endpoint
+// so provisioning health probes cannot become a database-error disclosure.
+func (c *ConsoleAPI) handleReadiness(w http.ResponseWriter, r *http.Request) {
+	if !beginProbe(w, r) {
+		return
+	}
+	if c.lifecycleCtx != nil && c.lifecycleCtx.Err() != nil {
+		writeProbe(w, r, http.StatusServiceUnavailable, false, "shutting_down")
+		return
+	}
+	if c.readinessCheck != nil {
+		ctx, cancel := c.readinessContext(r.Context())
+		err := c.readinessCheck(ctx)
+		cancel()
+		// Prefer the lifecycle result in the narrow race where shutdown begins
+		// while the dependency check is returning.
+		if c.lifecycleCtx != nil && c.lifecycleCtx.Err() != nil {
+			writeProbe(w, r, http.StatusServiceUnavailable, false, "shutting_down")
+			return
+		}
+		if err != nil {
+			writeProbe(w, r, http.StatusServiceUnavailable, false, "unavailable")
+			return
+		}
+	}
+	writeProbe(w, r, http.StatusOK, true, "ok")
+}
+
+// auditPersistenceReporter is the concrete-store diagnostic facet for the
+// durable audit writer. It deliberately stays off the AuditSink interface so
+// file-backed development stores simply omit the field.
+type auditPersistenceReporter interface {
+	AuditPersistenceStats() AuditPersistenceStats
+}
+
 func (c *ConsoleAPI) handleGateway(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"connectorUrl":     c.selfURL + "/mcp",
 		"oauthCallbackUrl": c.selfURL + "/api/oauth/callback",
 		"endpoint":         "mcp",
 		"namespace":        "narthex",
 		"ready":            true,
-	})
+	}
+	// Audit drop counters make lossy-under-outage auditing visible to the
+	// console. Only counts and the static drop-reason category cross this
+	// boundary — never LastError, which can carry driver error text.
+	if reporter, ok := c.store.(auditPersistenceReporter); ok {
+		stats := reporter.AuditPersistenceStats()
+		resp["auditPersistence"] = map[string]any{
+			"enqueued":       stats.Enqueued,
+			"persisted":      stats.Persisted,
+			"dropped":        stats.Dropped,
+			"failures":       stats.Failures,
+			"retries":        stats.Retries,
+			"queueDepth":     stats.QueueDepth,
+			"lastDropReason": stats.LastDropReason,
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (c *ConsoleAPI) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -1252,21 +1513,150 @@ func publicAccountHealth(item AccountHealth) AccountHealth {
 	return item
 }
 
+// logsPageSize is the fixed page size for both the default (newest) and
+// cursor-paged /api/logs reads. Kept in sync by convention with the
+// console client's own page-size constant.
+const logsPageSize = 100
+
+// maxLogsFetchAttempts bounds how many raw store pages handleLogs will pull
+// while backfilling a page short on VISIBLE rows (see below) — at most
+// maxLogsFetchAttempts*logsPageSize raw rows read for one request, no matter
+// how sparse this actor's visible history is within that window. Without a
+// bound, a namespace-scoped operator whose account accounts for a tiny slice
+// of a busy shared platform's audit volume could turn every 30s poll into an
+// unbounded scan of the whole tool_calls table. The tradeoff: if more than
+// maxLogsFetchAttempts*logsPageSize consecutive raw rows are invisible to
+// this actor, the response can still come back short of logsPageSize even
+// though more visible history exists further back — the same shape of
+// staleness this change fixes, just pushed from "triggered by any one
+// invisible row in the page" (the reported bug) to "triggered only by a
+// deeply skewed run of thousands of consecutive invisible rows" (very
+// unlikely for a real namespace's activity mix).
+const maxLogsFetchAttempts = 20
+
+// logsBeforeTSHeader and logsBeforeIDHeader carry the Activity "Load older"
+// keyset cursor as request headers rather than a ?before_ts=&before_id=
+// query string. This is deliberate, not stylistic: the hosted
+// Platform-to-Engine actor assertion (actor_assertion.go,
+// normalizedActorRequestPath) cryptographically binds and accepts only a
+// bare request path with an EMPTY query string — any request carrying one is
+// rejected outright (401) before handleLogs ever runs. Platform's reverse
+// proxy also forwards the browser's original query string to the Engine
+// unchanged while signing only the path, so a query-string cursor cannot be
+// made to work without changing that cross-service signing contract. Every
+// "operator"-role actor (the exact role this pagination fix targets) is
+// authenticated through that hosted path — self-hosted mode never has an
+// "operator" — so a query-string cursor would 401 for precisely the actors
+// who most need "Load older". Headers are outside the assertion's bound
+// claims and pass through the proxy unmodified, so they carry the cursor
+// through both self-hosted and hosted deployments alike.
+const (
+	logsBeforeTSHeader = "X-Synaxis-Logs-Before-Ts"
+	logsBeforeIDHeader = "X-Synaxis-Logs-Before-Id"
+)
+
+// handleLogs: GET /api/logs — the newest logsPageSize VISIBLE summary rows by
+// default. Sending the logsBeforeTSHeader (RFC3339) + logsBeforeIDHeader
+// request headers together pages backward from that keyset cursor instead
+// (Activity "Load older"), e.g. from the oldest row of a previous page —
+// both must be present, or neither. The FileStore audit sink is an
+// in-memory ring bounded at 500 rows (see audit.go); paging past that bound
+// on a self-hosted file store returns nothing older, even though
+// Postgres-backed workspaces retain the full AUDIT_RETENTION_DAYS window.
+//
+// The store is read in raw pages of logsPageSize, and each raw page is
+// visibility-filtered before joining the response. A raw page that mixes
+// visible and invisible rows — a normal occurrence for the "operator" role,
+// which is scoped to specific accounts via visibleCallPreloaded — would
+// otherwise shrink the filtered response below logsPageSize even though more
+// visible history sits just past the unfetched remainder. Since the frontend
+// infers "more pages exist" purely from the response length equaling
+// logsPageSize, that silently ends the "Load older" affordance for exactly
+// the scoped, least-privileged actors who most need to page back through
+// incident history — no error, no signal, the button just stops appearing.
+// So when a raw page comes back full (meaning the store may hold more) but
+// the response is still short of logsPageSize, the handler keeps advancing
+// the cursor and pulling further raw pages, folding in only the newly
+// visible rows, until the response reaches logsPageSize rows, or the store
+// is genuinely exhausted (a raw fetch returns fewer than logsPageSize rows),
+// or maxLogsFetchAttempts is reached. This preserves the existing
+// bare-JSON-array response contract, so the frontend's length-based
+// "hasMore" inference becomes correct again rather than needing its own
+// signal.
 func (c *ConsoleAPI) handleLogs(w http.ResponseWriter, r *http.Request) {
 	actor, ok := c.requireConnectionNamespaceActor(w, r)
 	if !ok {
 		return
 	}
-	calls, err := c.gw.RecentCalls(r.Context(), 100)
-	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "activity records unavailable"})
+	beforeTSRaw := strings.TrimSpace(r.Header.Get(logsBeforeTSHeader))
+	beforeIDRaw := strings.TrimSpace(r.Header.Get(logsBeforeIDHeader))
+
+	var cursorTS time.Time
+	var cursorID int64
+	haveCursor := false
+	switch {
+	case beforeTSRaw == "" && beforeIDRaw == "":
+		// No cursor: the first raw fetch below reads from the newest row via
+		// RecentCalls.
+	case beforeTSRaw == "" || beforeIDRaw == "":
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "before_ts and before_id headers must be provided together"})
 		return
-	}
-	out := make([]CallRecord, 0, len(calls))
-	for _, call := range calls {
-		if c.visibleCall(r.Context(), actor, call) {
-			out = append(out, call)
+	default:
+		beforeTS, parseErr := time.Parse(time.RFC3339, beforeTSRaw)
+		if parseErr != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid before_ts header: must be RFC3339"})
+			return
 		}
+		beforeID, parseErr := strconv.ParseInt(beforeIDRaw, 10, 64)
+		if parseErr != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid before_id header: must be an integer"})
+			return
+		}
+		cursorTS, cursorID = beforeTS, beforeID
+		haveCursor = true
+	}
+
+	admin := connectionNamespaceAdministrator(actor)
+	out := make([]CallRecord, 0, logsPageSize)
+	for attempt := 0; attempt < maxLogsFetchAttempts && len(out) < logsPageSize; attempt++ {
+		var raw []CallRecord
+		var err error
+		if haveCursor {
+			raw, err = c.gw.RecentCallsBefore(r.Context(), cursorTS, cursorID, logsPageSize)
+		} else {
+			raw, err = c.gw.RecentCalls(r.Context(), logsPageSize)
+		}
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "activity records unavailable"})
+			return
+		}
+		if len(raw) == 0 {
+			break
+		}
+
+		if admin {
+			out = append(out, raw...)
+		} else {
+			// Operators pay one account list plus one lookup per distinct
+			// namespace, not one account+namespace pair per record.
+			accountsByName, namespacesByID := c.callVisibilityData(r.Context(), raw)
+			for _, call := range raw {
+				if visibleCallPreloaded(actor, call, accountsByName, namespacesByID) {
+					out = append(out, call)
+				}
+			}
+		}
+
+		last := raw[len(raw)-1]
+		cursorTS, cursorID = last.TS, last.ID
+		haveCursor = true
+
+		if len(raw) < logsPageSize {
+			break // store genuinely exhausted past this point
+		}
+	}
+	if len(out) > logsPageSize {
+		out = out[:logsPageSize] // keep newest-first order; the trimmed tail is the next page's cursor
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -1953,6 +2343,11 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }
+
+// reservedEndpointSlugs may never name a shared connector or endpoint bundle:
+// `/mcp/clients/{slug}` is the subject-bound MCP client prefix — sharing the
+// prefix would invite routing confusion.
+var reservedEndpointSlugs = map[string]bool{"clients": true}
 
 // slugify turns "Notion Tegence" into "notion_tegence" — lowercase, non-alnum
 // collapsed to single underscores, trimmed.

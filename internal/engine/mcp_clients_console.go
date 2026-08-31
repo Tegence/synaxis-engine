@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -14,22 +15,28 @@ import (
 // ID is consumed by the signed consent/DCR path. The console gets the
 // useful status signal without becoming a second credential-binding surface.
 type mcpClientDTO struct {
-	ID                     string          `json:"id"`
-	Slug                   string          `json:"slug"`
-	Name                   string          `json:"name"`
-	Subject                string          `json:"subject"`
-	ConnectionNamespaceIDs []string        `json:"connectionNamespaceIds"`
-	Status                 MCPClientStatus `json:"status"`
-	OAuthBound             bool            `json:"oauthBound"`
-	Revision               int64           `json:"revision"`
-	CreatedAt              string          `json:"createdAt,omitempty"`
-	UpdatedAt              string          `json:"updatedAt,omitempty"`
-	RevokedAt              string          `json:"revokedAt,omitempty"`
-	CanManage              bool            `json:"canManage"`
+	ID                           string          `json:"id"`
+	Slug                         string          `json:"slug"`
+	Name                         string          `json:"name"`
+	Subject                      string          `json:"subject"`
+	ConnectionNamespaceIDs       []string        `json:"connectionNamespaceIds"`
+	Status                       MCPClientStatus `json:"status"`
+	OAuthBound                   bool            `json:"oauthBound"`
+	RuntimeAttestationConfigured bool            `json:"runtimeAttestationConfigured"`
+	Revision                     int64           `json:"revision"`
+	CreatedAt                    string          `json:"createdAt,omitempty"`
+	UpdatedAt                    string          `json:"updatedAt,omitempty"`
+	RevokedAt                    string          `json:"revokedAt,omitempty"`
+	CanManage                    bool            `json:"canManage"`
 }
 
 func (c *ConsoleAPI) mcpClientStore() (MCPClientStore, bool) {
 	store, ok := c.store.(MCPClientStore)
+	return store, ok
+}
+
+func (c *ConsoleAPI) mcpClientSkillAuthoringStore() (LibraryMCPClientSkillAuthoringStore, bool) {
+	store, ok := c.store.(LibraryMCPClientSkillAuthoringStore)
 	return store, ok
 }
 
@@ -59,6 +66,13 @@ func mcpClientRegistryAdministrator(actor PlatformActor) bool {
 	return connectionNamespaceAdministrator(actor)
 }
 
+// Unlike ordinary MCP-client registration, a temporary skill authoring lease
+// is owner/admin-only. In particular, service and operator roles must not be
+// able to mint an authoring window for a client credential they can manage.
+func mcpClientSkillAuthoringAdministrator(actor PlatformActor) bool {
+	return actor.Role == "owner" || actor.Role == "admin"
+}
+
 func canReadMCPClient(actor PlatformActor, client MCPClient) bool {
 	if mcpClientRegistryAdministrator(actor) {
 		return true
@@ -72,15 +86,16 @@ func canManageMCPClient(actor PlatformActor, client MCPClient) bool {
 
 func (c *ConsoleAPI) toMCPClientDTO(actor PlatformActor, client MCPClient) mcpClientDTO {
 	dto := mcpClientDTO{
-		ID:                     client.ID,
-		Slug:                   client.Slug,
-		Name:                   client.Name,
-		Subject:                client.Subject,
-		ConnectionNamespaceIDs: append([]string(nil), client.ConnectionNamespaceIDs...),
-		Status:                 client.Status,
-		OAuthBound:             client.OAuthClientID != "",
-		Revision:               client.Revision,
-		CanManage:              canManageMCPClient(actor, client),
+		ID:                           client.ID,
+		Slug:                         client.Slug,
+		Name:                         client.Name,
+		Subject:                      client.Subject,
+		ConnectionNamespaceIDs:       append([]string(nil), client.ConnectionNamespaceIDs...),
+		Status:                       client.Status,
+		OAuthBound:                   client.OAuthClientID != "",
+		RuntimeAttestationConfigured: client.RuntimeAttestorPublicKey != "",
+		Revision:                     client.Revision,
+		CanManage:                    canManageMCPClient(actor, client),
 	}
 	if !client.CreatedAt.IsZero() {
 		dto.CreatedAt = client.CreatedAt.UTC().Format(time.RFC3339Nano)
@@ -177,10 +192,11 @@ func (c *ConsoleAPI) handleMCPClients(w http.ResponseWriter, r *http.Request) {
 
 func (c *ConsoleAPI) createMCPClient(w http.ResponseWriter, r *http.Request, store MCPClientStore, actor PlatformActor) {
 	var request struct {
-		Name                   string   `json:"name"`
-		Slug                   string   `json:"slug"`
-		Subject                string   `json:"subject"`
-		ConnectionNamespaceIDs []string `json:"connectionNamespaceIds"`
+		Name                     string   `json:"name"`
+		Slug                     string   `json:"slug"`
+		Subject                  string   `json:"subject"`
+		ConnectionNamespaceIDs   []string `json:"connectionNamespaceIds"`
+		RuntimeAttestorPublicKey string   `json:"runtimeAttestorPublicKey"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&request); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
@@ -212,7 +228,11 @@ func (c *ConsoleAPI) createMCPClient(w http.ResponseWriter, r *http.Request, sto
 		Slug:                   strings.TrimSpace(request.Slug),
 		Subject:                subject,
 		ConnectionNamespaceIDs: namespaceIDs,
-		CreatedBy:              actor.UserID,
+		// Keep the key byte-for-byte so the core canonical-key validator rejects
+		// accidental whitespace instead of silently configuring a different
+		// attestor identity.
+		RuntimeAttestorPublicKey: request.RuntimeAttestorPublicKey,
+		CreatedBy:                actor.UserID,
 	})
 	if err != nil {
 		mcpClientError(w, err)
@@ -253,8 +273,9 @@ func (c *ConsoleAPI) handleMCPClientByID(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusOK, c.toMCPClientDTO(actor, client))
 	case http.MethodPatch:
 		var request struct {
-			Name     string `json:"name"`
-			Revision int64  `json:"revision"`
+			Name                     string  `json:"name"`
+			Revision                 int64   `json:"revision"`
+			RuntimeAttestorPublicKey *string `json:"runtimeAttestorPublicKey"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&request); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
@@ -264,7 +285,12 @@ func (c *ConsoleAPI) handleMCPClientByID(w http.ResponseWriter, r *http.Request)
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name and revision are required"})
 			return
 		}
-		updated, err := store.UpdateMCPClient(r.Context(), MCPClient{ID: client.ID, Name: strings.TrimSpace(request.Name)}, MCPClientPrecondition{ID: client.ID, Revision: request.Revision})
+		update := MCPClient{ID: client.ID, Name: strings.TrimSpace(request.Name)}
+		if request.RuntimeAttestorPublicKey != nil {
+			update.RuntimeAttestorPublicKey = *request.RuntimeAttestorPublicKey
+			update.runtimeAttestorKeySet = true
+		}
+		updated, err := store.UpdateMCPClient(r.Context(), update, MCPClientPrecondition{ID: client.ID, Revision: request.Revision})
 		if err != nil {
 			mcpClientError(w, err)
 			return
@@ -419,4 +445,222 @@ func (c *ConsoleAPI) handleMCPClientOAuthReset(w http.ResponseWriter, r *http.Re
 	}
 	c.refreshMCPClientProjection(r.Context())
 	writeJSON(w, http.StatusOK, c.toMCPClientDTO(actor, updated))
+}
+
+type mcpClientSkillAuthoringLeaseDTO struct {
+	LeaseID          string `json:"leaseId"`
+	ClientID         string `json:"clientId"`
+	Kind             string `json:"kind,omitempty"`
+	SkillID          string `json:"skillId,omitempty"`
+	BindingID        string `json:"bindingId,omitempty"`
+	GrantedAt        string `json:"grantedAt"`
+	ExpiresAt        string `json:"expiresAt"`
+	RemainingCreates int    `json:"remainingCreates"`
+	RevokedAt        string `json:"revokedAt,omitempty"`
+	Status           string `json:"status"`
+}
+
+func toMCPClientSkillAuthoringLeaseDTO(lease LibraryMCPClientSkillAuthoringLease) mcpClientSkillAuthoringLeaseDTO {
+	dto := mcpClientSkillAuthoringLeaseDTO{
+		LeaseID:          lease.ID,
+		ClientID:         lease.MCPClientID,
+		Kind:             libraryMCPClientSkillAuthoringLeaseKind(lease),
+		SkillID:          lease.TargetSkillID,
+		BindingID:        lease.TargetBindingID,
+		GrantedAt:        lease.GrantedAt.UTC().Format(time.RFC3339Nano),
+		ExpiresAt:        lease.ExpiresAt.UTC().Format(time.RFC3339Nano),
+		RemainingCreates: lease.RemainingCreates,
+		Status:           lease.Status,
+	}
+	if lease.RevokedAt != nil && !lease.RevokedAt.IsZero() {
+		dto.RevokedAt = lease.RevokedAt.UTC().Format(time.RFC3339Nano)
+	}
+	return dto
+}
+
+func (c *ConsoleAPI) mcpClientSkillAuthoringLeaseSupported(w http.ResponseWriter) (LibraryMCPClientSkillAuthoringStore, bool) {
+	store, ok := c.mcpClientSkillAuthoringStore()
+	if ok {
+		return store, true
+	}
+	writeJSON(w, http.StatusNotImplemented, map[string]string{
+		"error": "MCP client skill authoring leases are not supported by this store",
+	})
+	return nil, false
+}
+
+func mcpClientSkillAuthoringLeaseError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, ErrMCPClientNotFound), errors.Is(err, ErrMCPClientRevision), errors.Is(err, ErrMCPClientRevoked):
+		mcpClientError(w, err)
+	case errors.Is(err, ErrLibraryMCPClientSkillAuthoringLeaseNotFound):
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "skill authoring lease not found"})
+	case errors.Is(err, ErrLibraryMCPClientSkillAuthoringLeaseActive):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "an active skill authoring lease must be revoked before another can be granted"})
+	case errors.Is(err, ErrLibraryMCPClientSkillAuthoringClientUnavailable):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "MCP client must be active and OAuth-bound"})
+	case errors.Is(err, ErrLibrarySkillNotFound):
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "skill not found"})
+	case errors.Is(err, ErrLibraryMCPClientSkillAuthoringAdoptionHeadConflict):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "skill changed; refresh it before delegating a temporary revision"})
+	case errors.Is(err, ErrLibraryMCPClientSkillAuthoringAdoptionTargetBound):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "this client already has a pinned or incompatible binding for the skill"})
+	default:
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "MCP client skill authoring lease is unavailable"})
+	}
+}
+
+func decodeMCPClientSkillAuthoringLeaseRequest(w http.ResponseWriter, r *http.Request, destination any) bool {
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(destination); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return false
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return false
+	}
+	return true
+}
+
+func (c *ConsoleAPI) mcpClientForSkillAuthoringLease(w http.ResponseWriter, r *http.Request) (MCPClient, LibraryMCPClientSkillAuthoringStore, PlatformActor, bool) {
+	registry, ok := c.mcpClientsSupported(w)
+	if !ok {
+		return MCPClient{}, nil, PlatformActor{}, false
+	}
+	leaseStore, ok := c.mcpClientSkillAuthoringLeaseSupported(w)
+	if !ok {
+		return MCPClient{}, nil, PlatformActor{}, false
+	}
+	actor, ok := c.requireConnectionNamespaceActor(w, r)
+	if !ok {
+		return MCPClient{}, nil, PlatformActor{}, false
+	}
+	if !mcpClientSkillAuthoringAdministrator(actor) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "skill authoring leases require a workspace owner or admin"})
+		return MCPClient{}, nil, PlatformActor{}, false
+	}
+	client, ok := c.mcpClientForManagement(w, r, registry, actor)
+	if !ok {
+		return MCPClient{}, nil, PlatformActor{}, false
+	}
+	return client, leaseStore, actor, true
+}
+
+func (c *ConsoleAPI) handleMCPClientSkillAuthoringLease(w http.ResponseWriter, r *http.Request) {
+	client, store, actor, ok := c.mcpClientForSkillAuthoringLease(w, r)
+	if !ok {
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	switch r.Method {
+	case http.MethodGet:
+		lease, found, err := store.MCPClientSkillAuthoringLease(r.Context(), client.ID)
+		if err != nil {
+			mcpClientSkillAuthoringLeaseError(w, err)
+			return
+		}
+		if !found {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "skill authoring lease not found"})
+			return
+		}
+		writeJSON(w, http.StatusOK, toMCPClientSkillAuthoringLeaseDTO(lease))
+	case http.MethodPost:
+		var request struct {
+			Revision int64 `json:"revision"`
+		}
+		if !decodeMCPClientSkillAuthoringLeaseRequest(w, r, &request) {
+			return
+		}
+		if request.Revision < 1 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "revision is required"})
+			return
+		}
+		lease, err := store.GrantMCPClientSkillAuthoringLease(
+			r.Context(), client.ID, MCPClientPrecondition{ID: client.ID, Revision: request.Revision}, libraryActorRef(actor),
+		)
+		if err != nil {
+			mcpClientSkillAuthoringLeaseError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, toMCPClientSkillAuthoringLeaseDTO(lease))
+	default:
+		w.Header().Set("Allow", "GET, POST")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+// handleMCPClientSkillAuthoringAdoption is intentionally a separate Console
+// action from generic authoring windows and ordinary Add binding. It grants
+// no credentials or generic skill-create authority: it creates/adopts one
+// exact client-surface track binding plus a short, target-specific revision
+// lease.
+func (c *ConsoleAPI) handleMCPClientSkillAuthoringAdoption(w http.ResponseWriter, r *http.Request) {
+	client, store, actor, ok := c.mcpClientForSkillAuthoringLease(w, r)
+	if !ok {
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var request struct {
+		Revision              int64  `json:"revision"`
+		SkillID               string `json:"skillId"`
+		ExpectedVersionID     string `json:"expectedVersionId"`
+		ExpectedVersionDigest string `json:"expectedVersionDigest"`
+	}
+	if !decodeMCPClientSkillAuthoringLeaseRequest(w, r, &request) {
+		return
+	}
+	adoption, err := normalizeLibraryMCPClientSkillAuthoringAdoptionRequest(LibraryMCPClientSkillAuthoringAdoptionRequest{
+		SkillID: request.SkillID, ExpectedVersionID: request.ExpectedVersionID, ExpectedVersionDigest: request.ExpectedVersionDigest,
+	})
+	if request.Revision < 1 || err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "revision, skillId, expectedVersionId, and expectedVersionDigest are required"})
+		return
+	}
+	lease, err := store.GrantMCPClientSkillAuthoringAdoptionLease(
+		r.Context(), client.ID, MCPClientPrecondition{ID: client.ID, Revision: request.Revision}, adoption, libraryActorRef(actor),
+	)
+	if err != nil {
+		mcpClientSkillAuthoringLeaseError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, toMCPClientSkillAuthoringLeaseDTO(lease))
+}
+
+func (c *ConsoleAPI) handleMCPClientSkillAuthoringLeaseRevoke(w http.ResponseWriter, r *http.Request) {
+	client, store, actor, ok := c.mcpClientForSkillAuthoringLease(w, r)
+	if !ok {
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var request struct {
+		Revision int64  `json:"revision"`
+		LeaseID  string `json:"leaseId"`
+	}
+	if !decodeMCPClientSkillAuthoringLeaseRequest(w, r, &request) {
+		return
+	}
+	if request.Revision < 1 || validateLibraryOpaqueRef("skill authoring lease", request.LeaseID, false) != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "revision and leaseId are required"})
+		return
+	}
+	lease, err := store.RevokeMCPClientSkillAuthoringLease(
+		r.Context(), client.ID, request.LeaseID, MCPClientPrecondition{ID: client.ID, Revision: request.Revision}, libraryActorRef(actor),
+	)
+	if err != nil {
+		mcpClientSkillAuthoringLeaseError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, toMCPClientSkillAuthoringLeaseDTO(lease))
 }

@@ -48,6 +48,11 @@ type CallRecord struct {
 type AuditSink interface {
 	LogCall(rec CallRecord)
 	RecentCalls(ctx context.Context, limit int) ([]CallRecord, error)
+	// RecentCallsBefore pages backward from a keyset cursor: rows with
+	// (ts, id) strictly before (beforeTS, beforeID), newest-first, capped at
+	// limit. This is how the Activity "Load older" control reaches history
+	// past what RecentCalls' hard cap exposes.
+	RecentCallsBefore(ctx context.Context, beforeTS time.Time, beforeID int64, limit int) ([]CallRecord, error)
 	CallDetail(ctx context.Context, id int64) (CallRecord, bool, error)
 }
 
@@ -131,6 +136,33 @@ func (r *ring) RecentCalls(_ context.Context, limit int) ([]CallRecord, error) {
 	out := make([]CallRecord, 0, limit)
 	for i := len(r.buf) - 1; i >= 0 && len(out) < limit; i-- {
 		c := r.buf[i]
+		c.Args, c.Result = "", "" // summary only — payloads live behind CallDetail
+		out = append(out, c)
+	}
+	return out, nil
+}
+
+// keysetBefore reports whether (ts,id) sorts strictly before (beforeTS,
+// beforeID) in the newest-first (ts DESC, id DESC) traversal order used by
+// RecentCalls/RecentCallsBefore — i.e. whether the row belongs on an OLDER
+// page than the cursor. Mirrors the SQL row-comparison predicate
+// `WHERE (ts, id) < ($beforeTS, $beforeID)` used by PgStore.
+func keysetBefore(ts time.Time, id int64, beforeTS time.Time, beforeID int64) bool {
+	if ts.Equal(beforeTS) {
+		return id < beforeID
+	}
+	return ts.Before(beforeTS)
+}
+
+func (r *ring) RecentCallsBefore(_ context.Context, beforeTS time.Time, beforeID int64, limit int) ([]CallRecord, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]CallRecord, 0, limit)
+	for i := len(r.buf) - 1; i >= 0 && len(out) < limit; i-- {
+		c := r.buf[i]
+		if !keysetBefore(c.TS, c.ID, beforeTS, beforeID) {
+			continue
+		}
 		c.Args, c.Result = "", "" // summary only — payloads live behind CallDetail
 		out = append(out, c)
 	}

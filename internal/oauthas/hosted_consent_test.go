@@ -773,8 +773,10 @@ func TestHostedConsentOversizedAggregateAuthorizationFailsWithoutState(t *testin
 	}
 }
 
-func TestHostedConsentRequestAndApprovalPairsCannotCrossRestart(t *testing.T) {
+func TestHostedConsentRequestSurvivesRestartAndConsumedPairRemainsReplayed(t *testing.T) {
 	h := newHostedConsentHarness(t)
+	store := newMemoryDurableOAuthStore()
+	configureGeneration(t, h.server, store)
 	beforeCompletion := h.authorize(t, "https://engine.example/mcp")
 	beforeAssertion := approvalAssertion(
 		t,
@@ -799,9 +801,7 @@ func TestHostedConsentRequestAndApprovalPairsCannotCrossRestart(t *testing.T) {
 		return epoch, ok
 	})
 	restarted.clients[h.clientID] = client{redirectURIs: map[string]bool{h.redirect: true}}
-	restarted.mu.Lock()
-	restarted.tokenGeneration = serverGeneration(h.server)
-	restarted.mu.Unlock()
+	configureGeneration(t, restarted, store)
 	if err := restarted.ConfigureHostedConsent(
 		h.server.hosted.url.String(),
 		h.server.hosted.publicKey,
@@ -814,18 +814,26 @@ func TestHostedConsentRequestAndApprovalPairsCannotCrossRestart(t *testing.T) {
 	for name, pair := range map[string]struct {
 		request   string
 		assertion string
+		wantCode  int
 	}{
-		"unconsumed": {request: beforeCompletion, assertion: beforeAssertion},
-		"consumed":   {request: consumed, assertion: consumedAssertion},
+		"unconsumed": {request: beforeCompletion, assertion: beforeAssertion, wantCode: http.StatusFound},
+		"consumed":   {request: consumed, assertion: consumedAssertion, wantCode: http.StatusConflict},
 	} {
 		t.Run(name, func(t *testing.T) {
 			rec := completeHostedConsent(restartedMux, pair.request, pair.assertion, nil)
-			if rec.Code != http.StatusBadRequest || rec.Header().Get("Location") != "" {
+			if rec.Code != pair.wantCode {
 				t.Fatalf(
-					"pre-restart pair = %d location=%q, want 400 without redirect",
+					"post-restart pair = %d location=%q, want %d",
 					rec.Code,
 					rec.Header().Get("Location"),
+					pair.wantCode,
 				)
+			}
+			if pair.wantCode == http.StatusFound && rec.Header().Get("Location") == "" {
+				t.Fatal("unconsumed request did not receive an OAuth redirect after restart")
+			}
+			if pair.wantCode != http.StatusFound && rec.Header().Get("Location") != "" {
+				t.Fatalf("replayed approval redirected after restart: %q", rec.Header().Get("Location"))
 			}
 		})
 	}

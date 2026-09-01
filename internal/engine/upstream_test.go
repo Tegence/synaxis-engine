@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -18,7 +19,29 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"narthex/backend/internal/upstreamoauth"
 )
+
+// useLoopbackUpstreamTransport is restricted to tests that exercise local
+// httptest MCP servers. Production Upstreams always construct the hardened
+// transport; each test restores that default before it exits.
+func useLoopbackUpstreamTransport(t *testing.T) {
+	t.Helper()
+	previous := newUpstreamTransport
+	newUpstreamTransport = func() http.RoundTripper { return http.DefaultTransport }
+	t.Cleanup(func() { newUpstreamTransport = previous })
+}
+
+func TestUpstreamRejectsLoopbackByDefault(t *testing.T) {
+	upstream := &Upstream{Name: "blocked", URL: "http://127.0.0.1:65535/mcp"}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	_, err := upstream.ListTools(ctx)
+	if !errors.Is(err, upstreamoauth.ErrUnsafeOutboundAddress) {
+		t.Fatalf("loopback upstream error = %v, want ErrUnsafeOutboundAddress", err)
+	}
+}
 
 // newMockUpstream returns an MCP server (one "search" tool) fronted by a Bearer
 // check that 401s unless the presented token equals *validToken. Flipping
@@ -53,6 +76,7 @@ func newMockUpstream(t *testing.T, validToken *string, mu *sync.Mutex) *httptest
 // connection recovers — listing the tool. This is exactly what MetaMCP fails to
 // do (it refreshes the stored token but keeps the dead pooled connection).
 func TestRefreshAndRedial(t *testing.T) {
+	useLoopbackUpstreamTransport(t)
 	var mu sync.Mutex
 	valid := "TOKEN_FRESH" // the only token the upstream currently accepts
 
@@ -93,6 +117,7 @@ func TestRefreshAndRedial(t *testing.T) {
 
 // TestNoRefreshWhenHealthy: a valid token from the start needs no refresh.
 func TestNoRefreshWhenHealthy(t *testing.T) {
+	useLoopbackUpstreamTransport(t)
 	var mu sync.Mutex
 	valid := "GOOD"
 	mock := newMockUpstream(t, &valid, &mu)
@@ -116,6 +141,81 @@ func TestNoRefreshWhenHealthy(t *testing.T) {
 	}
 	if n := atomic.LoadInt32(&refreshes); n != 0 {
 		t.Fatalf("expected no refresh with a healthy token, got %d", n)
+	}
+}
+
+// TestToolLevelErrorMentioning401NeverRefreshesOrReexecutes guards the fix
+// for the substring-matching hazard: a TOOL-LEVEL JSON-RPC error whose text
+// happens to contain "401"/"invalid_token" is not a transport 401. The engine
+// must surface it to the caller without burning a rotating refresh token and
+// without re-executing the (possibly mutating) tool call.
+func TestToolLevelErrorMentioning401NeverRefreshesOrReexecutes(t *testing.T) {
+	useLoopbackUpstreamTransport(t)
+	upstream := server.NewMCPServer("flaky", "1.0", server.WithToolCapabilities(true))
+	upstream.AddTool(
+		mcp.NewTool("mutate", mcp.WithDescription("mutating tool")),
+		func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultText("done"), nil
+		},
+	)
+	streamable := server.NewStreamableHTTPServer(upstream, server.WithEndpointPath("/"))
+
+	var toolCallRequests int32
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			streamable.ServeHTTP(w, r)
+			return
+		}
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read upstream request: %v", err)
+			http.Error(w, "read request", http.StatusBadRequest)
+			return
+		}
+		_ = r.Body.Close()
+		r.Body = io.NopCloser(bytes.NewReader(raw))
+		var request struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+		}
+		if err := json.Unmarshal(raw, &request); err != nil ||
+			request.Method != string(mcp.MethodToolsCall) {
+			streamable.ServeHTTP(w, r)
+			return
+		}
+		// HTTP 200 — the transport is fine. The TOOL failed, and its protocol-
+		// level error text mentions auth material, exactly the phrasing the old
+		// substring matcher mistook for a transport 401.
+		atomic.AddInt32(&toolCallRequests, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"error":{"code":%d,"message":`+
+			`"tool failed: upstream returned 401 unauthorized (invalid_token: invalid access token)"}}`,
+			request.ID, mcp.INTERNAL_ERROR)
+	}))
+	defer mock.Close()
+
+	var refreshes int32
+	up := &Upstream{
+		Name:  "flaky",
+		URL:   mock.URL,
+		Token: func() string { return "" },
+		Refresh: func(ctx context.Context) error {
+			atomic.AddInt32(&refreshes, 1)
+			return nil
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := up.CallTool(ctx, "mutate", nil); err == nil {
+		t.Fatal("tool-level JSON-RPC error should propagate to the caller")
+	}
+	if n := atomic.LoadInt32(&refreshes); n != 0 {
+		t.Fatalf("tool-level error mentioning 401 triggered %d refreshes, want 0", n)
+	}
+	if n := atomic.LoadInt32(&toolCallRequests); n != 1 {
+		t.Fatalf("tools/call reached the upstream %d times, want exactly 1 (no re-execution)", n)
 	}
 }
 
@@ -206,6 +306,7 @@ func newOversizedResponseUpstream(
 }
 
 func TestUpstreamCapsResponsesBeforeJSONAndSSEDecode(t *testing.T) {
+	useLoopbackUpstreamTransport(t)
 	for _, tc := range []struct {
 		name       string
 		mediaType  string
@@ -234,6 +335,7 @@ func TestUpstreamCapsResponsesBeforeJSONAndSSEDecode(t *testing.T) {
 }
 
 func TestUpstreamBoundsCumulativePaginatedToolDiscovery(t *testing.T) {
+	useLoopbackUpstreamTransport(t)
 	upstream := server.NewMCPServer("paginated", "1.0", server.WithToolCapabilities(true))
 	streamable := server.NewStreamableHTTPServer(upstream, server.WithEndpointPath("/"))
 	description := strings.Repeat("d", int(maxUpstreamMCPResponseBytes/2)+1024)
@@ -286,6 +388,7 @@ func TestUpstreamBoundsCumulativePaginatedToolDiscovery(t *testing.T) {
 }
 
 func TestGatewayMapsPreDecodeCapToStructuredToolError(t *testing.T) {
+	useLoopbackUpstreamTransport(t)
 	mock := newOversizedResponseUpstream(t, "application/json", false)
 	defer mock.Close()
 	fileStore, err := LoadFileStore(t.TempDir() + "/accounts.json")

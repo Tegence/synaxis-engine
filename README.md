@@ -28,6 +28,11 @@ not engine dependencies.
 - connector-only response redaction, result size caps, and prompt-injection
   flagging
 - summary audit records, optional encrypted payload recording, and replay
+- portable Library skills and governed memory cards with immutable versions,
+  generic bindings, exact-version grants, private artifacts, and run provenance
+- read-only Library skill resolution with explicit-binding or
+  folder/repository/namespace/workspace precedence
+- direct-agent private artifact storage without requiring a skill parent
 - encrypted Postgres credential storage or a local JSON store for development
 - proactive health checks, credential refresh, and operational alerts
 - secret-free configuration import and export
@@ -35,6 +40,28 @@ not engine dependencies.
 These capabilities are part of the Apache-2.0 engine. A hosted plan may govern
 use of the managed Synaxis service, but it does not remove functionality from
 self-hosted engine builds.
+
+## MCP agent bootstrap
+
+Every Engine-owned MCP surface returns a short, versioned
+`synaxis.mcp.bootstrap.v1` instruction block during initialization. It tells a
+host to treat that endpoint's current `tools/list` response and schemas as the
+exact advertised inventory, distinguishes advertised tools from action-time
+authorization, and identifies the surface as the root aggregate, a governed
+connector, an endpoint bundle, or a subject-bound client. The text is static:
+it never contains provider data, credentials, subjects, skill bodies, or
+memory content, so live projection changes cannot make a snapshotted tool list
+stale.
+
+Root Library tools support explicit skill inspection and resolution, not
+activation. Generic connectors and endpoint bundles expose no Library
+orientation or memory workflow. When those facets are available on a
+subject-bound client, its bootstrap points the agent to no-argument
+`library_skill_activation` for assigned procedural context and to focused
+`library_memory_recall` for governed durable context. Skills and memories do
+not grant tools, credentials, OAuth scopes, permissions, or authority; the
+Engine enforces the authenticated endpoint and current policy again for every
+requested action.
 
 ## Secure development quickstart
 
@@ -81,8 +108,10 @@ docker run --rm -p 8080:8080 \
   synaxis-engine
 ```
 
-Use `DATABASE_URL` and `ENGINE_ENCRYPTION_KEY` for a durable deployment. Do not
-expose development credentials.
+Use `DATABASE_URL` and `ENGINE_ENCRYPTION_KEY` for a durable deployment. A
+Platform-managed Engine (`SYNAXIS_WORKSPACE_ID`) refuses to start without an
+encryption key; self-hosted development may omit it only for disposable local
+data. Do not expose development credentials.
 
 ## Health and control access
 
@@ -155,6 +184,29 @@ authentication.
 | `GET` | `/api/activation` | Return the privacy-limited connection count described below |
 | `GET` | `/api/usage` | Read sanitized usage |
 | `PUT` | `/api/usage/grant` | Install a signed hosted allowance |
+| `POST` | `/api/library/resolve` | Read applicable portable instructions from opaque context; never executes a skill or grants authority |
+| `GET, POST` | `/api/library/skills` | List/create portable skills and their initial immutable version |
+| `GET` | `/api/library/skills/{id}` | Read a skill, immutable versions, generic bindings, and evaluations |
+| `GET, POST` | `/api/library/skills/{id}/versions`, `/bindings`, `/evaluations` | Manage versions, bindings, and append-only evaluation evidence |
+| `DELETE` | `/api/library/skills/{id}/bindings/{binding}` | Remove one generic binding |
+| `POST` | `/api/library/skill-drafts` | Self-hosted direct generator; returns `503` when unconfigured and is rejected for hosted Engines |
+| `POST` | `/api/library/skill-drafts/platform-import` | Platform-only import of one validated editable generated draft; hosted owner/admin actor assertion and machine credential required |
+| `GET, POST` | `/api/library/memories` | List memory metadata or create a human-confirmed proposal for one exact active agent surface |
+| `GET, DELETE` | `/api/library/memories/{id}` | Read a card and immutable versions, or hard-forget the card, versions, and grants |
+| `GET, POST` | `/api/library/memories/{id}/versions` | List immutable versions or append a proposed correction |
+| `POST` | `/api/library/memories/{id}/review` | Review the exact current memory version and set lifecycle, trust, and freshness |
+| `GET, POST` | `/api/library/memories/{id}/grants` | List grants or delegate the active, unexpired current version/digest to one active MCP client |
+| `POST` | `/api/library/memories/{id}/grants/{grant}/revoke` | Revoke one exact-version memory handoff |
+| `GET, POST` | `/api/library/artifacts` | List/create private immutable artifacts |
+| `GET` | `/api/library/artifacts/{id}` | Read an artifact and all of its versions |
+| `GET, POST` | `/api/library/artifacts/{id}/versions` | List/create artifact versions; each new version starts pending review |
+| `POST` | `/api/library/artifacts/{id}/review` | Approve or reject an artifact version for Platform public sharing |
+| `GET, POST` | `/api/library/artifacts/{id}/grants` | List or create a private, version-pinned handoff to one live MCP-client registration; never grants credentials or authority |
+| `POST` | `/api/library/artifacts/{id}/grants/{grant}/revoke` | Revoke one private agent handoff without altering its historical record |
+| `GET` | `/api/library/artifacts/{id}/publication-candidate` | Platform-service-only reviewed snapshot candidate; not browser-proxied |
+| `POST` | `/api/library/artifacts/{id}/publication-claim` | Platform-service-only exact-version compare-and-claim before public publication |
+| `GET, POST` | `/api/library/runs` | List provenance or add a manual `human`/`automation` record; trusted `skill_run`/`agent_direct` provenance is not browser-creatable |
+| `GET` | `/api/library/runs/{id}` | Read one run |
 
 The legacy `/api/namespaces*` route family remains an exact compatibility alias
 for `/api/endpoints*`; it does not address credential-owning connection
@@ -424,6 +476,12 @@ resetting the OAuth binding, or revoking the client rotates its endpoint epoch.
 Tokens, authorization codes, and refresh grants minted for the prior epoch then
 fail closed. Slugs and tool prefixes remain stable.
 
+Only this subject-bound resource exposes `library_memory_propose`,
+`library_memory_recall`, and `library_memory_read`. Memory tools are absent
+from root `/mcp`, shared endpoints, and generic connector resources. The
+Engine derives the exact durable client ID, subject, and epoch from the
+authenticated resource; no memory tool accepts a caller-selected agent surface.
+
 ## Connector-only response guardrails
 
 Response redaction, result-size caps, and prompt-injection scanning run only on
@@ -439,6 +497,157 @@ read-only filtering, OAuth resource binding, namespace ACLs, request/result
 hard caps, and audit logging still apply on their respective surfaces. Do not
 describe an endpoint bundle or scoped MCP client as redacted unless a future
 explicit policy layer adds that behavior.
+
+## Portable Library
+
+The Engine-native Library stores reusable skills, governed memory, artifacts,
+and provenance without importing Platform concepts. A skill has stable
+metadata plus immutable Markdown instruction versions and requested
+capabilities. Requested capabilities are intent, not authority: an effective
+runtime set can only be the intersection of the skill request, an optional
+binding ceiling, and the already-granted runtime capabilities.
+
+Bindings use opaque, generic scope kinds — `workspace`, `namespace`, `folder`,
+`repository`, `project`, and `agent_surface` — and can track latest or pin a
+version. The generic `namespace` kind is deliberately unrelated to a
+credential-owning `connection_namespace`. A binding cannot connect an upstream,
+grant a credential, or override MCP/connector policy.
+
+Memory cards retain deliberate `decision`, `constraint`, `preference`,
+`lesson`, `fact`, or `handoff` context. A logical card is `proposed`, `active`,
+`disputed`, `superseded`, or `expired` and carries an `agent_observed`,
+`human_confirmed`, `workspace_approved`, or `host_attested` trust label plus
+optional expiry and review dates. Content exists only in immutable, SHA-256
+digested versions with optional run and exact artifact-version provenance; each
+statement is capped at 8 KiB. A correction appends a version and resets the
+head to a human-confirmed proposal; an owner/admin must review that exact head
+before it becomes recallable. A superseded card must name another active,
+unexpired card as its replacement. Memory has no public candidate or anonymous
+read route.
+
+`library_memory_propose` derives ownership from the live client and can create
+only an agent-observed proposal. `library_memory_recall` accepts optional
+query/kind filters, a default-5/max-20 limit, and a 1–32 KiB byte budget that
+defaults to 32 KiB; queries are capped at 4 KiB. It deterministically returns
+only active, unexpired exact versions owned by that surface or pinned to it
+through a live grant. `library_memory_read` requires both `memoryId` and
+`memoryVersionId`—it never follows “latest.” The returned
+`synaxis.library.memory.v1` bundle includes exact digest, provenance,
+freshness, `own_surface` or `granted_exact_version` access, `reviewDue`, an
+independent-record conflict policy, and a deterministic bundle digest. It does
+not blend or truncate content and labels memory as context, never instructions,
+authorization, or proof of execution.
+
+An owner/admin may share only the active, unexpired current memory version and
+digest with one active durable client registration. A correction atomically
+revokes every live handoff; it neither advances a grant nor lets an old version
+inherit the corrected head's review state. Revocation is enforced on the next
+read or recall. Forget hard-deletes the card's authored versions and grants.
+The Engine does not passively ingest chat,
+audit, prompts, hidden reasoning, or runs, and does not inject memory into an
+external host. Working memory remains host-side; cross-workspace personal
+memory is not part of this Engine contract.
+
+Artifacts have immutable text or Markdown versions (maximum 1 MiB), plus
+private PNG/JPEG or safely sanitized SVG image versions (maximum 512 KiB).
+Every new version is `pending` review. Runs retain only opaque actor/surface references,
+source type, effective capabilities, status, and SHA-256 input/output digests.
+An artifact created directly by an agent is marked `agent_direct`; it never
+pretends to have a skill parent. The Engine offers `library_skill_list`,
+`library_skill_read`, `library_skill_resolve`, `library_artifact_create`,
+`library_artifact_read`, and `library_artifact_list` as ordinary MCP tools.
+An authenticated subject-bound MCP client additionally has narrow append-only
+revision tools for its own direct artifacts: `library_artifact_version_create`
+for text/Markdown and `library_artifact_image_version_create` for image
+versions. Each requires a unique request ID plus exact current version ID and
+digest, rechecks the current client/epoch/direct-run ownership atomically, and
+appends a new immutable pending version; it never overwrites content, follows a
+grant, mutates a handoff, or changes authority. Exact retry replays the prior
+result, while changed request-ID reuse or a stale head conflicts.
+`library_skill_resolve` (and the protected `POST /api/library/resolve`)
+selects an explicit binding or, per skill, the most-specific matching binding
+in the order `folder > repository > namespace > workspace`. It returns
+instructions and constraints only: runtime policy must independently grant and
+intersect capability access immediately before a tool call. `project` and
+`agent_surface` bindings are persisted but not automatically resolved until
+their hierarchy is designed. Direct artifact tools create private content only
+and cannot approve or publish it.
+
+An owner/admin can grant one exact immutable artifact version to one durable
+subject-bound MCP-client registration. A grant stores the artifact version ID
+and digest plus the opaque client ID; it is never a user, connection, OAuth,
+or credential grant. Client artifact list/read returns the pinned body and
+digest rather than following later versions, and revocation is evaluated on
+each call. A direct client artifact may cite one exact source
+artifact/version/digest tuple only when the client owns it on that same surface
+or has the matching live grant; V1 intentionally records one singular parent,
+not general multi-input lineage. The trusted console/MCP endpoint derives each
+artifact-version author rather than accepting one from a tool request.
+
+A subject-bound `/mcp/clients/{slug}` endpoint is the narrow exception for an
+explicit `agent_surface` binding: it derives the durable MCP-client ID from the
+authenticated endpoint, never caller-supplied scope arguments. That scoped
+endpoint also offers the read-only, no-argument `library_skill_activation`
+tool for an external agent-host integration. It returns a deterministic
+`synaxis.library.activation.v1` bundle with only an opaque agent-surface ID,
+selected immutable skill/version/content digest/instructions, selected binding
+metadata, and requested-capability/binding-ceiling constraints. It excludes
+the client subject, OAuth identity, credential folders, connections, runtime
+grants, and effective capabilities. The Engine verifies each instruction body
+against its digest and includes a deterministic bundle digest. It does not inject
+content into Codex, Claude, Cursor, or any other host, execute a skill, or
+authorize a tool call; the host must independently verify the contract, choose
+model-context placement, and enforce every action-time policy. Root `/mcp`
+deliberately does not expose this activation tool.
+
+The open `narthex/backend/pkg/libraryruntime` package is a small Go reference
+adapter for that handoff. It strictly verifies the v1 content and bundle
+digests, builds a bounded deterministic JSON context document, and provides a
+host-owned `GrantProvider`/`ToolInterceptor` contract that intersects fresh
+host-authenticated grants with the skill request and binding ceiling for every
+tool call. It neither receives credentials or connection data nor chooses a
+model role or injects a model turn. Its `SkillRunEvidenceInput` is only a
+digest-only immutable selection record for a separately authenticated runtime
+provenance path; constructing one is not an Engine write or proof of execution.
+
+Hosted sharing is deliberately split: after an administrator approves the
+latest artifact version, Platform's exact service actor may call
+`GET /api/library/artifacts/{id}/publication-candidate`. The candidate is a
+narrow reviewed payload, not a raw artifact API, and is excluded from the
+browser BFF. Platform copies an immutable allowlisted snapshot and owns the
+one-time public URL, expiry, and revocation. The Engine remains usable
+self-hosted without a Platform public-link implementation.
+
+With Postgres and `ENGINE_ENCRYPTION_KEY`, all private authored Library free
+text is AES-GCM encrypted at rest: skill/draft names and descriptions,
+instructions, evaluation annotations, memory-version content, artifact
+titles/summaries, and artifact bodies, plus private authorship/source
+references (including the memory provenance source digest). Structural IDs,
+content/version digests, timestamps, and policy fields remain queryable
+metadata. FileStore implements the same memory lifecycle, recall, grant, and
+forget semantics while retaining its documented plaintext local-development
+posture.
+
+### Optional direct server-side draft creator
+
+`POST /api/library/skill-drafts` can use an OpenAI-compatible Chat Completions
+endpoint to produce a reviewable skill draft for a self-hosted deployment. The
+Engine process alone holds the provider key; raw task briefs are not retained
+as provenance (only their SHA-256 digest). The generator cannot publish, bind,
+obtain connector credentials, or run an agent. With no draft configuration,
+the route returns `503` rather than fabricating a draft. Synaxis does not ship
+or infer a provider secret: a self-hosted operator must configure the provider
+URL and key explicitly through the Engine runtime secret/configuration system.
+Managed deployments should not distribute one provider key across workspace
+Engines. A hosted Engine fails startup if any direct-provider variables are
+set; when it is running, the ordinary direct route rejects hosted requests. A
+Platform-held broker may use the fixed
+`/api/library/skill-drafts/platform-import` route to persist only a validated
+editable candidate. That import requires the normal machine credential plus a
+request-bound original owner/admin assertion, stores only a hash of its opaque
+idempotency request ID, and cannot create a skill, binding, run, artifact, or
+public link. The Engine ships no managed provider configuration; an
+unconfigured Platform broker keeps hosted generation off.
 
 ## Configuration
 
@@ -459,9 +668,12 @@ The complete example is in [`.env.example`](.env.example). Important values:
 | `SYNAXIS_ADMIN_TOKEN` | Optional trusted control-plane credential |
 | `SYNAXIS_ENABLE_LEGACY_ADMIN` | Enables password-bearing `/admin/*` compatibility forms; defaults to `false`, hosted engines force `false` |
 | `DATABASE_URL` | Optional Postgres connection string |
-| `ENGINE_ENCRYPTION_KEY` | Base64 32-byte AES-GCM key for stored secrets |
+| `ENGINE_ENCRYPTION_KEY` | Base64 32-byte AES-GCM key for stored secrets; required when `SYNAXIS_WORKSPACE_ID` is set |
 | `CONSOLE_URL` | Browser destination after upstream OAuth |
 | `CONSOLE_ORIGIN` | Allowed browser origins for the legacy direct console |
+| `ENGINE_SKILL_DRAFT_OPENAI_URL` | Optional HTTPS OpenAI-compatible API base or full Chat Completions endpoint for direct self-hosted skill drafts |
+| `ENGINE_SKILL_DRAFT_OPENAI_API_KEY` | Server-only provider key for the direct self-hosted creator; use a secret manager and never expose it to an MCP client, browser, or hosted workspace Engine |
+| `ENGINE_SKILL_DRAFT_OPENAI_MODEL` | Optional direct-creator model name; defaults to `gpt-4.1-mini` after URL/key are configured |
 
 Migration-sensitive `ENGINE_*` names remain supported even as user-visible
 product surfaces use Synaxis.

@@ -6,11 +6,13 @@
 // (authorization_code + refresh_token grants), plus a Bearer middleware that
 // issues the 401 challenge pointing back at the PRM.
 //
-// Deliberately simple for the engine spike: in-memory state, stateless HMAC
-// access tokens (bound to the RFC 8707 resource path they were authorized
-// for, so a connector token cannot open the ungated /mcp surface),
-// NON-rotating refresh tokens (rotating single-use tokens were
-// the cause of the earlier reconnect bricking). Single instance, single user.
+// Access tokens are stateless HMACs bound to the RFC 8707 resource path they
+// were authorized for, so a connector token cannot open the ungated /mcp
+// surface. Authorization codes, refresh grants, and hosted-consent replay
+// fences use the Engine's durable OAuthGrantStore when configured; small
+// standalone callers retain an in-memory compatibility fallback. Refresh
+// tokens are deliberately non-rotating so harmless retries cannot brick a
+// reconnect, while durable expiry and generation/epoch checks bound them.
 package oauthas
 
 import (
@@ -25,6 +27,7 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
+	"log"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -32,12 +35,24 @@ import (
 	"sync"
 	"time"
 	"unicode"
+
+	"narthex/backend/internal/ratelimit"
 )
 
 const (
-	accessTTL             = 7 * 24 * time.Hour // long-lived: Claude rarely needs to refresh
-	codeTTL               = 10 * time.Minute
+	accessTTL = 7 * 24 * time.Hour // long-lived: Claude rarely needs to refresh
+	codeTTL   = 10 * time.Minute
+	// Refresh tokens are deliberately non-rotating so a harmless retry cannot
+	// strand a client, but they are not permanent bearer credentials.  Their
+	// durable expiry bounds the recovery window after a client is retired.
+	refreshTTL            = 30 * 24 * time.Hour
 	generationReadTimeout = 2 * time.Second
+	grantStoreTimeout     = 2 * time.Second
+	// tokenGenerationCacheTTL bounds how long syncTokenGeneration may skip its
+	// durable read once this process has confirmed the generation at least
+	// once. See the cache-check comment in syncTokenGenerationWithHook for the
+	// staleness tradeoff this accepts.
+	tokenGenerationCacheTTL = 2 * time.Second
 
 	maxRegistrationBody = 32 << 10
 	maxClientIDLength   = 1024
@@ -53,16 +68,22 @@ type authCode struct {
 	challenge   string // PKCE S256 code_challenge
 	scope       string
 	resource    string // RFC 8707 resource the code was authorized for (endpoint path)
-	generation  string // workspace-wide authorization generation at issuance
-	expires     time.Time
+	// resourceEpoch is the endpoint generation at approval time.  Keeping it
+	// with the grant prevents a code or refresh token for a deleted/recreated
+	// connector from being upgraded into the replacement endpoint's epoch.
+	resourceEpoch string
+	generation    string // workspace-wide authorization generation at issuance
+	expires       time.Time
 }
 
 // refreshGrant is what a refresh token re-issues: refreshed access tokens stay
 // bound to the resource the original authorization was for.
 type refreshGrant struct {
-	clientID   string
-	resource   string
-	generation string
+	clientID      string
+	resource      string
+	resourceEpoch string
+	generation    string
+	expires       time.Time
 }
 
 // TokenGenerationStore persists the workspace-wide OAuth generation. Engine
@@ -72,6 +93,60 @@ type TokenGenerationStore interface {
 	LoadOrCreateTokenGeneration(ctx context.Context, candidate string) (string, error)
 	CurrentTokenGeneration(ctx context.Context) (string, error)
 	RotateTokenGeneration(ctx context.Context, expected, replacement string) (string, error)
+}
+
+// DurableAuthorizationCode is the persisted, one-time authorization grant.
+// TokenHash is a one-way digest of the opaque browser-facing code, never the
+// code itself.  The Engine store owns the atomic consume operation so a code
+// remains single-use across restarts and replicas.
+type DurableAuthorizationCode struct {
+	TokenHash     string
+	ClientID      string
+	RedirectURI   string
+	Challenge     string
+	Scope         string
+	Resource      string
+	ResourceEpoch string
+	Generation    string
+	ExpiresAt     time.Time
+}
+
+// DurableRefreshGrant is the persisted non-rotating refresh grant.  It has
+// the same generation and endpoint-epoch fences as an authorization code.
+type DurableRefreshGrant struct {
+	TokenHash     string
+	ClientID      string
+	Resource      string
+	ResourceEpoch string
+	Generation    string
+	ExpiresAt     time.Time
+}
+
+// OAuthGrantStore is the durable companion to TokenGenerationStore.  Engine
+// storage implements it without oauthas knowing any database details.  The
+// consume and consent-reservation operations must be atomic across replicas.
+//
+// Implementations may leave expired records for lazy cleanup, but they must
+// never return them as usable grants or reservations.
+type OAuthGrantStore interface {
+	StoreAuthorizationCode(context.Context, DurableAuthorizationCode) error
+	ConsumeAuthorizationCode(context.Context, string, time.Time) (DurableAuthorizationCode, bool, error)
+	StoreRefreshGrant(context.Context, DurableRefreshGrant) error
+	LoadRefreshGrant(context.Context, string, time.Time) (DurableRefreshGrant, bool, error)
+	RevokeOAuthGrantsForResource(context.Context, string) error
+	RevokeAllOAuthGrants(context.Context) error
+	ReserveHostedConsentReplay(ctx context.Context, reservationID, approvalKey, requestKey string, expiresAt, now time.Time) (bool, error)
+	FinalizeHostedConsentReplay(ctx context.Context, reservationID string) error
+	ReleaseHostedConsentReplay(ctx context.Context, reservationID string) error
+}
+
+// OAuthGrantEpochStore is the optional precise-revocation extension used by
+// Engine's endpoint lifecycle. It removes grants for the retired endpoint
+// incarnation only, so an asynchronous delete/recreate cannot erase a newly
+// authorized grant for the replacement epoch.
+type OAuthGrantEpochStore interface {
+	OAuthGrantStore
+	RevokeOAuthGrantsForResourceEpoch(context.Context, string, string) error
 }
 
 // Server is the single-tenant AS. issuer is this service's public base URL.
@@ -86,7 +161,16 @@ type Server struct {
 	mu                 sync.RWMutex
 	tokenGeneration    string
 	generationStore    TokenGenerationStore
+	grantStore         OAuthGrantStore
 	generationSyncGate chan struct{}
+	// generationSyncedAt is the instant tokenGeneration was last confirmed
+	// fresh: either a successful durable read in syncTokenGenerationWithHook,
+	// or implicitly by a local mutation (revokeAll writes tokenGeneration
+	// directly, which is always at least as fresh as any read could be). Zero
+	// means "never confirmed" — ConfigureTokenGeneration and revokeAll reset it
+	// explicitly so the NEXT syncTokenGeneration call always reads through
+	// rather than trusting a cache it cannot vouch for.
+	generationSyncedAt time.Time
 
 	// epochOf resolves a resource path (e.g. /mcp/team) to the CURRENT token
 	// epoch of the connector serving it, or ok=false if no such endpoint
@@ -126,6 +210,14 @@ type Server struct {
 	usedConsentRequests    map[string]time.Time
 	hostedInFlightRequests map[string]struct{}
 	now                    func() time.Time
+	// consentThrottle bounds online brute-force attempts against the shared
+	// console password gating self-hosted consent. Denial is backoff-by-429,
+	// never a lockout: the engine is single-user by design.
+	consentThrottle *ratelimit.Limiter
+	// trustProxyHeaders switches consentThrottle's key from RemoteAddr to the
+	// trusted last hop of X-Forwarded-For. See SetTrustProxyHeaders: this
+	// must only be enabled behind an operator-controlled reverse proxy.
+	trustProxyHeaders bool
 }
 
 func New(issuer, password, secret string) *Server {
@@ -144,6 +236,7 @@ func New(issuer, password, secret string) *Server {
 		usedConsentRequests:    map[string]time.Time{},
 		hostedInFlightRequests: map[string]struct{}{},
 		now:                    time.Now,
+		consentThrottle:        ratelimit.New(10, 5*time.Minute),
 	}
 }
 
@@ -204,7 +297,20 @@ func (s *Server) ConfigureTokenGeneration(ctx context.Context, store TokenGenera
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.generationStore = store
+	// Built-in Engine stores implement both contracts.  Keep the durable grant
+	// store optional for compact package tests and explicitly ephemeral custom
+	// integrations, but never reject a grant merely because this process has
+	// not seen it: when present, it is the authority for code/refresh state.
+	if grants, ok := store.(OAuthGrantStore); ok {
+		s.grantStore = grants
+	} else {
+		s.grantStore = nil
+	}
 	s.tokenGeneration = generation
+	// Never trust an inherited cache window across a (re-)configuration: the
+	// next syncTokenGeneration call must read through, exactly like a cold
+	// start, rather than skip re-confirming against the store just wired in.
+	s.generationSyncedAt = time.Time{}
 	// Configuration is expected before serving. Clearing transient issuance
 	// state also makes a late configuration fail closed.
 	clear(s.refresh)
@@ -228,6 +334,27 @@ func (s *Server) syncTokenGenerationWithHook(ctx context.Context, beforeBarrier 
 	}
 	if beforeBarrier != nil {
 		beforeBarrier()
+	}
+	// Short-TTL cache: once this process has confirmed tokenGeneration against
+	// durable storage (or applied a local mutation, which is at least as fresh
+	// as any read), skip the redundant round trip for tokenGenerationCacheTTL.
+	// A zero generationSyncedAt — never yet confirmed, or explicitly
+	// invalidated by ConfigureTokenGeneration/revokeAll — always falls through
+	// to a real read below, so a cold process (or one that just rotated the
+	// generation) can never skip the ONE read that would catch a generation
+	// advanced by a different writer of this durable row.
+	//
+	// Tradeoff: once warm, a rotation committed by a different writer of the
+	// same durable row (e.g. another Engine instance sharing the store) can
+	// take up to tokenGenerationCacheTTL to be honored by THIS process. A
+	// local RevokeAll is unaffected — see revokeAll — because it writes
+	// s.tokenGeneration directly and synchronously under this same lock,
+	// independent of whether this cache is warm.
+	s.mu.RLock()
+	syncedAt := s.generationSyncedAt
+	s.mu.RUnlock()
+	if !syncedAt.IsZero() && s.now().Sub(syncedAt) < tokenGenerationCacheTTL {
+		return nil
 	}
 	// Serialize the durable read and local apply. Without this gate, two reads
 	// that both snapshot local G could observe durable H then J, apply H first,
@@ -268,8 +395,77 @@ func (s *Server) syncTokenGenerationWithHook(ctx context.Context, beforeBarrier 
 		clear(s.refresh)
 		clear(s.codes)
 	}
+	s.generationSyncedAt = s.now()
 	s.mu.Unlock()
 	return nil
+}
+
+// grantStoreForRequest snapshots the optional durable grant authority without
+// holding the generation barrier during database I/O.
+func (s *Server) grantStoreForRequest() OAuthGrantStore {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.grantStore
+}
+
+func grantStoreContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, grantStoreTimeout)
+}
+
+// durableGrantTokenHash intentionally stores only a digest of opaque OAuth
+// grants.  The grants themselves carry 192+ bits of entropy; the domain label
+// prevents accidental reuse of the digest in another credential namespace.
+func durableGrantTokenHash(token string) string {
+	sum := sha256.Sum256([]byte("synaxis-oauth-grant|v1|" + token))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
+}
+
+func durableAuthorizationCodeFrom(code string, grant authCode) DurableAuthorizationCode {
+	return DurableAuthorizationCode{
+		TokenHash:     durableGrantTokenHash(code),
+		ClientID:      grant.clientID,
+		RedirectURI:   grant.redirectURI,
+		Challenge:     grant.challenge,
+		Scope:         grant.scope,
+		Resource:      grant.resource,
+		ResourceEpoch: grant.resourceEpoch,
+		Generation:    grant.generation,
+		ExpiresAt:     grant.expires,
+	}
+}
+
+func authorizationCodeFromDurable(grant DurableAuthorizationCode) authCode {
+	return authCode{
+		clientID:      grant.ClientID,
+		redirectURI:   grant.RedirectURI,
+		challenge:     grant.Challenge,
+		scope:         grant.Scope,
+		resource:      grant.Resource,
+		resourceEpoch: grant.ResourceEpoch,
+		generation:    grant.Generation,
+		expires:       grant.ExpiresAt,
+	}
+}
+
+func durableRefreshGrantFrom(token string, grant refreshGrant) DurableRefreshGrant {
+	return DurableRefreshGrant{
+		TokenHash:     durableGrantTokenHash(token),
+		ClientID:      grant.clientID,
+		Resource:      grant.resource,
+		ResourceEpoch: grant.resourceEpoch,
+		Generation:    grant.generation,
+		ExpiresAt:     grant.expires,
+	}
+}
+
+func refreshGrantFromDurable(grant DurableRefreshGrant) refreshGrant {
+	return refreshGrant{
+		clientID:      grant.ClientID,
+		resource:      grant.Resource,
+		resourceEpoch: grant.ResourceEpoch,
+		generation:    grant.Generation,
+		expires:       grant.ExpiresAt,
+	}
 }
 
 // SetEpochLookup wires the resource-path → token-epoch resolver (see the
@@ -284,6 +480,22 @@ func (s *Server) SetEpochLookup(fn func(path string) (string, bool)) { s.epochOf
 func (s *Server) SetClientResourceAuthorizer(fn func(clientID, resource string) bool) {
 	s.clientResourceAuthorizer = fn
 }
+
+// SetTrustProxyHeaders switches the consent-throttle rate-limit key from
+// r.RemoteAddr to the last entry of a present X-Forwarded-For header (see
+// ratelimit.ClientIP). Leaving it disabled (the default) preserves the
+// original RemoteAddr-only behavior.
+//
+// Enable this ONLY when the Engine sits directly behind exactly one
+// reverse-proxy hop the operator controls (nginx, Caddy, Traefik, Cloudflare
+// Tunnel, ...). The Engine binary has no TLS of its own, so a self-hosted
+// deployment almost always runs behind such a proxy — without this option,
+// every request's RemoteAddr is the proxy's own fixed address, so every real
+// client shares one rate-limit bucket and a single attacker can exhaust it to
+// lock out the legitimate administrator. Enabling it when the Engine is
+// otherwise directly reachable, or behind more than one untrusted hop, lets
+// an attacker spoof X-Forwarded-For to pick their own rate-limit key instead.
+func (s *Server) SetTrustProxyHeaders(enabled bool) { s.trustProxyHeaders = enabled }
 
 // epochFor resolves the current epoch for a (normalized) resource path.
 // Without a lookup wired, every path is valid with a stable empty epoch.
@@ -334,18 +546,52 @@ func (s *Server) generationForResource(path string) (string, bool) {
 // validAccess (a deleted path no longer resolves; a recreated one has a fresh
 // epoch).
 func (s *Server) RevokeResource(path string) {
+	s.revokeResource(path, "")
+}
+
+// RevokeResourceAtEpoch is wired by the Gateway lifecycle. The endpoint epoch
+// identifies the retiring incarnation and lets durable cleanup coexist with a
+// fast delete/recreate of the same friendly path.
+func (s *Server) RevokeResourceAtEpoch(path, resourceEpoch string) {
+	s.revokeResource(path, resourceEpoch)
+}
+
+func (s *Server) revokeResource(path, resourceEpoch string) {
 	path = strings.TrimRight(path, "/")
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	for rt, g := range s.refresh {
-		if g.resource == path {
+		if g.resource == path && revokedResourceEpochMatches(resourceEpoch, g.resourceEpoch) {
 			delete(s.refresh, rt)
 		}
 	}
 	for c, ac := range s.codes {
-		if ac.resource == path {
+		if ac.resource == path && revokedResourceEpochMatches(resourceEpoch, ac.resourceEpoch) {
 			delete(s.codes, c)
 		}
+	}
+	store := s.grantStore
+	s.mu.Unlock()
+	if store == nil {
+		return
+	}
+	// Connector deletion changes the endpoint epoch, which independently makes
+	// old durable grants unusable even if this cleanup is unavailable. Keep the
+	// callback bounded and, when the Gateway supplied the retiring epoch, delete
+	// only that incarnation's rows rather than racing a recreated endpoint.
+	ctx, cancel := context.WithTimeout(context.Background(), grantStoreTimeout)
+	defer cancel()
+	var err error
+	if resourceEpoch != "" {
+		if epochStore, ok := store.(OAuthGrantEpochStore); ok {
+			err = epochStore.RevokeOAuthGrantsForResourceEpoch(ctx, path, resourceEpoch)
+		} else {
+			err = store.RevokeOAuthGrantsForResource(ctx, path)
+		}
+	} else {
+		err = store.RevokeOAuthGrantsForResource(ctx, path)
+	}
+	if err != nil {
+		log.Printf("oauthas: durable resource grant cleanup for %q failed: %v", path, err)
 	}
 }
 
@@ -367,7 +613,12 @@ func (s *Server) revokeAll(ctx context.Context, beforeBarrier func()) error {
 		beforeBarrier()
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	locked := true
+	defer func() {
+		if locked {
+			s.mu.Unlock()
+		}
+	}()
 
 	nextGeneration := randToken(16)
 	if s.generationStore != nil {
@@ -402,6 +653,18 @@ func (s *Server) revokeAll(ctx context.Context, beforeBarrier func()) error {
 	s.tokenGeneration = nextGeneration
 	clear(s.refresh)
 	clear(s.codes)
+	// Force the next syncTokenGeneration call to read through the durable
+	// store rather than trust the cache for up to tokenGenerationCacheTTL
+	// more: this write is the newest possible value, but invalidating (rather
+	// than marking it fresh here) keeps the cache's only "fresh" source of
+	// truth as a confirmed read or an in-process write, never an assumption.
+	s.generationSyncedAt = time.Time{}
+	s.mu.Unlock()
+	locked = false
+	// Generation rotation is the durable revocation boundary.  Do not issue a
+	// broad persistent delete here: a newly minted grant under nextGeneration
+	// could otherwise race this post-barrier cleanup and be deleted.  Stale
+	// records are rejected by generation and naturally expire.
 	return nil
 }
 
@@ -670,6 +933,13 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The password consent page must never be framed: a clickjacked consent
+	// would let a malicious page trick the administrator into approving an MCP
+	// authorization. frame-ancestors alone is the point; a default-src CSP
+	// would break the page's inline <style>.
+	w.Header().Set("Content-Security-Policy", "frame-ancestors 'none'")
+	w.Header().Set("X-Frame-Options", "DENY")
+
 	// Preserve the OAuth params across the consent POST.
 	fields := map[string]string{
 		"client_id": clientID, "redirect_uri": redirectURI, "state": state,
@@ -682,7 +952,15 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// POST: validate password.
+	// POST: validate password. Throttle by RemoteAddr host by default before
+	// the comparison; SetTrustProxyHeaders opts into keying on the trusted
+	// last X-Forwarded-For hop instead, for deployments behind an
+	// operator-controlled reverse proxy where RemoteAddr is always the proxy.
+	if !s.consentThrottle.Allow(ratelimit.ClientIP(r, s.trustProxyHeaders)) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		consentTmpl.Execute(w, map[string]any{"Client": clientID, "Resource": resource, "Fields": fields, "Err": "Too many attempts, try again later."})
+		return
+	}
 	if subtle.ConstantTimeCompare([]byte(q.Get("password")), []byte(s.password)) != 1 {
 		w.WriteHeader(401)
 		consentTmpl.Execute(w, map[string]any{"Client": clientID, "Resource": resource, "Fields": fields, "Err": "Incorrect password."})
@@ -710,7 +988,12 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) completeAuthorization(w http.ResponseWriter, r *http.Request, request authorizationRequest) {
 	s.mu.Lock()
-	code, ok := s.createAuthorizationCodeLocked(request)
+	code, ok, err := s.createAuthorizationCodeLocked(r.Context(), request)
+	if err != nil {
+		s.mu.Unlock()
+		oauthErr(w, http.StatusServiceUnavailable, "temporarily_unavailable", "authorization state unavailable")
+		return
+	}
 	if !ok {
 		s.mu.Unlock()
 		s.redirectErr(w, r, request.redirectURI, request.state, "invalid_request", "authorization request was revoked")
@@ -722,21 +1005,37 @@ func (s *Server) completeAuthorization(w http.ResponseWriter, r *http.Request, r
 
 // createAuthorizationCodeLocked requires s.mu for writing and refuses to
 // create a code from authorization state captured before the latest revoke.
-func (s *Server) createAuthorizationCodeLocked(request authorizationRequest) (string, bool) {
+// A configured durable grant store is written before the browser receives the
+// code, so a restart or a different replica can redeem it exactly once.
+func (s *Server) createAuthorizationCodeLocked(ctx context.Context, request authorizationRequest) (string, bool, error) {
 	if request.generation == "" || request.generation != s.tokenGeneration {
-		return "", false
+		return "", false, nil
+	}
+	resourceEpoch, resourceLive := s.resourceEpoch(request.resourcePath)
+	if !resourceLive {
+		return "", false, nil
 	}
 	code := randToken(24)
-	s.codes[code] = authCode{
-		clientID:    request.clientID,
-		redirectURI: request.redirectURI,
-		challenge:   request.challenge,
-		scope:       request.scope,
-		resource:    request.resourcePath,
-		generation:  s.tokenGeneration,
-		expires:     s.now().Add(codeTTL),
+	grant := authCode{
+		clientID:      request.clientID,
+		redirectURI:   request.redirectURI,
+		challenge:     request.challenge,
+		scope:         request.scope,
+		resource:      request.resourcePath,
+		resourceEpoch: resourceEpoch,
+		generation:    s.tokenGeneration,
+		expires:       s.now().Add(codeTTL),
 	}
-	return code, true
+	if store := s.grantStore; store != nil {
+		grantCtx, cancel := grantStoreContext(ctx)
+		err := store.StoreAuthorizationCode(grantCtx, durableAuthorizationCodeFrom(code, grant))
+		cancel()
+		if err != nil {
+			return "", false, fmt.Errorf("persist authorization code: %w", err)
+		}
+	}
+	s.codes[code] = grant
+	return code, true, nil
 }
 
 func (s *Server) redirectAuthorizationCode(w http.ResponseWriter, r *http.Request, request authorizationRequest, code string) {
@@ -768,22 +1067,31 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	grantType := r.Form.Get("grant_type")
-	s.mu.RLock()
-	locallyKnown := false
 	switch grantType {
 	case "authorization_code":
-		_, locallyKnown = s.codes[r.Form.Get("code")]
 	case "refresh_token":
-		_, locallyKnown = s.refresh[r.Form.Get("refresh_token")]
 	default:
-		s.mu.RUnlock()
 		oauthErr(w, 400, "unsupported_grant_type", "")
 		return
 	}
-	s.mu.RUnlock()
-	if !locallyKnown {
-		oauthErr(w, http.StatusBadRequest, "invalid_grant", "grant is unknown")
-		return
+	// A durable store is authoritative across restarts and replicas.  Retain
+	// the local fast rejection only for deliberately in-memory test/dev
+	// servers; using it with a store would reject a perfectly valid grant that
+	// another Engine instance issued.
+	if s.grantStoreForRequest() == nil {
+		s.mu.RLock()
+		var knownInMemory bool
+		switch grantType {
+		case "authorization_code":
+			_, knownInMemory = s.codes[r.Form.Get("code")]
+		case "refresh_token":
+			_, knownInMemory = s.refresh[r.Form.Get("refresh_token")]
+		}
+		s.mu.RUnlock()
+		if !knownInMemory {
+			oauthErr(w, http.StatusBadRequest, "invalid_grant", "grant is unknown")
+			return
+		}
 	}
 	if err := s.syncTokenGeneration(r.Context()); err != nil {
 		oauthErr(w, http.StatusServiceUnavailable, "temporarily_unavailable", "authorization state unavailable")
@@ -797,12 +1105,73 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// consumeAuthorizationCode is atomic at the durable-store boundary.  The
+// local copy is only a compatibility/cache seam and is cleared on every
+// durable consume so it cannot grow across a long-lived replica.
+func (s *Server) consumeAuthorizationCode(ctx context.Context, code string) (authCode, bool, error) {
+	if store := s.grantStoreForRequest(); store != nil {
+		grantCtx, cancel := grantStoreContext(ctx)
+		grant, ok, err := store.ConsumeAuthorizationCode(grantCtx, durableGrantTokenHash(code), s.now())
+		cancel()
+		if err != nil {
+			return authCode{}, false, err
+		}
+		s.mu.Lock()
+		delete(s.codes, code)
+		s.mu.Unlock()
+		if !ok {
+			return authCode{}, false, nil
+		}
+		return authorizationCodeFromDurable(grant), true, nil
+	}
+	s.mu.Lock()
+	grant, ok := s.codes[code]
+	delete(s.codes, code) // single-use
+	s.mu.Unlock()
+	return grant, ok, nil
+}
+
+func (s *Server) loadRefreshGrant(ctx context.Context, token string) (refreshGrant, bool, error) {
+	if store := s.grantStoreForRequest(); store != nil {
+		grantCtx, cancel := grantStoreContext(ctx)
+		grant, ok, err := store.LoadRefreshGrant(grantCtx, durableGrantTokenHash(token), s.now())
+		cancel()
+		if err != nil {
+			return refreshGrant{}, false, err
+		}
+		if !ok {
+			return refreshGrant{}, false, nil
+		}
+		return refreshGrantFromDurable(grant), true, nil
+	}
+	s.mu.RLock()
+	grant, ok := s.refresh[token]
+	s.mu.RUnlock()
+	return grant, ok, nil
+}
+
+func resourceEpochMatches(expected, current string) bool {
+	// Empty is the legacy/in-memory representation for an endpoint epoch. New
+	// durable grants always carry a snapshot whenever one exists.
+	return expected == "" || expected == current
+}
+
+func revokedResourceEpochMatches(retired, grant string) bool {
+	// A pre-epoch in-memory grant is necessarily older than an explicitly
+	// retiring endpoint. New durable grants always carry their epoch, so this
+	// compatibility branch cannot remove a replacement grant.
+	return retired == "" || grant == "" || retired == grant
+}
+
 func (s *Server) grantCode(w http.ResponseWriter, r *http.Request) {
 	code := r.Form.Get("code")
+	ac, ok, err := s.consumeAuthorizationCode(r.Context(), code)
+	if err != nil {
+		oauthErr(w, http.StatusServiceUnavailable, "temporarily_unavailable", "authorization state unavailable")
+		return
+	}
 	s.mu.Lock()
-	ac, ok := s.codes[code]
-	delete(s.codes, code) // single-use
-	if !ok || ac.generation == "" || ac.generation != s.tokenGeneration || s.now().After(ac.expires) {
+	if !ok || ac.generation == "" || ac.generation != s.tokenGeneration || !s.now().Before(ac.expires) {
 		s.mu.Unlock()
 		oauthErr(w, 400, "invalid_grant", "code invalid or expired")
 		return
@@ -824,10 +1193,15 @@ func (s *Server) grantCode(w http.ResponseWriter, r *http.Request) {
 		oauthErr(w, 400, "invalid_grant", "PKCE verification failed")
 		return
 	}
-	grantEpoch, resourceLive := s.epochForLocked(ac.resource)
+	grantResourceEpoch, resourceLive := s.resourceEpoch(ac.resource)
 	if !resourceLive {
 		s.mu.Unlock()
 		oauthErr(w, 400, "invalid_grant", "resource no longer exists")
+		return
+	}
+	if !resourceEpochMatches(ac.resourceEpoch, grantResourceEpoch) {
+		s.mu.Unlock()
+		oauthErr(w, 400, "invalid_grant", "client authorization changed")
 		return
 	}
 	// The code is deliberately consumed before the durable client grant lookup:
@@ -845,12 +1219,19 @@ func (s *Server) grantCode(w http.ResponseWriter, r *http.Request) {
 		oauthErr(w, 400, "invalid_grant", "code invalid or expired")
 		return
 	}
-	if currentEpoch, ok := s.epochForLocked(ac.resource); !ok || currentEpoch != grantEpoch {
+	if currentResourceEpoch, ok := s.resourceEpoch(ac.resource); !ok ||
+		currentResourceEpoch != grantResourceEpoch ||
+		!resourceEpochMatches(ac.resourceEpoch, currentResourceEpoch) {
 		s.mu.Unlock()
 		oauthErr(w, 400, "invalid_grant", "client authorization changed")
 		return
 	}
-	response, ok := s.issueTokensLocked(ac.clientID, ac.scope, ac.resource, ac.generation, true)
+	response, ok, err := s.issueTokensLocked(r.Context(), ac.clientID, ac.scope, ac.resource, ac.generation, ac.resourceEpoch, true)
+	if err != nil {
+		s.mu.Unlock()
+		oauthErr(w, http.StatusServiceUnavailable, "temporarily_unavailable", "authorization state unavailable")
+		return
+	}
 	if !ok {
 		s.mu.Unlock()
 		oauthErr(w, 400, "invalid_grant", "resource no longer exists or authorization was revoked")
@@ -865,9 +1246,14 @@ func (s *Server) grantCode(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) grantRefresh(w http.ResponseWriter, r *http.Request) {
 	rt := r.Form.Get("refresh_token")
+	g, ok, err := s.loadRefreshGrant(r.Context(), rt)
+	if err != nil {
+		oauthErr(w, http.StatusServiceUnavailable, "temporarily_unavailable", "authorization state unavailable")
+		return
+	}
 	s.mu.Lock()
-	g, ok := s.refresh[rt]
-	if !ok || g.generation == "" || g.generation != s.tokenGeneration {
+	if !ok || g.generation == "" || g.generation != s.tokenGeneration ||
+		(!g.expires.IsZero() && !s.now().Before(g.expires)) {
 		s.mu.Unlock()
 		oauthErr(w, 400, "invalid_grant", "unknown refresh token")
 		return
@@ -882,10 +1268,15 @@ func (s *Server) grantRefresh(w http.ResponseWriter, r *http.Request) {
 		oauthErr(w, 400, "invalid_grant", "resource is missing, malformed, or does not match the refresh grant")
 		return
 	}
-	grantEpoch, resourceLive := s.epochForLocked(g.resource)
+	grantResourceEpoch, resourceLive := s.resourceEpoch(g.resource)
 	if !resourceLive {
 		s.mu.Unlock()
 		oauthErr(w, 400, "invalid_grant", "resource no longer exists")
+		return
+	}
+	if !resourceEpochMatches(g.resourceEpoch, grantResourceEpoch) {
+		s.mu.Unlock()
+		oauthErr(w, 400, "invalid_grant", "client authorization changed")
 		return
 	}
 	// Do not let a refresh token from a formerly-bound client gain the current
@@ -896,20 +1287,22 @@ func (s *Server) grantRefresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
-	g, ok = s.refresh[rt]
-	if !ok || g.generation == "" || g.generation != s.tokenGeneration {
+	if g.generation == "" || g.generation != s.tokenGeneration ||
+		(!g.expires.IsZero() && !s.now().Before(g.expires)) {
 		s.mu.Unlock()
 		oauthErr(w, 400, "invalid_grant", "unknown refresh token")
 		return
 	}
-	if currentEpoch, ok := s.epochForLocked(g.resource); !ok || currentEpoch != grantEpoch {
+	if currentResourceEpoch, ok := s.resourceEpoch(g.resource); !ok ||
+		currentResourceEpoch != grantResourceEpoch ||
+		!resourceEpochMatches(g.resourceEpoch, currentResourceEpoch) {
 		s.mu.Unlock()
 		oauthErr(w, 400, "invalid_grant", "client authorization changed")
 		return
 	}
 	// Non-rotating: reuse the same refresh token (robust against retries).
 	// The refreshed access token keeps the original grant's resource binding.
-	at, ok := s.signAccessLocked(g.clientID, g.resource)
+	at, ok := s.signAccessForResourceEpochLocked(g.clientID, g.resource, grantResourceEpoch)
 	if !ok {
 		s.mu.Unlock()
 		oauthErr(w, 400, "invalid_grant", "resource no longer exists")
@@ -920,22 +1313,41 @@ func (s *Server) grantRefresh(w http.ResponseWriter, r *http.Request) {
 }
 
 // issueTokensLocked requires s.mu for writing. The expected generation check,
-// access-token signing, and refresh-grant insertion form one atomic operation
-// with respect to RevokeAll.
-func (s *Server) issueTokensLocked(clientID, scope, resource, expectedGeneration string, withRefresh bool) (map[string]any, bool) {
+// access-token signing, and durable refresh-grant insertion form one atomic
+// operation with respect to this instance's RevokeAll barrier.
+func (s *Server) issueTokensLocked(ctx context.Context, clientID, scope, resource, expectedGeneration, expectedResourceEpoch string, withRefresh bool) (map[string]any, bool, error) {
 	if expectedGeneration == "" || expectedGeneration != s.tokenGeneration {
-		return nil, false
+		return nil, false, nil
 	}
-	at, ok := s.signAccessLocked(clientID, resource)
+	resourceEpoch, resourceLive := s.resourceEpoch(resource)
+	if !resourceLive || !resourceEpochMatches(expectedResourceEpoch, resourceEpoch) {
+		return nil, false, nil
+	}
+	at, ok := s.signAccessForResourceEpochLocked(clientID, resource, resourceEpoch)
 	if !ok {
-		return nil, false
+		return nil, false, nil
 	}
 	rt := ""
 	if withRefresh {
 		rt = randToken(32)
-		s.refresh[rt] = refreshGrant{clientID: clientID, resource: resource, generation: s.tokenGeneration}
+		grant := refreshGrant{
+			clientID:      clientID,
+			resource:      resource,
+			resourceEpoch: resourceEpoch,
+			generation:    s.tokenGeneration,
+			expires:       s.now().Add(refreshTTL),
+		}
+		if store := s.grantStore; store != nil {
+			grantCtx, cancel := grantStoreContext(ctx)
+			err := store.StoreRefreshGrant(grantCtx, durableRefreshGrantFrom(rt, grant))
+			cancel()
+			if err != nil {
+				return nil, false, fmt.Errorf("persist refresh grant: %w", err)
+			}
+		}
+		s.refresh[rt] = grant
 	}
-	return tokenResp(at, rt, scope), true
+	return tokenResp(at, rt, scope), true, nil
 }
 
 func tokenResp(at, rt, scope string) map[string]any {
@@ -1025,10 +1437,22 @@ func (s *Server) signAccess(clientID, resource string) (string, bool) {
 // signAccessLocked requires s.mu for reading or writing.
 func (s *Server) signAccessLocked(clientID, resource string) (string, bool) {
 	resource = resourcePath(resource)
-	epoch, ok := s.epochForLocked(resource)
+	resourceEpoch, ok := s.resourceEpoch(resource)
 	if !ok {
 		return "", false
 	}
+	return s.signAccessForResourceEpochLocked(clientID, resource, resourceEpoch)
+}
+
+// signAccessForResourceEpochLocked signs against the caller's endpoint epoch
+// snapshot.  Code/refresh redemption uses it after comparing that snapshot to
+// the one persisted with the grant, closing the delete-and-recreate path.
+func (s *Server) signAccessForResourceEpochLocked(clientID, resource, resourceEpoch string) (string, bool) {
+	resource = resourcePath(resource)
+	if _, ok := s.resourceEpoch(resource); !ok {
+		return "", false
+	}
+	epoch := s.tokenGeneration + "|" + resourceEpoch
 	exp := strconv.FormatInt(s.now().Add(accessTTL).Unix(), 10)
 	return exp + "." + s.sign(exp+"|"+clientID+"|"+resource+"|"+epoch) + "." +
 		base64.RawURLEncoding.EncodeToString([]byte(clientID)) + "." +

@@ -223,6 +223,56 @@ func TestPlatformActorVerifierRejectsTamperingAndMismatches(t *testing.T) {
 	}
 }
 
+func TestPlatformServiceActorAllowsOnlyExactLibraryPublicationRoutes(t *testing.T) {
+	verifier, privateKey, now := newActorVerifier(t)
+	candidatePath := "/api/library/artifacts/libart_candidate_123/publication-candidate"
+	claimPath := "/api/library/artifacts/libart_candidate_123/publication-claim"
+	for _, allowed := range []struct {
+		name   string
+		method string
+		path   string
+		body   []byte
+	}{
+		{name: "candidate", method: http.MethodGet, path: candidatePath},
+		{name: "claim", method: http.MethodPost, path: claimPath, body: []byte(`{"artifactVersionId":"libartv_candidate_123","digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`)},
+	} {
+		t.Run(allowed.name, func(t *testing.T) {
+			claims := actorClaimsForTest(now, allowed.method, allowed.path, allowed.body)
+			claims.UserID = platformServiceActorID
+			claims.Role = "service"
+			actor, err := verifier.VerifyRequest(actorRequest(allowed.method, allowed.path, allowed.body, signActorAssertionForTest(t, privateKey, claims)))
+			if err != nil {
+				t.Fatalf("verify publication %s service assertion: %v", allowed.name, err)
+			}
+			if actor.UserID != platformServiceActorID || actor.Role != "service" {
+				t.Fatalf("service actor = %+v", actor)
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name   string
+		method string
+		path   string
+	}{
+		{name: "wrong candidate method", method: http.MethodPost, path: candidatePath},
+		{name: "wrong claim method", method: http.MethodGet, path: claimPath},
+		{name: "unsafe artifact identifier", method: http.MethodGet, path: "/api/library/artifacts/artifact~123/publication-candidate"},
+		{name: "extra path segment", method: http.MethodGet, path: candidatePath + "/extra"},
+		{name: "other library resource", method: http.MethodGet, path: "/api/library/artifacts/libart_candidate_123"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := actorClaimsForTest(now, test.method, test.path, nil)
+			candidate.UserID = platformServiceActorID
+			candidate.Role = "service"
+			_, err := verifier.VerifyRequest(actorRequest(test.method, test.path, nil, signActorAssertionForTest(t, privateKey, candidate)))
+			if !errors.Is(err, ErrInvalidPlatformActorAssertion) {
+				t.Fatalf("service %s assertion error=%v, want invalid assertion", test.name, err)
+			}
+		})
+	}
+}
+
 func TestHostedConsoleRequiresMachineTokenAndActorAssertion(t *testing.T) {
 	verifier, privateKey, now := newActorVerifier(t)
 	api := NewConsoleAPI(

@@ -236,9 +236,42 @@ func platformServiceControlRoute(method, requestPath string) bool {
 		return true
 	case method == http.MethodGet && requestPath == "/api/activation":
 		return true
+	case method == http.MethodGet && platformServiceLibraryPublicationCandidateRoute(requestPath):
+		return true
+	case method == http.MethodPost && platformServiceLibraryPublicationClaimRoute(requestPath):
+		return true
 	default:
 		return false
 	}
+}
+
+// platformServiceLibraryPublicationCandidateRoute deliberately recognizes one
+// dynamic resource route instead of making the entire Library API available
+// to the Platform service principal. The opaque artifact ID is constrained to
+// the same unescaped identifier alphabet as every actor assertion field, so a
+// signed path cannot be confused with a differently encoded route.
+func platformServiceLibraryPublicationCandidateRoute(requestPath string) bool {
+	return platformServiceLibraryPublicationRoute(requestPath, "publication-candidate")
+}
+
+// platformServiceLibraryPublicationClaimRoute is intentionally separate from
+// the candidate read. The Platform can only claim the exact reviewed artifact
+// version/digest it just observed; it never receives general Library write
+// authority through this service principal.
+func platformServiceLibraryPublicationClaimRoute(requestPath string) bool {
+	return platformServiceLibraryPublicationRoute(requestPath, "publication-claim")
+}
+
+func platformServiceLibraryPublicationRoute(requestPath, operation string) bool {
+	parts := strings.Split(strings.TrimPrefix(requestPath, "/"), "/")
+	if len(parts) != 5 ||
+		parts[0] != "api" ||
+		parts[1] != "library" ||
+		parts[2] != "artifacts" ||
+		parts[4] != operation {
+		return false
+	}
+	return validActorIdentifier(parts[3])
 }
 
 func readBoundedActorRequestBody(r *http.Request) ([]byte, error) {

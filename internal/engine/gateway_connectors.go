@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/mark3labs/mcp-go/server"
 )
@@ -38,6 +39,13 @@ type connectorServer struct {
 	// toolset; also read by Replay so a replayed call re-applies the
 	// connector's CURRENT guards. Accessed under Gateway.mu.
 	guards *compiledGuards
+	// refreshedAt is set by buildMCPClient every time it (re)builds a
+	// subject-bound client endpoint. MCPClientHandler compares it against
+	// mcpClientProjectionTTL to decide whether a request needs to rebuild from
+	// durable state or may serve the existing projection directly. Unused by
+	// connector/namespace endpoints (those rebuild only on mutation, via
+	// RefreshConnectors, never per-request). Accessed under Gateway.mu.
+	refreshedAt time.Time
 }
 
 // connectorStore returns the store's ConnectorStore facet, if it has one.
@@ -60,6 +68,19 @@ func (g *Gateway) namespaceStore() (NamespaceStore, bool) {
 // in vc.Approval get the approval-parking wrapper — rebuilds always re-wrap
 // from the CURRENT store state, since vc comes from the store on every refresh.
 func (g *Gateway) buildConnector(vc VirtualConnector) error {
+	// store I/O stays outside g.mu; dispatch-time revision fences
+	// (accountSnapshotLive) remain the authority. Snapshot every account this
+	// connector references before acquiring the lock; a row that changes
+	// between this snapshot and the lock is caught on the next rebuild (every
+	// mutation triggers RefreshConnectors), matching the staleness this code
+	// already tolerates via the incarnation/revision/URL checks below.
+	accounts := make(map[string]Account, len(vc.Tools))
+	for acct := range vc.Tools {
+		if account, exists := g.store.Account(acct); exists {
+			accounts[acct] = account
+		}
+	}
+
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	cs, ok := g.connectors[vc.Slug]
@@ -70,7 +91,7 @@ func (g *Gateway) buildConnector(vc VirtualConnector) error {
 		ok = false
 	}
 	if !ok {
-		m := server.NewMCPServer("narthex-"+vc.Slug, "0.1.0", server.WithToolCapabilities(true))
+		m := newSynaxisMCPServer("narthex-"+vc.Slug, mcpBootstrapSurfaceConnector, mcpBootstrapFeatures{})
 		cs = &connectorServer{
 			mcp:     m,
 			handler: server.NewStreamableHTTPServer(m, server.WithEndpointPath("/mcp/"+vc.Slug)),
@@ -90,7 +111,7 @@ func (g *Gateway) buildConnector(vc VirtualConnector) error {
 	var names []string
 	var add []cachedTool
 	for acct, allow := range vc.Tools {
-		account, exists := g.store.Account(acct)
+		account, exists := accounts[acct]
 		if !exists || account.IsPersonal() {
 			// Storage mutation paths reject this, but old/corrupt durable rows
 			// must not turn a personal credential into a shared endpoint while
@@ -110,13 +131,16 @@ func (g *Gateway) buildConnector(vc VirtualConnector) error {
 			if !allowSet[bare] {
 				continue
 			}
-			if approvalSet[bare] {
+			preset, presetErr := normalizedGovernancePreset(
+				account.ToolOverrides[bare].GovernancePreset,
+			)
+			if approvalSet[bare] && (presetErr != nil || !preset.requiresApproval()) {
 				// require_approval: park the call for a human decision first.
 				// ct is a copy — the cached (main /mcp) handler stays unwrapped;
 				// that's safe because access tokens are bound to the endpoint
 				// path they were authorized for (oauthas), so a connector token
 				// cannot reach the ungated /mcp surface.
-				ct.handler = g.approvalHandler(vc.Slug, account, bare, ct.handler)
+				ct.handler = g.approvalHandler(vc.Slug, account, bare, readOnlyTool(ct.tool, bare), ct.handler)
 			}
 			// Outermost: stamp every call on this endpoint with the connector
 			// name, its Record flag, and its compiled guards (read by the
@@ -154,6 +178,16 @@ func (g *Gateway) buildConnector(vc VirtualConnector) error {
 // already reflect account-level disabled/read-only/override policy, and their
 // <account>__<tool> names are reused unchanged.
 func (g *Gateway) buildNamespace(ns Namespace) error {
+	// store I/O stays outside g.mu; dispatch-time revision fences
+	// (accountSnapshotLive) remain the authority. Snapshot member accounts
+	// before acquiring the lock, same tolerance as buildConnector above.
+	accounts := make(map[string]Account, len(ns.Accounts))
+	for _, name := range ns.Accounts {
+		if account, exists := g.store.Account(name); exists {
+			accounts[name] = account
+		}
+	}
+
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	cs, ok := g.connectors[ns.Slug]
@@ -163,7 +197,7 @@ func (g *Gateway) buildNamespace(ns Namespace) error {
 		ok = false
 	}
 	if !ok {
-		m := server.NewMCPServer("narthex-"+ns.Slug, "0.1.0", server.WithToolCapabilities(true))
+		m := newSynaxisMCPServer("narthex-"+ns.Slug, mcpBootstrapSurfaceBundle, mcpBootstrapFeatures{})
 		cs = &connectorServer{
 			mcp:     m,
 			handler: server.NewStreamableHTTPServer(m, server.WithEndpointPath("/mcp/"+ns.Slug)),
@@ -176,12 +210,12 @@ func (g *Gateway) buildNamespace(ns Namespace) error {
 	var names []string
 	var add []cachedTool
 	for _, account := range ns.Accounts {
-		stored, exists := g.store.Account(account)
+		stored, exists := accounts[account]
 		if !exists || stored.IsPersonal() {
 			continue
 		}
 		for _, cached := range g.cached[account] {
-			if cached.accountIncarnationID == "" || cached.accountIncarnationID != stored.IncarnationID || !equalAccountSnapshotURL(cached.accountURL, stored.URL) {
+			if cached.accountIncarnationID == "" || cached.accountIncarnationID != stored.IncarnationID || cached.accountRevision != stored.Revision || !equalAccountSnapshotURL(cached.accountURL, stored.URL) {
 				continue
 			}
 			ct := cached
@@ -223,10 +257,33 @@ func (g *Gateway) RefreshConnectors(ctx context.Context) {
 	// a move to personal, while retaining its cached tools for the owner's
 	// subject-bound client endpoint. Then rebuild every shared endpoint from
 	// the current store state below.
-	for _, account := range g.store.Accounts() {
+	accounts := g.store.Accounts()
+	live := make(map[string]bool, len(accounts))
+	for _, account := range accounts {
+		live[account.Name] = true
 		if account.IsPersonal() {
 			g.removeRootProjectionLive(account)
 		}
+	}
+	// aggregateAccount and rebindCachedAccount snapshot g.store.Account(name)
+	// BEFORE acquiring g.mu (store I/O intentionally stays outside the lock —
+	// see their comments), so a goroutine merely slow to reach g.mu.Lock()
+	// afterward — plausible under real lock contention — can still be
+	// holding a pre-delete "live" snapshot after a concurrent delete
+	// (durable Delete + RemoveAccount) has already fully completed. It then
+	// writes that stale snapshot back, resurrecting the just-deleted account
+	// into g.byAcct/g.cached/g.projectedIncarnations (and back onto the
+	// shared root /mcp server). Nothing else diffs those in-memory maps
+	// against the store, so prune here, against the fresh accounts list just
+	// fetched above: RefreshConnectors already runs after every account
+	// mutation — including the resurrecting write itself — so a ghost
+	// self-heals within one refresh cycle. Skip when the list comes back
+	// empty: AccountStore.Accounts() predates error-returning list methods
+	// (see PgStore's implementation), so an empty result is indistinguishable
+	// from a transient query failure, and pruning on that would wipe every
+	// live registration instead of just an orphan.
+	if len(accounts) > 0 {
+		g.pruneOrphanedAccounts(live)
 	}
 	var connectors []VirtualConnector
 	if cs, ok := g.connectorStore(); ok {
@@ -278,6 +335,43 @@ func (g *Gateway) RefreshConnectors(ctx context.Context) {
 	g.refreshMCPClientsLocked(ctx)
 }
 
+// pruneOrphanedAccounts removes every root-registered and cached tool
+// projection for an account name absent from live — the account set
+// RefreshConnectors just fetched fresh from the store. See RefreshConnectors
+// for why this is needed: aggregateAccount/rebindCachedAccount's hoisted
+// store read can otherwise resurrect a just-deleted account's tools into
+// these maps (and back onto the shared /mcp server), where nothing else
+// would ever remove them again — no other code path diffs g.byAcct/g.cached/
+// g.projectedIncarnations against the store.
+func (g *Gateway) pruneOrphanedAccounts(live map[string]bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	orphans := make(map[string]bool)
+	for name := range g.byAcct {
+		if !live[name] {
+			orphans[name] = true
+		}
+	}
+	for name := range g.cached {
+		if !live[name] {
+			orphans[name] = true
+		}
+	}
+	for name := range g.projectedIncarnations {
+		if !live[name] {
+			orphans[name] = true
+		}
+	}
+	for name := range orphans {
+		if names := g.byAcct[name]; len(names) > 0 {
+			g.mcp.DeleteTools(names...)
+		}
+		delete(g.byAcct, name)
+		delete(g.cached, name)
+		delete(g.projectedIncarnations, name)
+	}
+}
+
 // UpsertConnector writes vc through the store, then (re)builds its live server.
 // A connector without an epoch gets one: preserved from the stored row on
 // update, freshly minted on create — so recreating a deleted slug invalidates
@@ -289,6 +383,9 @@ func (g *Gateway) UpsertConnector(ctx context.Context, vc VirtualConnector) erro
 	cs, ok := g.connectorStore()
 	if !ok {
 		return fmt.Errorf("store does not support connectors")
+	}
+	if reservedEndpointSlugs[vc.Slug] {
+		return fmt.Errorf("%w: %s", ErrEndpointCollision, vc.Slug)
 	}
 	if err := g.rejectPersonalEndpointAccounts(accountNamesInToolMap(vc.Tools)); err != nil {
 		return err
@@ -395,6 +492,9 @@ func (g *Gateway) CreateNamespace(ctx context.Context, ns Namespace) (Namespace,
 	store, ok := g.namespaceStore()
 	if !ok {
 		return Namespace{}, fmt.Errorf("store does not support namespaces")
+	}
+	if reservedEndpointSlugs[ns.Slug] {
+		return Namespace{}, fmt.Errorf("%w: %s", ErrEndpointCollision, ns.Slug)
 	}
 	if err := g.rejectPersonalEndpointAccounts(normalizedNamespaceAccounts(ns.Accounts)); err != nil {
 		return Namespace{}, err
@@ -509,9 +609,14 @@ func (g *Gateway) retireEndpoint(slug, kind, generation string) {
 		delete(g.connectors, slug)
 	}
 	revoke := g.revokeResource
+	revokeEpoch := g.revokeResourceEpoch
 	g.mu.Unlock()
-	if !reused && revoke != nil {
-		revoke("/mcp/" + slug)
+	if !reused {
+		if revokeEpoch != nil && generation != "" {
+			revokeEpoch("/mcp/"+slug, generation)
+		} else if revoke != nil {
+			revoke("/mcp/" + slug)
+		}
 	}
 }
 
@@ -521,6 +626,15 @@ func (g *Gateway) retireEndpoint(slug, kind, generation string) {
 func (g *Gateway) SetTokenRevoker(fn func(resourcePath string)) {
 	g.mu.Lock()
 	g.revokeResource = fn
+	g.mu.Unlock()
+}
+
+// SetTokenEpochRevoker installs the precise revocation callback used by the
+// durable OAuth store. `retiringEpoch` is the endpoint generation removed or
+// replaced by this Gateway refresh, never the replacement's generation.
+func (g *Gateway) SetTokenEpochRevoker(fn func(resourcePath, retiringEpoch string)) {
+	g.mu.Lock()
+	g.revokeResourceEpoch = fn
 	g.mu.Unlock()
 }
 
@@ -575,10 +689,18 @@ func (g *Gateway) ConnectorStats(ctx context.Context, slug string) (ConnectorSta
 	if !ok {
 		return ConnectorStats{}, fmt.Errorf("connector %q not found", slug)
 	}
+	// store I/O stays outside g.mu; dispatch-time revision fences
+	// (accountSnapshotLive) remain the authority. Snapshot the cached-tool map
+	// (a cheap copy of slice headers, no I/O) under the lock, then look up
+	// accounts and compute stats without holding it.
 	g.mu.Lock()
-	defer g.mu.Unlock()
-	var st ConnectorStats
+	cached := make(map[string][]cachedTool, len(g.cached))
 	for acct, tools := range g.cached {
+		cached[acct] = tools
+	}
+	g.mu.Unlock()
+	var st ConnectorStats
+	for acct, tools := range cached {
 		if account, found := g.store.Account(acct); !found || account.IsPersonal() {
 			continue
 		}
@@ -611,10 +733,17 @@ func (g *Gateway) NamespaceStats(ctx context.Context, slug string) (ConnectorSta
 		return ConnectorStats{}, fmt.Errorf("namespace %q not found", slug)
 	}
 	members := toSet(ns.Accounts)
+	// store I/O stays outside g.mu; dispatch-time revision fences
+	// (accountSnapshotLive) remain the authority. Same snapshot-then-release
+	// pattern as ConnectorStats above.
 	g.mu.Lock()
-	defer g.mu.Unlock()
-	var st ConnectorStats
+	cached := make(map[string][]cachedTool, len(g.cached))
 	for account, tools := range g.cached {
+		cached[account] = tools
+	}
+	g.mu.Unlock()
+	var st ConnectorStats
+	for account, tools := range cached {
 		if stored, found := g.store.Account(account); !found || stored.IsPersonal() {
 			continue
 		}

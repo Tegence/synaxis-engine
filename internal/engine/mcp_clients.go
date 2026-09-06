@@ -2,6 +2,8 @@ package engine
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"sort"
@@ -21,20 +23,27 @@ import (
 // (for example, /mcp/clients/<slug>). It is distinct from ID, which is
 // opaque and remains the authority key for management requests.
 type MCPClient struct {
-	ID                     string          `json:"id"`
-	Slug                   string          `json:"slug"`
-	Name                   string          `json:"name"`
-	Subject                string          `json:"subject"`
-	OAuthClientID          string          `json:"oauth_client_id,omitempty"`
-	ConnectionNamespaceIDs []string        `json:"connection_namespace_ids"`
-	Status                 MCPClientStatus `json:"status"`
-	Epoch                  string          `json:"epoch"`
-	Revision               int64           `json:"revision"`
-	CreatedBy              string          `json:"created_by,omitempty"`
-	CreatedAt              time.Time       `json:"created_at,omitempty"`
-	UpdatedAt              time.Time       `json:"updated_at,omitempty"`
-	RevokedAt              *time.Time      `json:"revoked_at,omitempty"`
-	RevokedBy              string          `json:"revoked_by,omitempty"`
+	ID            string `json:"id"`
+	Slug          string `json:"slug"`
+	Name          string `json:"name"`
+	Subject       string `json:"subject"`
+	OAuthClientID string `json:"oauth_client_id,omitempty"`
+	// RuntimeAttestorPublicKey is an optional, canonical raw-base64url
+	// Ed25519 public key. It authorizes only the separate host-attestation
+	// endpoint; it is neither an OAuth credential nor an MCP bearer token.
+	RuntimeAttestorPublicKey string          `json:"runtime_attestor_public_key,omitempty"`
+	ConnectionNamespaceIDs   []string        `json:"connection_namespace_ids"`
+	Status                   MCPClientStatus `json:"status"`
+	Epoch                    string          `json:"epoch"`
+	Revision                 int64           `json:"revision"`
+	CreatedBy                string          `json:"created_by,omitempty"`
+	CreatedAt                time.Time       `json:"created_at,omitempty"`
+	UpdatedAt                time.Time       `json:"updated_at,omitempty"`
+	RevokedAt                *time.Time      `json:"revoked_at,omitempty"`
+	RevokedBy                string          `json:"revoked_by,omitempty"`
+	// runtimeAttestorKeySet is an update-only presence bit. It is intentionally
+	// not persisted, so an empty public key can explicitly disable attestation.
+	runtimeAttestorKeySet bool `json:"-"`
 }
 
 type MCPClientStatus string
@@ -167,6 +176,32 @@ func validMCPClientOAuthClientID(value string) bool {
 	return true
 }
 
+func normalizeMCPClientRuntimeAttestorPublicKey(value string) (string, error) {
+	if value == "" {
+		return "", nil
+	}
+	if strings.TrimSpace(value) != value {
+		return "", fmt.Errorf("%w: runtime attestor public key is invalid", ErrInvalidMCPClient)
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil || len(decoded) != ed25519.PublicKeySize || base64.RawURLEncoding.EncodeToString(decoded) != value {
+		return "", fmt.Errorf("%w: runtime attestor public key is invalid", ErrInvalidMCPClient)
+	}
+	return value, nil
+}
+
+func mcpClientRuntimeAttestorPublicKey(value string) (ed25519.PublicKey, bool) {
+	normalized, err := normalizeMCPClientRuntimeAttestorPublicKey(value)
+	if err != nil || normalized == "" {
+		return nil, false
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(normalized)
+	if err != nil {
+		return nil, false
+	}
+	return ed25519.PublicKey(decoded), true
+}
+
 func validateMCPClientName(value string) error {
 	if value == "" || utf8.RuneCountInString(value) > maxMCPClientNameRunes {
 		return fmt.Errorf("%w: name is required and must be at most %d characters", ErrInvalidMCPClient, maxMCPClientNameRunes)
@@ -273,6 +308,11 @@ func prepareMCPClientForCreate(client *MCPClient) error {
 	if err := validateMCPClientSubject(client.Subject); err != nil {
 		return err
 	}
+	var keyErr error
+	client.RuntimeAttestorPublicKey, keyErr = normalizeMCPClientRuntimeAttestorPublicKey(client.RuntimeAttestorPublicKey)
+	if keyErr != nil {
+		return keyErr
+	}
 	client.CreatedBy = strings.TrimSpace(client.CreatedBy)
 	if client.CreatedBy != "" && !validActorIdentifier(client.CreatedBy) {
 		return fmt.Errorf("%w: creator is invalid", ErrInvalidMCPClient)
@@ -346,6 +386,10 @@ func prepareLoadedMCPClient(client *MCPClient, existingIDs, existingSlugs, exist
 	if err := validateMCPClientSubject(client.Subject); err != nil {
 		return false, err
 	}
+	client.RuntimeAttestorPublicKey, err = normalizeMCPClientRuntimeAttestorPublicKey(client.RuntimeAttestorPublicKey)
+	if err != nil {
+		return false, err
+	}
 	client.CreatedBy = strings.TrimSpace(client.CreatedBy)
 	if client.CreatedBy != "" && !validActorIdentifier(client.CreatedBy) {
 		return false, fmt.Errorf("%w: stored creator is invalid", ErrInvalidMCPClient)
@@ -415,7 +459,7 @@ func prepareLoadedMCPClient(client *MCPClient, existingIDs, existingSlugs, exist
 
 func sameMCPClient(a, b MCPClient) bool {
 	if a.ID != b.ID || a.Slug != b.Slug || a.Name != b.Name || a.Subject != b.Subject ||
-		a.OAuthClientID != b.OAuthClientID || a.Status != b.Status || a.Epoch != b.Epoch ||
+		a.OAuthClientID != b.OAuthClientID || a.RuntimeAttestorPublicKey != b.RuntimeAttestorPublicKey || a.Status != b.Status || a.Epoch != b.Epoch ||
 		a.Revision != b.Revision || a.CreatedBy != b.CreatedBy || !a.CreatedAt.Equal(b.CreatedAt) ||
 		!a.UpdatedAt.Equal(b.UpdatedAt) || a.RevokedBy != b.RevokedBy || !sameStrings(a.ConnectionNamespaceIDs, b.ConnectionNamespaceIDs) {
 		return false
@@ -650,10 +694,26 @@ func (s *FileStore) CreateMCPClient(_ context.Context, client MCPClient) (MCPCli
 	if err := s.validateMCPClientNamespacesLocked(client); err != nil {
 		return MCPClient{}, err
 	}
+	beforeSkills := cloneBuiltInLibrarySkills(s.librarySkills)
+	beforeVersions := cloneBuiltInLibrarySkillVersions(s.librarySkillVersions)
+	beforeBindings := copyLibrarySkillBindings(s.librarySkillBindings)
+	beforeGenerations := copyLibrarySkillBindingGenerations(s.librarySkillBindingGenerations)
 	copy := copyMCPClient(client)
 	s.mcpClients = append(s.mcpClients, &copy)
+	if _, err := s.reconcileInstalledBuiltInLibraryForNewClientLocked(); err != nil {
+		s.mcpClients = s.mcpClients[:len(s.mcpClients)-1]
+		s.librarySkills = beforeSkills
+		s.librarySkillVersions = beforeVersions
+		s.librarySkillBindings = beforeBindings
+		s.librarySkillBindingGenerations = beforeGenerations
+		return MCPClient{}, err
+	}
 	if err := s.saveLocked(); err != nil {
 		s.mcpClients = s.mcpClients[:len(s.mcpClients)-1]
+		s.librarySkills = beforeSkills
+		s.librarySkillVersions = beforeVersions
+		s.librarySkillBindings = beforeBindings
+		s.librarySkillBindingGenerations = beforeGenerations
 		return MCPClient{}, err
 	}
 	return copyMCPClient(copy), nil
@@ -682,11 +742,25 @@ func (s *FileStore) UpdateMCPClient(_ context.Context, update MCPClient, precond
 	if update.Slug != "" && normalizeMCPClientSlug(update.Slug) != client.Slug {
 		return MCPClient{}, fmt.Errorf("%w: endpoint slug is immutable", ErrInvalidMCPClient)
 	}
-	if name == client.Name {
+	key := client.RuntimeAttestorPublicKey
+	if update.runtimeAttestorKeySet {
+		var keyErr error
+		key, keyErr = normalizeMCPClientRuntimeAttestorPublicKey(update.RuntimeAttestorPublicKey)
+		if keyErr != nil {
+			return MCPClient{}, keyErr
+		}
+	}
+	if name == client.Name && key == client.RuntimeAttestorPublicKey {
 		return copyMCPClient(*client), nil
 	}
 	before := copyMCPClient(*client)
 	client.Name = name
+	if key != client.RuntimeAttestorPublicKey {
+		client.RuntimeAttestorPublicKey = key
+		// A key rotation is an authorization boundary: pending signed receipts
+		// for the old key must fail even before their expiry.
+		client.Epoch = newEpoch()
+	}
 	client.Revision++
 	client.UpdatedAt = time.Now().UTC()
 	if err := s.saveLocked(); err != nil {

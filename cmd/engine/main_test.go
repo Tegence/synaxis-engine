@@ -4,12 +4,124 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/mark3labs/mcp-go/server"
 
 	"narthex/backend/internal/engine"
 )
+
+func TestNewEngineHTTPServerPreservesStreamingResponses(t *testing.T) {
+	server := newEngineHTTPServer("8080", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	if server.ReadHeaderTimeout != 10*time.Second {
+		t.Fatalf("ReadHeaderTimeout = %s, want 10s", server.ReadHeaderTimeout)
+	}
+	if server.WriteTimeout != 0 {
+		t.Fatalf("WriteTimeout = %s, want unset for streamable MCP", server.WriteTimeout)
+	}
+}
+
+func TestServeEngineHTTPDrainsActiveRequestsOnContextCancellation(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startOnce sync.Once
+	var releaseOnce sync.Once
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		startOnce.Do(func() { close(started) })
+		<-release
+		w.WriteHeader(http.StatusOK)
+	})}
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- serveEngineHTTP(ctx, server, listener) }()
+
+	clientErr := make(chan error, 1)
+	go func() {
+		client := &http.Client{Transport: &http.Transport{Proxy: nil}}
+		response, err := client.Get("http://" + listener.Addr().String())
+		if err == nil {
+			response.Body.Close()
+		}
+		clientErr <- err
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		releaseOnce.Do(func() { close(release) })
+		t.Fatal("active request never reached the server")
+	}
+	cancel()
+	// Shutdown must wait for this live request rather than dropping its stream
+	// or returning before the handler is allowed to finish.
+	select {
+	case err := <-serveErr:
+		releaseOnce.Do(func() { close(release) })
+		t.Fatalf("server returned before active request drained: %v", err)
+	case <-time.After(75 * time.Millisecond):
+	}
+	releaseOnce.Do(func() { close(release) })
+
+	select {
+	case err := <-clientErr:
+		if err != nil {
+			t.Fatalf("active request did not drain successfully: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("active request did not finish")
+	}
+	select {
+	case err := <-serveErr:
+		if err != nil {
+			t.Fatalf("serveEngineHTTP shutdown: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server did not stop after active request drained")
+	}
+}
+
+type testShutdownDependency struct {
+	calls int
+	err   error
+}
+
+func (d *testShutdownDependency) Shutdown(context.Context) error {
+	d.calls++
+	return d.err
+}
+
+type testCloseDependency struct{ calls int }
+
+func (d *testCloseDependency) Close() { d.calls++ }
+
+func TestShutdownEngineDependenciesUsesGracefulHookBeforeCloseFallback(t *testing.T) {
+	wantErr := errors.New("flush audit")
+	shutdowner := &testShutdownDependency{err: wantErr}
+	closer := &testCloseDependency{}
+	if err := shutdownEngineDependencies(context.Background(), shutdowner, closer); !errors.Is(err, wantErr) {
+		t.Fatalf("shutdownEngineDependencies error = %v, want %v", err, wantErr)
+	}
+	if shutdowner.calls != 1 {
+		t.Fatalf("Shutdown calls = %d, want 1", shutdowner.calls)
+	}
+	if closer.calls != 1 {
+		t.Fatalf("Close calls = %d, want 1", closer.calls)
+	}
+}
 
 func TestAdminTokenFromEnv(t *testing.T) {
 	t.Run("Synaxis name has precedence", func(t *testing.T) {
@@ -35,6 +147,29 @@ func TestAdminTokenFromEnv(t *testing.T) {
 			t.Fatalf("adminTokenFromEnv() = %q, want empty", got)
 		}
 	})
+}
+
+func TestSkillDraftGeneratorFromEnvFailsClosedUntilFullyConfigured(t *testing.T) {
+	t.Setenv("ENGINE_SKILL_DRAFT_OPENAI_URL", "")
+	t.Setenv("ENGINE_SKILL_DRAFT_OPENAI_API_KEY", "")
+	t.Setenv("ENGINE_SKILL_DRAFT_OPENAI_MODEL", "")
+	if generator, err := skillDraftGeneratorFromEnv(false); err != nil || generator != nil {
+		t.Fatalf("unset generator=%T err=%v, want nil nil", generator, err)
+	}
+
+	t.Setenv("ENGINE_SKILL_DRAFT_OPENAI_URL", "https://api.example/v1")
+	if _, err := skillDraftGeneratorFromEnv(false); err == nil {
+		t.Fatal("partially configured generator was accepted")
+	}
+
+	t.Setenv("ENGINE_SKILL_DRAFT_OPENAI_API_KEY", "test-server-only-key")
+	if generator, err := skillDraftGeneratorFromEnv(false); err != nil || generator == nil {
+		t.Fatalf("fully configured generator=%T err=%v", generator, err)
+	}
+
+	if _, err := skillDraftGeneratorFromEnv(true); err == nil {
+		t.Fatal("hosted Engine accepted a direct provider configuration")
+	}
 }
 
 func TestLegacyAdminEnabledFromEnv(t *testing.T) {
@@ -101,6 +236,8 @@ func clearStartupSecurityEnv(t *testing.T) {
 		"SYNAXIS_ENABLE_LEGACY_ADMIN",
 		"ENGINE_ENABLE_LEGACY_ADMIN",
 		"SYNAXIS_WORKSPACE_ID",
+		"ENGINE_ENCRYPTION_KEY",
+		"ENGINE_TRUST_PROXY_HEADERS",
 	} {
 		t.Setenv(key, "")
 	}
@@ -185,6 +322,118 @@ func TestStartupSecurityConfigHostedModeRemainsMachineOnly(t *testing.T) {
 	if !config.hosted || config.localAdminAuth || config.legacyAdmin {
 		t.Fatalf("hosted password routes local=%v legacy=%v, want both disabled", config.localAdminAuth, config.legacyAdmin)
 	}
+}
+
+func TestStartupSecurityConfigTrustProxyHeaders(t *testing.T) {
+	t.Run("defaults off", func(t *testing.T) {
+		clearStartupSecurityEnv(t)
+		t.Setenv("ENGINE_PASSWORD", "unique-self-hosted-password")
+		t.Setenv("ENGINE_SECRET", "unique-self-hosted-secret")
+		config, err := startupSecurityConfigFromEnv()
+		if err != nil {
+			t.Fatalf("startupSecurityConfigFromEnv(): %v", err)
+		}
+		if config.trustProxyHeaders {
+			t.Fatal("trustProxyHeaders defaulted on; want off unless explicitly opted in")
+		}
+	})
+
+	t.Run("explicit opt-in is honored", func(t *testing.T) {
+		clearStartupSecurityEnv(t)
+		t.Setenv("ENGINE_PASSWORD", "unique-self-hosted-password")
+		t.Setenv("ENGINE_SECRET", "unique-self-hosted-secret")
+		t.Setenv("ENGINE_TRUST_PROXY_HEADERS", "true")
+		config, err := startupSecurityConfigFromEnv()
+		if err != nil {
+			t.Fatalf("startupSecurityConfigFromEnv(): %v", err)
+		}
+		if !config.trustProxyHeaders {
+			t.Fatal("explicit ENGINE_TRUST_PROXY_HEADERS=true was not honored")
+		}
+	})
+
+	t.Run("invalid value is rejected", func(t *testing.T) {
+		clearStartupSecurityEnv(t)
+		t.Setenv("ENGINE_PASSWORD", "unique-self-hosted-password")
+		t.Setenv("ENGINE_SECRET", "unique-self-hosted-secret")
+		t.Setenv("ENGINE_TRUST_PROXY_HEADERS", "sometimes")
+		if _, err := startupSecurityConfigFromEnv(); err == nil {
+			t.Fatal("invalid ENGINE_TRUST_PROXY_HEADERS value was accepted")
+		}
+	})
+}
+
+func TestEncryptionKeyFromEnvRequiresHostedKey(t *testing.T) {
+	t.Run("self-hosted may omit encryption for local development", func(t *testing.T) {
+		t.Setenv("ENGINE_ENCRYPTION_KEY", "")
+		key, err := encryptionKeyFromEnv(false)
+		if err != nil || key != "" {
+			t.Fatalf("encryptionKeyFromEnv(false) = %q, %v", key, err)
+		}
+	})
+	t.Run("hosted workspace rejects a missing or whitespace key", func(t *testing.T) {
+		for _, value := range []string{"", "  \t"} {
+			t.Setenv("ENGINE_ENCRYPTION_KEY", value)
+			if _, err := encryptionKeyFromEnv(true); err == nil {
+				t.Fatalf("hosted workspace accepted encryption key %q", value)
+			}
+		}
+	})
+	t.Run("hosted workspace retains a configured key for validation", func(t *testing.T) {
+		key := base64.StdEncoding.EncodeToString(make([]byte, 32))
+		t.Setenv("ENGINE_ENCRYPTION_KEY", key)
+		got, err := encryptionKeyFromEnv(true)
+		if err != nil || got != key {
+			t.Fatalf("encryptionKeyFromEnv(true) = %q, %v", got, err)
+		}
+	})
+}
+
+type fakeEncryptionStore struct {
+	cipher       *engine.Cipher
+	migrationErr error
+}
+
+func (s *fakeEncryptionStore) SetCipher(cipher *engine.Cipher) { s.cipher = cipher }
+func (s *fakeEncryptionStore) EncryptExisting(context.Context) error {
+	return s.migrationErr
+}
+
+func TestConfigureStoreEncryptionFailsClosedOnMigrationFailure(t *testing.T) {
+	key := base64.StdEncoding.EncodeToString(make([]byte, 32))
+	t.Run("no key keeps explicitly local storage plaintext", func(t *testing.T) {
+		enabled, err := configureStoreEncryption(context.Background(), nil, "")
+		if err != nil || enabled {
+			t.Fatalf("configure empty key = enabled=%v err=%v", enabled, err)
+		}
+	})
+	t.Run("invalid key is rejected before a store is mutated", func(t *testing.T) {
+		store := &fakeEncryptionStore{}
+		if _, err := configureStoreEncryption(context.Background(), store, "not-a-key"); err == nil {
+			t.Fatal("invalid encryption key was accepted")
+		}
+		if store.cipher != nil {
+			t.Fatal("invalid key configured a cipher on the store")
+		}
+	})
+	t.Run("migration failure is returned to the startup caller", func(t *testing.T) {
+		migrationErr := errors.New("corrupt encrypted row")
+		store := &fakeEncryptionStore{migrationErr: migrationErr}
+		enabled, err := configureStoreEncryption(context.Background(), store, key)
+		if enabled || !errors.Is(err, migrationErr) {
+			t.Fatalf("configure migration error = enabled=%v err=%v", enabled, err)
+		}
+		if store.cipher == nil {
+			t.Fatal("configured encryption key was not installed before migration")
+		}
+	})
+	t.Run("successful migration enables encryption", func(t *testing.T) {
+		store := &fakeEncryptionStore{}
+		enabled, err := configureStoreEncryption(context.Background(), store, key)
+		if err != nil || !enabled || store.cipher == nil {
+			t.Fatalf("configure success = enabled=%v cipher=%v err=%v", enabled, store.cipher, err)
+		}
+	})
 }
 
 func TestPasswordAdminRoutesAreAbsentWithoutExplicitOptIn(t *testing.T) {
@@ -335,4 +584,80 @@ func TestHostedUsageGateFromEnvIsOptionalAndFailClosed(t *testing.T) {
 			t.Fatal("hosted mode accepted a store without durable usage support")
 		}
 	})
+}
+
+// TestEnginePingRecordsAuditRow proves the built-in ping — which bypasses the
+// gateway dispatch boundary — still leaves exactly one audit row per call.
+func TestEnginePingRecordsAuditRow(t *testing.T) {
+	fs, err := engine.LoadFileStore(t.TempDir() + "/accounts.json")
+	if err != nil {
+		t.Fatalf("LoadFileStore: %v", err)
+	}
+	s := server.NewMCPServer("test", "0.0.0", server.WithToolCapabilities(true))
+	registerBuiltinTools(s, fs, fs)
+
+	req, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{"name": "engine_ping", "arguments": map[string]any{}},
+	})
+	resp, err := json.Marshal(s.HandleMessage(context.Background(), req))
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+	if !strings.Contains(string(resp), "synaxis-engine ok") {
+		t.Fatalf("ping response = %s", resp)
+	}
+
+	calls, err := fs.RecentCalls(context.Background(), 100)
+	if err != nil {
+		t.Fatalf("RecentCalls: %v", err)
+	}
+	var pings []engine.CallRecord
+	for _, c := range calls {
+		if c.Tool == "engine_ping" {
+			pings = append(pings, c)
+		}
+	}
+	if len(pings) != 1 {
+		t.Fatalf("engine_ping audit rows = %d, want exactly one", len(pings))
+	}
+	if pings[0].Account != "engine" || !pings[0].OK || pings[0].TS.IsZero() {
+		t.Fatalf("engine_ping audit row = %+v", pings[0])
+	}
+
+	// A second ping records a second row: audit keeps pace with calls.
+	s.HandleMessage(context.Background(), req)
+	calls, err = fs.RecentCalls(context.Background(), 100)
+	if err != nil {
+		t.Fatalf("RecentCalls: %v", err)
+	}
+	count := 0
+	for _, c := range calls {
+		if c.Tool == "engine_ping" {
+			count++
+		}
+	}
+	if count != 2 {
+		t.Fatalf("engine_ping audit rows after two pings = %d, want 2", count)
+	}
+}
+
+// TestEnginePingWithoutAuditSinkStaysHealthy: a store without the AuditSink
+// facet must not break the ping — audit is fire-and-forget, never on the
+// request's critical path.
+func TestEnginePingWithoutAuditSinkStaysHealthy(t *testing.T) {
+	s := server.NewMCPServer("test", "0.0.0", server.WithToolCapabilities(true))
+	registerBuiltinTools(s, nil, nil)
+
+	req, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{"name": "engine_ping", "arguments": map[string]any{}},
+	})
+	resp, err := json.Marshal(s.HandleMessage(context.Background(), req))
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+	if !strings.Contains(string(resp), "synaxis-engine ok") {
+		t.Fatalf("ping without audit sink response = %s", resp)
+	}
 }

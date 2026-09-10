@@ -37,6 +37,14 @@ type pendingConnect struct {
 	created                          time.Time
 	accountExisted                   bool
 	accountPrecondition              OAuthCompletionPrecondition
+	staticClient                     bool
+}
+
+func (p *pendingConnect) persistedScope() string {
+	if p != nil && p.staticClient {
+		return p.scope
+	}
+	return ""
 }
 
 // StaticCreds carries pre-registered OAuth app credentials for the
@@ -49,6 +57,7 @@ type StaticCreds struct {
 }
 
 const gmailMCPURL = "https://gmailmcp.googleapis.com/mcp/v1"
+const slackMCPURL = "https://mcp.slack.com/mcp"
 
 // effectiveStaticCreds preserves a pre-registered OAuth client across a
 // reauthorization. Static-client accounts persist their client ID, optional
@@ -86,13 +95,23 @@ func isGmailMCPURL(upstreamURL string) bool {
 	return strings.TrimRight(strings.TrimSpace(upstreamURL), "/") == gmailMCPURL
 }
 
+func isSlackMCPURL(upstreamURL string) bool {
+	return strings.TrimRight(strings.TrimSpace(upstreamURL), "/") == slackMCPURL
+}
+
 // validateStaticCredsForUpstream enforces requirements that are specific to a
-// first-party provider's officially supported OAuth client type. Google
-// documents Gmail's MCP connection as a confidential Web OAuth client, so an
-// empty secret must not start a flow that cannot exchange its code.
+// first-party provider's officially supported OAuth client type. Google and
+// Slack both document their MCP connection as a confidential OAuth client, so
+// an empty secret must not start a flow that cannot exchange its code.
 func validateStaticCredsForUpstream(sc *StaticCreds, upstreamURL string) error {
-	if sc != nil && isGmailMCPURL(upstreamURL) && strings.TrimSpace(sc.ClientSecret) == "" {
+	if sc == nil || strings.TrimSpace(sc.ClientSecret) != "" {
+		return nil
+	}
+	switch {
+	case isGmailMCPURL(upstreamURL):
 		return errors.New("clientSecret is required for Gmail's pre-registered OAuth app")
+	case isSlackMCPURL(upstreamURL):
+		return errors.New("clientSecret is required for Slack's pre-registered OAuth app")
 	}
 	return nil
 }
@@ -114,7 +133,7 @@ func NewConnector(store AccountStore, gw *Gateway) *Connector {
 
 // StartConnect: discovery + PKCE for an OAuth upstream; returns the authorize
 // URL the browser should visit. sc==nil selects the DCR path (RFC 7591 Register
-// + no scope). sc!=nil selects the static-client path (pre-registered app):
+// + the authoritative scope discovered from the upstream). sc!=nil selects the static-client path (pre-registered app):
 // the supplied client_id/client_secret are used directly (no Register call) and
 // sc.Scope is requested. Runtime behavior (refresh, dispatch) is identical.
 func (c *Connector) StartConnect(ctx context.Context, name, label, group, url, redirectURI string, sc *StaticCreds) (string, error) {
@@ -139,7 +158,7 @@ func (c *Connector) StartConnect(ctx context.Context, name, label, group, url, r
 		return "", fmt.Errorf("discover: %w", err)
 	}
 	var ci *upstreamoauth.ClientInfo
-	scope := ""
+	scope := meta.Scope
 	var authorizationExtras map[string]string
 	if sc != nil {
 		ci, err = upstreamoauth.StaticClient(sc.ClientID, sc.ClientSecret)
@@ -149,7 +168,7 @@ func (c *Connector) StartConnect(ctx context.Context, name, label, group, url, r
 		scope = sc.Scope
 		authorizationExtras = sc.AuthorizationExtras
 	} else {
-		ci, err = upstreamoauth.Register(ctx, meta.RegistrationEndpoint, redirectURI)
+		ci, err = upstreamoauth.RegisterDiscoveredClient(ctx, meta, redirectURI)
 		if err != nil {
 			return "", fmt.Errorf("register (DCR): %w", err)
 		}
@@ -169,6 +188,7 @@ func (c *Connector) StartConnect(ctx context.Context, name, label, group, url, r
 		clientID: ci.ClientID, clientSecret: ci.ClientSecret, verifier: pkce.Verifier,
 		scope: scope, meta: meta, redirectURI: redirectURI, created: time.Now(),
 		accountExisted: accountExisted, accountPrecondition: accountPrecondition,
+		staticClient: sc != nil,
 	}
 	c.mu.Unlock()
 	return upstreamoauth.AuthorizeURL(meta, ci.ClientID, redirectURI, pkce.Challenge, state, scope, authorizationExtras), nil
@@ -199,7 +219,7 @@ func (c *Connector) FinishConnect(ctx context.Context, state, code string) (stri
 		Name: p.name, URL: p.url, AuthMode: "oauth",
 		ClientID: p.clientID, ClientSecret: p.clientSecret,
 		AccessToken: tokens.AccessToken, RefreshToken: tokens.RefreshToken,
-		TokenEndpoint: p.meta.TokenEndpoint, Resource: p.meta.Resource, Scope: p.scope,
+		TokenEndpoint: p.meta.TokenEndpoint, Resource: p.meta.Resource, Scope: p.persistedScope(),
 	}
 	var (
 		persisted  Account
@@ -209,7 +229,10 @@ func (c *Connector) FinishConnect(ctx context.Context, state, code string) (stri
 		// Credential-only completion is atomic in the store: labels and tool
 		// policy changed during consent are preserved, while deletion,
 		// replacement, ownership moves, and URL retargeting reject the callback.
-		persisted, persistErr = c.store.CompleteOAuth(ctx, p.accountPrecondition, completion)
+		// CompleteOAuthLocked additionally serializes against any in-flight
+		// token refresh for this account, so a stale refresh cannot overwrite
+		// the freshly-authorized credentials.
+		persisted, persistErr = c.gw.CompleteOAuthLocked(ctx, p.accountPrecondition, completion)
 	} else {
 		// Legacy admin can start OAuth before an account row exists. Create (not
 		// Upsert) ensures a concurrent account cannot be overwritten.

@@ -44,6 +44,13 @@ type PendingCall struct {
 	DecidedAt    *time.Time     `json:"decided_at,omitempty"`
 	DecidedBy    string         `json:"decided_by,omitempty"`
 	DecisionNote string         `json:"decision_note,omitempty"`
+	// Kind is "read" or "write", captured from the tool's annotations (or the
+	// readOnlyTool name heuristic) at park time — the live mcp.Tool is not
+	// necessarily reachable any more once the call is decided or has timed
+	// out, so this is persisted rather than recomputed. Historical rows
+	// logged before this field existed read back as "" (mobile-notifications
+	// MOBI-13/MOBI-14: feeds the structured webhook/Slack/push "kind" field).
+	Kind string `json:"kind,omitempty"`
 
 	// AccountIncarnationID, AccountRevision, and ConnectionNamespaceID bind a
 	// parked request to the exact credential ownership generation that presented

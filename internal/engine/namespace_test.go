@@ -757,6 +757,61 @@ func TestPortableConfigImportsNamespacesWithoutSecrets(t *testing.T) {
 	}
 }
 
+// TestPortableConfigImportRejectsReservedSlug guards the third creation path:
+// /api/connectors and /api/endpoints already reject the reserved "clients"
+// slug (see TestReservedEndpointSlugRejected), but config import reaches the
+// same Gateway.CreateNamespace/UpsertConnector calls through a different
+// handler and must reject it too, or an admin could bypass the other two
+// endpoints by importing a config with "slug":"clients" and reintroduce the
+// /mcp/clients routing collision.
+func TestPortableConfigImportRejectsReservedSlug(t *testing.T) {
+	mux, token, g := newConnectorConsole(t, map[string][]string{
+		"linear": {"get_issue"},
+	})
+	ctx := context.Background()
+
+	namespacePayload := `{
+	  "version":1,
+	  "accounts":[
+	    {"name":"notion_work","displayName":"Notion Work","url":"https://notion.example/mcp","readOnly":false}
+	  ],
+	  "connectors":[],
+	  "namespaces":[
+	    {"slug":"clients","label":"Clients","members":["linear"]}
+	  ]
+	}`
+	rec, got := doJSON(t, mux, token, http.MethodPost, "/api/config/import", namespacePayload)
+	if msg, _ := got["error"].(string); rec.Code != http.StatusBadRequest || msg != "that slug is reserved" {
+		t.Fatalf("namespace import with reserved slug = %d %v, want 400 reserved", rec.Code, got)
+	}
+	nsStore := g.store.(NamespaceStore)
+	if _, ok := nsStore.Namespace(ctx, "clients"); ok {
+		t.Fatal("reserved-slug namespace import must not create the namespace")
+	}
+	// The reserved slug is caught in the pre-validation pass, before the apply
+	// loop runs, so nothing else in the same payload should be applied either.
+	if _, ok := g.store.Account("notion_work"); ok {
+		t.Fatal("rejected reserved-slug import must not apply other resources in the same payload")
+	}
+
+	connectorPayload := `{
+	  "version":1,
+	  "accounts":[],
+	  "connectors":[
+	    {"slug":"clients","label":"Clients","tools":{"linear":["get_issue"]}}
+	  ],
+	  "namespaces":[]
+	}`
+	rec, got = doJSON(t, mux, token, http.MethodPost, "/api/config/import", connectorPayload)
+	if msg, _ := got["error"].(string); rec.Code != http.StatusBadRequest || msg != "that slug is reserved" {
+		t.Fatalf("connector import with reserved slug = %d %v, want 400 reserved", rec.Code, got)
+	}
+	connectorStore := g.store.(ConnectorStore)
+	if _, ok := connectorStore.VirtualConnector(ctx, "clients"); ok {
+		t.Fatal("reserved-slug connector import must not create the connector")
+	}
+}
+
 func TestAccountCreatePrefersToolPrefixAndRejectsConflictingLegacyAlias(t *testing.T) {
 	mux, token, _ := newConnectorConsole(t, map[string][]string{})
 	rec, got := doJSON(t, mux, token, http.MethodPost, "/api/servers",

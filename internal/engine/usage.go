@@ -46,6 +46,15 @@ const (
 	StarterRateBurst      int64 = 10
 	StarterMaxCallSeconds int64 = 120
 
+	// Hosted Platform-signed grants may define limits above the legacy Starter
+	// defaults. These are Engine safety ceilings, deliberately independent of
+	// the Platform's commercial catalogue. They bound instantaneous resource
+	// use without preventing the Platform from evolving named plans.
+	maxUsageGrantConcurrency    int64 = 16
+	maxUsageGrantRatePerMinute  int64 = 600
+	maxUsageGrantBurst          int64 = 120
+	maxUsageGrantMaxCallSeconds int64 = 900
+
 	usageGrantIssuer   = "synaxis-platform"
 	usageGrantAudience = "synaxis-engine"
 	// legacyUsageGrantPlan remains useful to compatibility tests and existing
@@ -88,16 +97,17 @@ type UsageLimits struct {
 // usageGrantClaims is the compact JWT/JWS payload signed by Platform. Claim
 // names are snake_case to keep the wire contract independent of Go's API DTOs.
 type usageGrantClaims struct {
-	Issuer           string `json:"iss"`
-	Audience         string `json:"aud"`
-	WorkspaceID      string `json:"workspace_id"`
-	EngineGeneration int64  `json:"engine_generation"`
-	PeriodStart      string `json:"period_start"`
-	PeriodEnd        string `json:"period_end"`
-	Revision         int64  `json:"revision"`
-	PlanID           string `json:"plan_id"`
-	Status           string `json:"status"`
-	Limits           struct {
+	SupersedesPeriodStart string `json:"supersedes_period_start,omitempty"`
+	Issuer                string `json:"iss"`
+	Audience              string `json:"aud"`
+	WorkspaceID           string `json:"workspace_id"`
+	EngineGeneration      int64  `json:"engine_generation"`
+	PeriodStart           string `json:"period_start"`
+	PeriodEnd             string `json:"period_end"`
+	Revision              int64  `json:"revision"`
+	PlanID                string `json:"plan_id"`
+	Status                string `json:"status"`
+	Limits                struct {
 		Calls          int64 `json:"calls"`
 		RuntimeSeconds int64 `json:"runtime_seconds"`
 		TransferBytes  int64 `json:"transfer_bytes"`
@@ -115,16 +125,17 @@ type usageGrantClaims struct {
 // policy fields, rather than the digest, bind a revision because Platform
 // periodically re-signs that revision with a later short-lived expiry.
 type UsageGrant struct {
-	Identity    UsageIdentity
-	PeriodStart time.Time
-	PeriodEnd   time.Time
-	Revision    int64
-	PlanID      string
-	Status      string
-	Limits      UsageLimits
-	IssuedAt    time.Time
-	ExpiresAt   time.Time
-	Digest      string
+	SupersedesPeriodStart *time.Time
+	Identity              UsageIdentity
+	PeriodStart           time.Time
+	PeriodEnd             time.Time
+	Revision              int64
+	PlanID                string
+	Status                string
+	Limits                UsageLimits
+	IssuedAt              time.Time
+	ExpiresAt             time.Time
+	Digest                string
 }
 
 // UsagePeriod is the store's authoritative aggregate. RuntimeMilliseconds is
@@ -470,8 +481,17 @@ func verifyUsageGrant(
 		return UsageGrant{}, err
 	}
 	digest := sha256.Sum256([]byte(assertion))
+	var supersedes *time.Time
+	if claims.SupersedesPeriodStart != "" {
+		previous, err := time.Parse(time.RFC3339Nano, claims.SupersedesPeriodStart)
+		if err != nil || !previous.Before(start) {
+			return UsageGrant{}, errors.New("usage grant prior period is invalid")
+		}
+		supersedes = &previous
+	}
 	return UsageGrant{
-		Identity: identity, PeriodStart: start.UTC(), PeriodEnd: end.UTC(),
+		SupersedesPeriodStart: supersedes,
+		Identity:              identity, PeriodStart: start.UTC(), PeriodEnd: end.UTC(),
 		Revision: claims.Revision, PlanID: claims.PlanID, Status: claims.Status,
 		Limits: limits, IssuedAt: issuedAt.UTC(), ExpiresAt: expiresAt.UTC(),
 		Digest: hex.EncodeToString(digest[:]),
@@ -486,16 +506,16 @@ func validateUsageLimits(limits UsageLimits) error {
 		return fmt.Errorf("usage grant runtime_seconds must be between 0 and %d", maxRuntimeGrantSeconds)
 	case limits.TransferBytes < 0:
 		return errors.New("usage grant transfer_bytes cannot be negative")
-	case limits.Concurrency <= 0 || limits.Concurrency > StarterMaxConcurrency:
-		return fmt.Errorf("usage grant concurrency must be between 1 and %d", StarterMaxConcurrency)
-	case limits.RatePerMinute <= 0 || limits.RatePerMinute > StarterRatePerMinute:
-		return fmt.Errorf("usage grant rate_per_minute must be between 1 and %d", StarterRatePerMinute)
-	case limits.Burst <= 0 || limits.Burst > StarterRateBurst:
-		return fmt.Errorf("usage grant burst must be between 1 and %d", StarterRateBurst)
+	case limits.Concurrency <= 0 || limits.Concurrency > maxUsageGrantConcurrency:
+		return fmt.Errorf("usage grant concurrency must be between 1 and %d", maxUsageGrantConcurrency)
+	case limits.RatePerMinute <= 0 || limits.RatePerMinute > maxUsageGrantRatePerMinute:
+		return fmt.Errorf("usage grant rate_per_minute must be between 1 and %d", maxUsageGrantRatePerMinute)
+	case limits.Burst <= 0 || limits.Burst > maxUsageGrantBurst:
+		return fmt.Errorf("usage grant burst must be between 1 and %d", maxUsageGrantBurst)
 	case limits.Burst > limits.RatePerMinute:
 		return errors.New("usage grant burst cannot exceed rate_per_minute")
-	case limits.MaxCallSeconds <= 0 || limits.MaxCallSeconds > StarterMaxCallSeconds:
-		return fmt.Errorf("usage grant max_call_seconds must be between 1 and %d", StarterMaxCallSeconds)
+	case limits.MaxCallSeconds <= 0 || limits.MaxCallSeconds > maxUsageGrantMaxCallSeconds:
+		return fmt.Errorf("usage grant max_call_seconds must be between 1 and %d", maxUsageGrantMaxCallSeconds)
 	}
 	return nil
 }

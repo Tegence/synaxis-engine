@@ -193,6 +193,20 @@ WHERE period_start=$1`,
 			return err
 		}
 	case errors.Is(err, pgx.ErrNoRows):
+		if grant.SupersedesPeriodStart != nil {
+			if !grant.SupersedesPeriodStart.Before(grant.PeriodStart) {
+				return errors.New("invalid prior usage period")
+			}
+			// A verified control-plane grant may close one explicitly named
+			// prior period. Keep all counters and in-flight reservations. The
+			// regular overlap and revision checks below still fail closed for
+			// any other period; the transaction rolls back the closure on error.
+			if _, err := tx.Exec(ctx, `UPDATE narthex_usage_periods SET period_end=$2,grant_expires_at=LEAST(grant_expires_at,$2),updated_at=now()
+			 WHERE period_start=$1 AND period_end>$2 AND workspace_id=$3 AND engine_generation<=$4 AND revision<$5`,
+				*grant.SupersedesPeriodStart, grant.PeriodStart, grant.Identity.WorkspaceID, grant.Identity.EngineGeneration, grant.Revision); err != nil {
+				return err
+			}
+		}
 		var overlap bool
 		if err := tx.QueryRow(ctx, `
 SELECT EXISTS (

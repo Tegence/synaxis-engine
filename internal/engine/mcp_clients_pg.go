@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS narthex_mcp_clients (
     name            TEXT NOT NULL,
     subject         TEXT NOT NULL,
     oauth_client_id TEXT NOT NULL DEFAULT '',
+	runtime_attestor_public_key TEXT NOT NULL DEFAULT '',
     status          TEXT NOT NULL DEFAULT 'active',
     epoch           TEXT NOT NULL,
     revision        BIGINT NOT NULL DEFAULT 1 CHECK (revision >= 1),
@@ -30,6 +31,10 @@ CREATE TABLE IF NOT EXISTS narthex_mcp_clients (
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     revoked_at      TIMESTAMPTZ,
     revoked_by      TEXT NOT NULL DEFAULT '',
+    agent_profile_id            TEXT NOT NULL DEFAULT '',
+    agent_profile_revision      BIGINT NOT NULL DEFAULT 0,
+    agent_profile_policy_digest TEXT NOT NULL DEFAULT '',
+    agent_profile_bound_at      TIMESTAMPTZ,
     CONSTRAINT narthex_mcp_clients_status_check CHECK (status IN ('active','revoked'))
 );
 CREATE TABLE IF NOT EXISTS narthex_mcp_client_namespaces (
@@ -45,6 +50,7 @@ CREATE INDEX IF NOT EXISTS narthex_mcp_clients_subject_status_idx
 CREATE INDEX IF NOT EXISTS narthex_mcp_client_namespaces_namespace_idx
     ON narthex_mcp_client_namespaces (connection_namespace_id, client_id);
 ALTER TABLE narthex_mcp_clients ADD COLUMN IF NOT EXISTS oauth_client_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE narthex_mcp_clients ADD COLUMN IF NOT EXISTS runtime_attestor_public_key TEXT NOT NULL DEFAULT '';
 ALTER TABLE narthex_mcp_clients ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active';
 ALTER TABLE narthex_mcp_clients ADD COLUMN IF NOT EXISTS epoch TEXT NOT NULL DEFAULT '';
 ALTER TABLE narthex_mcp_clients ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;
@@ -53,6 +59,13 @@ ALTER TABLE narthex_mcp_clients ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ 
 ALTER TABLE narthex_mcp_clients ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
 ALTER TABLE narthex_mcp_clients ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ;
 ALTER TABLE narthex_mcp_clients ADD COLUMN IF NOT EXISTS revoked_by TEXT NOT NULL DEFAULT '';
+-- The agent profile binding is an opaque, revisioned reference installed by a
+-- hosting control plane. Either every column is blank (unbound) or all four
+-- describe one binding with a canonical SHA-256 policy digest.
+ALTER TABLE narthex_mcp_clients ADD COLUMN IF NOT EXISTS agent_profile_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE narthex_mcp_clients ADD COLUMN IF NOT EXISTS agent_profile_revision BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE narthex_mcp_clients ADD COLUMN IF NOT EXISTS agent_profile_policy_digest TEXT NOT NULL DEFAULT '';
+ALTER TABLE narthex_mcp_clients ADD COLUMN IF NOT EXISTS agent_profile_bound_at TIMESTAMPTZ;
 -- A revoked client retains its history but must not permanently prevent
 -- deleting an otherwise-empty credential folder. Active grants are rejected
 -- by the application before delete; cascade only prunes inert grant rows.
@@ -75,13 +88,34 @@ BEGIN
             ADD CONSTRAINT narthex_mcp_clients_status_check
             CHECK (status IN ('active','revoked'));
     END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'narthex_mcp_clients_agent_profile_check'
+          AND conrelid = 'narthex_mcp_clients'::regclass
+    ) THEN
+        ALTER TABLE narthex_mcp_clients
+            ADD CONSTRAINT narthex_mcp_clients_agent_profile_check
+            CHECK (
+                (agent_profile_id = '' AND agent_profile_revision = 0
+                    AND agent_profile_policy_digest = '' AND agent_profile_bound_at IS NULL)
+                OR (agent_profile_id <> '' AND agent_profile_revision >= 1
+                    AND agent_profile_policy_digest ~ '^[a-f0-9]{64}$' AND agent_profile_bound_at IS NOT NULL)
+            );
+    END IF;
 END $$;`
 
 var _ MCPClientStore = (*PgStore)(nil)
 
-const mcpClientSelect = `
-SELECT c.id,c.slug,c.name,c.subject,c.oauth_client_id,c.status,c.epoch,c.revision,
+// mcpClientColumns is the one authoritative column list for the registry
+// row. Every read (grouped list, single row, locked row) scans these columns in
+// this order through scanMCPClientColumns so a new column cannot be added to
+// one path and silently dropped from another.
+const mcpClientColumns = `c.id,c.slug,c.name,c.subject,c.oauth_client_id,c.runtime_attestor_public_key,c.status,c.epoch,c.revision,
        c.created_by,c.created_at,c.updated_at,c.revoked_at,c.revoked_by,
+       c.agent_profile_id,c.agent_profile_revision,c.agent_profile_policy_digest,c.agent_profile_bound_at`
+
+const mcpClientSelect = `
+SELECT ` + mcpClientColumns + `,
        COALESCE(
            array_agg(g.connection_namespace_id ORDER BY g.connection_namespace_id)
                FILTER (WHERE g.connection_namespace_id IS NOT NULL),
@@ -90,21 +124,65 @@ SELECT c.id,c.slug,c.name,c.subject,c.oauth_client_id,c.status,c.epoch,c.revisio
 FROM narthex_mcp_clients c
 LEFT JOIN narthex_mcp_client_namespaces g ON g.client_id=c.id`
 
+const mcpClientGroupBy = `
+GROUP BY ` + mcpClientColumns
+
 type mcpClientQueryer interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
-func scanMCPClient(row pgx.Row) (MCPClient, error) {
+// mcpClientProfileColumns is the flat relational form of the optional
+// binding. Scan targets are collected here and folded back into the pointer
+// after the row is read.
+type mcpClientProfileColumns struct {
+	profileID       string
+	profileRevision int64
+	policyDigest    string
+	boundAt         *time.Time
+}
+
+func (p mcpClientProfileColumns) binding() *MCPClientProfileBinding {
+	if p.profileID == "" && p.profileRevision == 0 && p.policyDigest == "" && p.boundAt == nil {
+		return nil
+	}
+	binding := MCPClientProfileBinding{ProfileID: p.profileID, ProfileRevision: p.profileRevision, PolicyDigest: p.policyDigest}
+	if p.boundAt != nil {
+		binding.BoundAt = p.boundAt.UTC()
+	}
+	return &binding
+}
+
+func mcpClientProfileColumnValues(binding *MCPClientProfileBinding) (string, int64, string, *time.Time) {
+	if binding == nil {
+		return "", 0, "", nil
+	}
+	at := binding.BoundAt.UTC()
+	return binding.ProfileID, binding.ProfileRevision, binding.PolicyDigest, &at
+}
+
+func scanMCPClientColumns(row pgx.Row, extra ...any) (MCPClient, error) {
 	var (
-		client       MCPClient
-		namespaceIDs []string
+		client  MCPClient
+		profile mcpClientProfileColumns
 	)
-	if err := row.Scan(
-		&client.ID, &client.Slug, &client.Name, &client.Subject, &client.OAuthClientID,
+	targets := []any{
+		&client.ID, &client.Slug, &client.Name, &client.Subject, &client.OAuthClientID, &client.RuntimeAttestorPublicKey,
 		&client.Status, &client.Epoch, &client.Revision, &client.CreatedBy,
 		&client.CreatedAt, &client.UpdatedAt, &client.RevokedAt, &client.RevokedBy,
-		&namespaceIDs,
-	); err != nil {
+		&profile.profileID, &profile.profileRevision, &profile.policyDigest, &profile.boundAt,
+	}
+	targets = append(targets, extra...)
+	if err := row.Scan(targets...); err != nil {
+		return MCPClient{}, err
+	}
+	client.AgentProfileBinding = profile.binding()
+	return client, nil
+}
+
+func scanMCPClient(row pgx.Row) (MCPClient, error) {
+	var namespaceIDs []string
+	client, err := scanMCPClientColumns(row, &namespaceIDs)
+	if err != nil {
 		return MCPClient{}, err
 	}
 	client.ConnectionNamespaceIDs = namespaceIDs
@@ -116,25 +194,17 @@ func scanMCPClient(row pgx.Row) (MCPClient, error) {
 
 func loadMCPClient(ctx context.Context, q mcpClientQueryer, id string) (MCPClient, error) {
 	return scanMCPClient(q.QueryRow(ctx, mcpClientSelect+`
-WHERE c.id=$1
-GROUP BY c.id,c.slug,c.name,c.subject,c.oauth_client_id,c.status,c.epoch,c.revision,
-         c.created_by,c.created_at,c.updated_at,c.revoked_at,c.revoked_by`, id))
+WHERE c.id=$1`+mcpClientGroupBy, id))
 }
 
 func loadMCPClientForUpdate(ctx context.Context, tx pgx.Tx, id string) (MCPClient, error) {
 	// Lock the parent row first. The second select gets a stable grant set in
 	// this transaction while all client mutations serialize on the row lock.
-	var client MCPClient
-	err := tx.QueryRow(ctx, `
-SELECT id,slug,name,subject,oauth_client_id,status,epoch,revision,
-       created_by,created_at,updated_at,revoked_at,revoked_by
-FROM narthex_mcp_clients
-WHERE id=$1
-FOR UPDATE`, id).Scan(
-		&client.ID, &client.Slug, &client.Name, &client.Subject, &client.OAuthClientID,
-		&client.Status, &client.Epoch, &client.Revision, &client.CreatedBy,
-		&client.CreatedAt, &client.UpdatedAt, &client.RevokedAt, &client.RevokedBy,
-	)
+	client, err := scanMCPClientColumns(tx.QueryRow(ctx, `
+SELECT `+mcpClientColumns+`
+FROM narthex_mcp_clients c
+WHERE c.id=$1
+FOR UPDATE`, id))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return MCPClient{}, ErrMCPClientNotFound
 	}
@@ -166,6 +236,17 @@ ORDER BY connection_namespace_id`, id)
 	return client, nil
 }
 
+const mcpClientRegistryLock = "mcp-client-registry"
+
+// lockMCPClientRegistryTx is the first lock for any transaction that can
+// change the durable client registry or the account/namespace membership it
+// projects. The canonical order is registry, account parents where needed,
+// client rows in ID order, then namespace advisory locks.
+func lockMCPClientRegistryTx(ctx context.Context, tx pgx.Tx) error {
+	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, mcpClientRegistryLock)
+	return err
+}
+
 func (s *PgStore) backfillMCPClients(ctx context.Context) error {
 	// This registry has no predecessor table to infer from. The small repair
 	// pass makes a pre-release/hand-authored table fail closed instead: empty
@@ -176,7 +257,10 @@ func (s *PgStore) backfillMCPClients(ctx context.Context) error {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	rows, err := tx.Query(ctx, `SELECT id FROM narthex_mcp_clients FOR UPDATE`)
+	if err := lockMCPClientRegistryTx(ctx, tx); err != nil {
+		return err
+	}
+	rows, err := tx.Query(ctx, `SELECT id FROM narthex_mcp_clients ORDER BY id FOR UPDATE`)
 	if err != nil {
 		return err
 	}
@@ -282,10 +366,9 @@ func lockMCPClientNamespacesTx(ctx context.Context, tx pgx.Tx, namespaceIDs []st
 
 // lockActiveMCPClientsForAccountMoveTx locks active registrations that could
 // gain or lose an account when it moves between the supplied namespaces. The
-// parent-row locks serialize an epoch rotation with client scope, OAuth, and
-// revoke mutations; the caller also takes namespace advisory locks before its
-// final call so a newly-created registration cannot slip between selection and
-// the account transition.
+// caller must already hold the client-registry lock. The parent-row locks then
+// serialize an epoch rotation with client OAuth and revoke mutations before
+// the caller takes namespace advisory locks.
 func lockActiveMCPClientsForAccountMoveTx(ctx context.Context, tx pgx.Tx, namespaceIDs []string) ([]MCPClient, error) {
 	namespaceIDs, err := normalizeMCPClientNamespaceIDs(namespaceIDs)
 	if err != nil {
@@ -342,12 +425,12 @@ FOR UPDATE`, namespaceIDs)
 
 // prepareMCPClientEpochRotationForAccountOwnershipChangeTx takes the same
 // deterministic locks used by an explicit account move before a legacy
-// whole-account write can publish a different ownership boundary. The first
-// client selection establishes the parent-row lock ordering; namespace
-// advisory locks then prevent a concurrently-created client registration from
-// slipping into either folder; the second selection returns the complete,
-// locked rotation set. Callers persist the account and rotate the returned
-// clients in the same transaction.
+// whole-account write can publish a different ownership boundary. The caller
+// must already hold the client-registry lock, which freezes store-managed
+// registration and scope membership while the client rows and then namespace
+// advisories are acquired. The second selection is a defensive final snapshot
+// of the locked rotation set. Callers persist the account and rotate the
+// returned clients in the same transaction.
 func prepareMCPClientEpochRotationForAccountOwnershipChangeTx(ctx context.Context, tx pgx.Tx, before, after Account) ([]MCPClient, error) {
 	if !accountOwnershipChanged(before, after) {
 		return nil, nil
@@ -411,9 +494,7 @@ SELECT EXISTS(
 // ---- PgStore: MCPClientStore ----
 
 func (s *PgStore) MCPClients(ctx context.Context) ([]MCPClient, error) {
-	rows, err := s.pool.Query(ctx, mcpClientSelect+`
-GROUP BY c.id,c.slug,c.name,c.subject,c.oauth_client_id,c.status,c.epoch,c.revision,
-         c.created_by,c.created_at,c.updated_at,c.revoked_at,c.revoked_by
+	rows, err := s.pool.Query(ctx, mcpClientSelect+mcpClientGroupBy+`
 ORDER BY c.slug,c.id`)
 	if err != nil {
 		return nil, err
@@ -432,9 +513,7 @@ ORDER BY c.slug,c.id`)
 
 func (s *PgStore) ActiveMCPClients(ctx context.Context) ([]MCPClient, error) {
 	rows, err := s.pool.Query(ctx, mcpClientSelect+`
-WHERE c.status='active'
-GROUP BY c.id,c.slug,c.name,c.subject,c.oauth_client_id,c.status,c.epoch,c.revision,
-         c.created_by,c.created_at,c.updated_at,c.revoked_at,c.revoked_by
+WHERE c.status='active'`+mcpClientGroupBy+`
 ORDER BY c.slug,c.id`)
 	if err != nil {
 		return nil, err
@@ -461,9 +540,7 @@ func (s *PgStore) MCPClient(ctx context.Context, id string) (MCPClient, bool) {
 
 func (s *PgStore) MCPClientBySlug(ctx context.Context, slug string) (MCPClient, bool) {
 	client, err := scanMCPClient(s.pool.QueryRow(ctx, mcpClientSelect+`
-WHERE c.slug=$1
-GROUP BY c.id,c.slug,c.name,c.subject,c.oauth_client_id,c.status,c.epoch,c.revision,
-         c.created_by,c.created_at,c.updated_at,c.revoked_at,c.revoked_by`, normalizeMCPClientSlug(slug)))
+WHERE c.slug=$1`+mcpClientGroupBy, normalizeMCPClientSlug(slug)))
 	if err != nil {
 		return MCPClient{}, false
 	}
@@ -487,9 +564,7 @@ func (s *PgStore) ActiveMCPClientByOAuthClientID(ctx context.Context, oauthClien
 		return MCPClient{}, false
 	}
 	client, err := scanMCPClient(s.pool.QueryRow(ctx, mcpClientSelect+`
-WHERE c.oauth_client_id=$1 AND c.status='active'
-GROUP BY c.id,c.slug,c.name,c.subject,c.oauth_client_id,c.status,c.epoch,c.revision,
-         c.created_by,c.created_at,c.updated_at,c.revoked_at,c.revoked_by`, oauthClientID))
+WHERE c.oauth_client_id=$1 AND c.status='active'`+mcpClientGroupBy, oauthClientID))
 	if err != nil {
 		return MCPClient{}, false
 	}
@@ -507,7 +582,7 @@ func (s *PgStore) CreateMCPClient(ctx context.Context, client MCPClient) (MCPCli
 	defer tx.Rollback(ctx)
 	// This inexpensive workspace-local lock serializes the active-record cap,
 	// slug suffix selection, and public OAuth-ID uniqueness across replicas.
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, "mcp-client-registry"); err != nil {
+	if err := lockMCPClientRegistryTx(ctx, tx); err != nil {
 		return MCPClient{}, err
 	}
 	var idExists bool
@@ -551,19 +626,31 @@ func (s *PgStore) CreateMCPClient(ctx context.Context, client MCPClient) (MCPCli
 	if active >= maxActiveMCPClients {
 		return MCPClient{}, ErrMCPClientLimit
 	}
+	profileID, profileRevision, policyDigest, profileBoundAt := mcpClientProfileColumnValues(client.AgentProfileBinding)
+	if _, err := tx.Exec(ctx, `
+INSERT INTO narthex_mcp_clients
+    (id,slug,name,subject,oauth_client_id,runtime_attestor_public_key,status,epoch,revision,created_by,created_at,updated_at,revoked_at,revoked_by,
+     agent_profile_id,agent_profile_revision,agent_profile_policy_digest,agent_profile_bound_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
+		client.ID, client.Slug, client.Name, client.Subject, client.OAuthClientID, client.RuntimeAttestorPublicKey,
+		client.Status, client.Epoch, client.Revision, client.CreatedBy,
+		client.CreatedAt, client.UpdatedAt, client.RevokedAt, client.RevokedBy,
+		profileID, profileRevision, policyDigest, profileBoundAt); err != nil {
+		return MCPClient{}, err
+	}
+	// Once the managed manifest is installed, client creation keeps the global
+	// registry lock while the built-in helper locks every durable client and
+	// only then takes namespace advisories. Scope edits and account ownership
+	// changes take the same registry -> client rows -> namespace order. The
+	// enclosing transaction still makes the client, managed binding, namespace
+	// validation, and grants one atomic commit.
+	if err := s.reconcileInstalledBuiltInLibraryForNewClientTx(ctx, tx, client.ID); err != nil {
+		return MCPClient{}, err
+	}
 	if err := lockMCPClientNamespacesTx(ctx, tx, client.ConnectionNamespaceIDs); err != nil {
 		return MCPClient{}, err
 	}
 	if err := validateMCPClientNamespacesTx(ctx, tx, client); err != nil {
-		return MCPClient{}, err
-	}
-	if _, err := tx.Exec(ctx, `
-INSERT INTO narthex_mcp_clients
-    (id,slug,name,subject,oauth_client_id,status,epoch,revision,created_by,created_at,updated_at,revoked_at,revoked_by)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
-		client.ID, client.Slug, client.Name, client.Subject, client.OAuthClientID,
-		client.Status, client.Epoch, client.Revision, client.CreatedBy,
-		client.CreatedAt, client.UpdatedAt, client.RevokedAt, client.RevokedBy); err != nil {
 		return MCPClient{}, err
 	}
 	for _, namespaceID := range client.ConnectionNamespaceIDs {
@@ -605,7 +692,18 @@ func (s *PgStore) UpdateMCPClient(ctx context.Context, update MCPClient, precond
 	if update.Slug != "" && normalizeMCPClientSlug(update.Slug) != client.Slug {
 		return MCPClient{}, fmt.Errorf("%w: endpoint slug is immutable", ErrInvalidMCPClient)
 	}
-	if name == client.Name {
+	if update.agentProfileBindingSet || update.AgentProfileBinding != nil {
+		return MCPClient{}, fmt.Errorf("%w: agent profile binding changes require the profile-binding operation", ErrInvalidMCPClient)
+	}
+	key := client.RuntimeAttestorPublicKey
+	if update.runtimeAttestorKeySet {
+		var keyErr error
+		key, keyErr = normalizeMCPClientRuntimeAttestorPublicKey(update.RuntimeAttestorPublicKey)
+		if keyErr != nil {
+			return MCPClient{}, keyErr
+		}
+	}
+	if name == client.Name && key == client.RuntimeAttestorPublicKey {
 		if err := tx.Commit(ctx); err != nil {
 			return MCPClient{}, err
 		}
@@ -613,12 +711,15 @@ func (s *PgStore) UpdateMCPClient(ctx context.Context, update MCPClient, precond
 	}
 	if err := tx.QueryRow(ctx, `
 UPDATE narthex_mcp_clients
-SET name=$2,revision=revision+1,updated_at=now()
+SET name=$2,runtime_attestor_public_key=$3,
+    epoch=CASE WHEN runtime_attestor_public_key IS DISTINCT FROM $3 THEN $4 ELSE epoch END,
+    revision=revision+1,updated_at=now()
 WHERE id=$1
-RETURNING revision,updated_at`, client.ID, name).Scan(&client.Revision, &client.UpdatedAt); err != nil {
+RETURNING epoch,revision,updated_at`, client.ID, name, key, newEpoch()).Scan(&client.Epoch, &client.Revision, &client.UpdatedAt); err != nil {
 		return MCPClient{}, err
 	}
 	client.Name = name
+	client.RuntimeAttestorPublicKey = key
 	if err := tx.Commit(ctx); err != nil {
 		return MCPClient{}, err
 	}
@@ -635,6 +736,9 @@ func (s *PgStore) SetMCPClientNamespaces(ctx context.Context, id string, namespa
 		return MCPClient{}, err
 	}
 	defer tx.Rollback(ctx)
+	if err := lockMCPClientRegistryTx(ctx, tx); err != nil {
+		return MCPClient{}, err
+	}
 	client, err := loadMCPClientForUpdate(ctx, tx, strings.TrimSpace(id))
 	if err != nil {
 		return MCPClient{}, err
@@ -810,6 +914,90 @@ RETURNING epoch,revision,updated_at,revoked_at,revoked_by`, client.ID, newEpoch(
 		return MCPClient{}, err
 	}
 	client.Status = MCPClientStatusRevoked
+	if err := tx.Commit(ctx); err != nil {
+		return MCPClient{}, err
+	}
+	return client, nil
+}
+
+func (s *PgStore) BindMCPClientProfile(ctx context.Context, precondition MCPClientPrecondition, binding MCPClientProfileBinding) (MCPClient, error) {
+	binding, err := normalizeMCPClientProfileBinding(binding)
+	if err != nil {
+		return MCPClient{}, err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return MCPClient{}, err
+	}
+	defer tx.Rollback(ctx)
+	client, err := loadMCPClientForUpdate(ctx, tx, strings.TrimSpace(precondition.ID))
+	if err != nil {
+		return MCPClient{}, err
+	}
+	if !mcpClientPreconditionMatches(client, precondition) {
+		return MCPClient{}, ErrMCPClientRevision
+	}
+	if client.Status == MCPClientStatusRevoked {
+		return MCPClient{}, ErrMCPClientRevoked
+	}
+	if sameMCPClientProfileReference(client.AgentProfileBinding, &binding) {
+		if err := tx.Commit(ctx); err != nil {
+			return MCPClient{}, err
+		}
+		return client, nil
+	}
+	// A changed policy reference is an authorization boundary: rotate the
+	// epoch in the same statement that installs the binding.
+	var boundAtValue time.Time
+	if err := tx.QueryRow(ctx, `
+UPDATE narthex_mcp_clients
+SET agent_profile_id=$2,agent_profile_revision=$3,agent_profile_policy_digest=$4,agent_profile_bound_at=now(),
+    epoch=$5,revision=revision+1,updated_at=now()
+WHERE id=$1
+RETURNING agent_profile_bound_at,epoch,revision,updated_at`, client.ID, binding.ProfileID, binding.ProfileRevision, binding.PolicyDigest, newEpoch()).Scan(
+		&boundAtValue, &client.Epoch, &client.Revision, &client.UpdatedAt,
+	); err != nil {
+		return MCPClient{}, err
+	}
+	binding.BoundAt = boundAtValue.UTC()
+	client.AgentProfileBinding = &binding
+	if err := tx.Commit(ctx); err != nil {
+		return MCPClient{}, err
+	}
+	return client, nil
+}
+
+func (s *PgStore) UnbindMCPClientProfile(ctx context.Context, precondition MCPClientPrecondition) (MCPClient, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return MCPClient{}, err
+	}
+	defer tx.Rollback(ctx)
+	client, err := loadMCPClientForUpdate(ctx, tx, strings.TrimSpace(precondition.ID))
+	if err != nil {
+		return MCPClient{}, err
+	}
+	if !mcpClientPreconditionMatches(client, precondition) {
+		return MCPClient{}, ErrMCPClientRevision
+	}
+	if client.Status == MCPClientStatusRevoked {
+		return MCPClient{}, ErrMCPClientRevoked
+	}
+	if client.AgentProfileBinding == nil {
+		if err := tx.Commit(ctx); err != nil {
+			return MCPClient{}, err
+		}
+		return client, nil
+	}
+	if err := tx.QueryRow(ctx, `
+UPDATE narthex_mcp_clients
+SET agent_profile_id='',agent_profile_revision=0,agent_profile_policy_digest='',agent_profile_bound_at=NULL,
+    epoch=$2,revision=revision+1,updated_at=now()
+WHERE id=$1
+RETURNING epoch,revision,updated_at`, client.ID, newEpoch()).Scan(&client.Epoch, &client.Revision, &client.UpdatedAt); err != nil {
+		return MCPClient{}, err
+	}
+	client.AgentProfileBinding = nil
 	if err := tx.Commit(ctx); err != nil {
 		return MCPClient{}, err
 	}

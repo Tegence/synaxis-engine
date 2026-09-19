@@ -223,6 +223,56 @@ func TestPlatformActorVerifierRejectsTamperingAndMismatches(t *testing.T) {
 	}
 }
 
+func TestPlatformServiceActorAllowsOnlyExactLibraryPublicationRoutes(t *testing.T) {
+	verifier, privateKey, now := newActorVerifier(t)
+	candidatePath := "/api/library/artifacts/libart_candidate_123/publication-candidate"
+	claimPath := "/api/library/artifacts/libart_candidate_123/publication-claim"
+	for _, allowed := range []struct {
+		name   string
+		method string
+		path   string
+		body   []byte
+	}{
+		{name: "candidate", method: http.MethodGet, path: candidatePath},
+		{name: "claim", method: http.MethodPost, path: claimPath, body: []byte(`{"artifactVersionId":"libartv_candidate_123","digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`)},
+	} {
+		t.Run(allowed.name, func(t *testing.T) {
+			claims := actorClaimsForTest(now, allowed.method, allowed.path, allowed.body)
+			claims.UserID = platformServiceActorID
+			claims.Role = "service"
+			actor, err := verifier.VerifyRequest(actorRequest(allowed.method, allowed.path, allowed.body, signActorAssertionForTest(t, privateKey, claims)))
+			if err != nil {
+				t.Fatalf("verify publication %s service assertion: %v", allowed.name, err)
+			}
+			if actor.UserID != platformServiceActorID || actor.Role != "service" {
+				t.Fatalf("service actor = %+v", actor)
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name   string
+		method string
+		path   string
+	}{
+		{name: "wrong candidate method", method: http.MethodPost, path: candidatePath},
+		{name: "wrong claim method", method: http.MethodGet, path: claimPath},
+		{name: "unsafe artifact identifier", method: http.MethodGet, path: "/api/library/artifacts/artifact~123/publication-candidate"},
+		{name: "extra path segment", method: http.MethodGet, path: candidatePath + "/extra"},
+		{name: "other library resource", method: http.MethodGet, path: "/api/library/artifacts/libart_candidate_123"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := actorClaimsForTest(now, test.method, test.path, nil)
+			candidate.UserID = platformServiceActorID
+			candidate.Role = "service"
+			_, err := verifier.VerifyRequest(actorRequest(test.method, test.path, nil, signActorAssertionForTest(t, privateKey, candidate)))
+			if !errors.Is(err, ErrInvalidPlatformActorAssertion) {
+				t.Fatalf("service %s assertion error=%v, want invalid assertion", test.name, err)
+			}
+		})
+	}
+}
+
 func TestHostedConsoleRequiresMachineTokenAndActorAssertion(t *testing.T) {
 	verifier, privateKey, now := newActorVerifier(t)
 	api := NewConsoleAPI(
@@ -298,4 +348,113 @@ func readRequestTestBody(t *testing.T, request *http.Request) []byte {
 		t.Fatal(err)
 	}
 	return body
+}
+
+func TestValidActorAPIPathAcceptsOnlyConsoleAndControlV1Prefixes(t *testing.T) {
+	for path, want := range map[string]bool{
+		"/api/servers":                                     true,
+		"/api/mcp-clients/mcpcli_1/revoke":                 true,
+		"/control/v1/meta":                                 true,
+		"/control/v1/mcp-clients":                          true,
+		"/control/v1/mcp-clients/mcpcli_1/profile-binding": true,
+		"/control/v1/run-correlations":                     true,
+		// Only the exact v1 prefix: no other version, no look-alike prefix,
+		// no bare prefix, and no trailing slash.
+		"/control/v2/x":            false,
+		"/control/v1":              false,
+		"/control/v1/":             false,
+		"/controlx":                false,
+		"/controlx/v1/meta":        false,
+		"/control/v10/meta":        false,
+		"/control/V1/meta":         false,
+		"/control":                 false,
+		"/control/":                false,
+		"/api":                     false,
+		"/apix/servers":            false,
+		"/control/v1/mcp-clients/": false,
+		// Traversal that only normalizes into a control path fails the
+		// path.Clean fixed-point check, as do escapes and control bytes.
+		"/api/../control/v1":         false,
+		"/api/../control/v1/meta":    false,
+		"/control/v1/../api/servers": false,
+		"/control/v1/./meta":         false,
+		"/control/v1//meta":          false,
+		"/control/v1/mcp%2Dclients":  false,
+		"/control/v1/mcp\\clients":   false,
+		"/control/v1/mcp\x00clients": false,
+		// The MCP data plane and the signed runtime ingress are never
+		// assertion-addressable.
+		"/mcp":                              false,
+		"/mcp/clients/codex":                false,
+		"/runtime/clients/codex/activation": false,
+		"":                                  false,
+	} {
+		if got := validActorAPIPath(path); got != want {
+			t.Fatalf("validActorAPIPath(%q)=%t; want %t", path, got, want)
+		}
+	}
+}
+
+func TestPlatformServiceActorAllowsOnlyExactControlV1ServiceRoutes(t *testing.T) {
+	verifier, privateKey, now := newActorVerifier(t)
+	clientPath := "/control/v1/mcp-clients/mcpcli_service_123"
+	bindingBody := []byte(`{"revision":1,"profileId":"aap_1","profileRevision":1,"policyDigest":"` + libraryDigest("policy") + `"}`)
+	for _, allowed := range []struct {
+		name   string
+		method string
+		path   string
+		body   []byte
+	}{
+		{name: "meta", method: http.MethodGet, path: "/control/v1/meta"},
+		{name: "run correlations", method: http.MethodGet, path: "/control/v1/run-correlations"},
+		{name: "activation snapshot", method: http.MethodGet, path: clientPath + "/activation-snapshot"},
+		{name: "bind profile", method: http.MethodPut, path: clientPath + "/profile-binding", body: bindingBody},
+		{name: "unbind profile", method: http.MethodDelete, path: clientPath + "/profile-binding", body: []byte(`{"revision":2}`)},
+	} {
+		t.Run(allowed.name, func(t *testing.T) {
+			claims := actorClaimsForTest(now, allowed.method, allowed.path, allowed.body)
+			claims.UserID = platformServiceActorID
+			claims.Role = "service"
+			actor, err := verifier.VerifyRequest(actorRequest(allowed.method, allowed.path, allowed.body, signActorAssertionForTest(t, privateKey, claims)))
+			if err != nil {
+				t.Fatalf("verify %s service assertion: %v", allowed.name, err)
+			}
+			if actor.UserID != platformServiceActorID || actor.Role != "service" {
+				t.Fatalf("service actor = %+v", actor)
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name   string
+		method string
+		path   string
+	}{
+		{name: "list clients", method: http.MethodGet, path: "/control/v1/mcp-clients"},
+		{name: "register client", method: http.MethodPost, path: "/control/v1/mcp-clients"},
+		{name: "read client", method: http.MethodGet, path: clientPath},
+		{name: "rename client", method: http.MethodPatch, path: clientPath},
+		{name: "namespaces", method: http.MethodPut, path: clientPath + "/namespaces"},
+		{name: "oauth reset", method: http.MethodPost, path: clientPath + "/oauth-client/reset"},
+		{name: "revoke", method: http.MethodPost, path: clientPath + "/revoke"},
+		{name: "wrong binding method", method: http.MethodPost, path: clientPath + "/profile-binding"},
+		{name: "wrong snapshot method", method: http.MethodPost, path: clientPath + "/activation-snapshot"},
+		{name: "wrong meta method", method: http.MethodPost, path: "/control/v1/meta"},
+		{name: "wrong feed method", method: http.MethodPost, path: "/control/v1/run-correlations"},
+		{name: "feed sub-resource", method: http.MethodGet, path: "/control/v1/run-correlations/lrc_1"},
+		{name: "unsafe client identifier", method: http.MethodGet, path: "/control/v1/mcp-clients/mcpcli~123/activation-snapshot"},
+		{name: "extra path segment", method: http.MethodGet, path: clientPath + "/activation-snapshot/extra"},
+		{name: "other client operation", method: http.MethodGet, path: clientPath + "/skill-authoring-lease"},
+		{name: "future version", method: http.MethodGet, path: "/control/v2/meta"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := actorClaimsForTest(now, test.method, test.path, nil)
+			candidate.UserID = platformServiceActorID
+			candidate.Role = "service"
+			_, err := verifier.VerifyRequest(actorRequest(test.method, test.path, nil, signActorAssertionForTest(t, privateKey, candidate)))
+			if !errors.Is(err, ErrInvalidPlatformActorAssertion) {
+				t.Fatalf("service %s assertion error=%v, want invalid assertion", test.name, err)
+			}
+		})
+	}
 }

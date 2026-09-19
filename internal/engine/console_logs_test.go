@@ -1,13 +1,17 @@
 package engine
 
 import (
+	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/mark3labs/mcp-go/server"
 )
@@ -82,6 +86,305 @@ func TestLogsAPIListAndDetail(t *testing.T) {
 	rec, _ = doJSON(t, mux, tok, http.MethodDelete, fmt.Sprintf("/api/logs/%d", int64(id)), "")
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("DELETE detail = %d, want 405", rec.Code)
+	}
+}
+
+// doJSONWithHeaders is doJSON plus arbitrary extra request headers — used for
+// the Activity "Load older" keyset cursor, which travels as request headers
+// rather than query parameters (see logsBeforeTSHeader/logsBeforeIDHeader in
+// console.go for why: the hosted Platform actor assertion rejects any
+// request carrying a query string).
+func doJSONWithHeaders(t *testing.T, mux *http.ServeMux, token, method, path, body string, headers map[string]string) (*httptest.ResponseRecorder, map[string]any) {
+	t.Helper()
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	var out map[string]any
+	if b := rec.Body.Bytes(); len(b) > 0 && b[0] == '{' {
+		_ = json.Unmarshal(b, &out)
+	}
+	return rec, out
+}
+
+// TestLogsAPICursorPaging: the default (no-cursor) response is unaffected by
+// the new cursor headers, a valid before-ts/before-id cursor pages backward
+// to the next older rows, and a malformed or partial cursor is a 400 via the
+// existing error shape.
+func TestLogsAPICursorPaging(t *testing.T) {
+	mux, tok, _, fs, _ := newRecorderConsole(t)
+
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	const total = 5
+	for i := 0; i < total; i++ {
+		fs.LogCall(CallRecord{
+			Account: "linear", Tool: fmt.Sprintf("t%d", i), OK: true,
+			TS: base.Add(time.Duration(i) * time.Second),
+		})
+	}
+
+	// No cursor: newest-first, byte-compatible default shape (a JSON array).
+	rec, _ := doJSON(t, mux, tok, http.MethodGet, "/api/logs", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/logs = %d, body %s", rec.Code, rec.Body)
+	}
+	var page1 []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &page1); err != nil || len(page1) != total {
+		t.Fatalf("default list = %s (err %v)", rec.Body, err)
+	}
+	if page1[0]["tool"] != "t4" || page1[total-1]["tool"] != "t0" {
+		t.Fatalf("default list not newest-first: %v", page1)
+	}
+
+	// A cursor off the 3rd-newest row (t2) pages to the 2 older rows (t1, t0).
+	cursor := page1[2]
+	cursorTS, _ := cursor["ts"].(string)
+	cursorID := int64(cursor["id"].(float64))
+	cursorHeaders := map[string]string{
+		logsBeforeTSHeader: cursorTS,
+		logsBeforeIDHeader: fmt.Sprint(cursorID),
+	}
+	rec, _ = doJSONWithHeaders(t, mux, tok, http.MethodGet, "/api/logs", "", cursorHeaders)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/logs with cursor headers = %d, body %s", rec.Code, rec.Body)
+	}
+	var page2 []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &page2); err != nil || len(page2) != 2 {
+		t.Fatalf("cursor page = %s (err %v)", rec.Body, err)
+	}
+	if page2[0]["tool"] != "t1" || page2[1]["tool"] != "t0" {
+		t.Fatalf("cursor page not the expected older rows: %v", page2)
+	}
+
+	// Garbage or partial cursors → 400, with the existing error shape.
+	for name, headers := range map[string]map[string]string{
+		"garbage ts":        {logsBeforeTSHeader: "not-a-time", logsBeforeIDHeader: fmt.Sprint(cursorID)},
+		"garbage id":        {logsBeforeTSHeader: cursorTS, logsBeforeIDHeader: "nope"},
+		"missing before_id": {logsBeforeTSHeader: cursorTS},
+		"missing before_ts": {logsBeforeIDHeader: fmt.Sprint(cursorID)},
+	} {
+		rec, got := doJSONWithHeaders(t, mux, tok, http.MethodGet, "/api/logs", "", headers)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: GET /api/logs = %d, want 400 (body %s)", name, rec.Code, rec.Body)
+		}
+		if _, present := got["error"]; !present {
+			t.Fatalf("%s: 400 missing error field: %v", name, got)
+		}
+	}
+}
+
+// hostedNamespaceRequestWithHeaders is hostedNamespaceRequest plus arbitrary
+// extra request headers — used for the Activity "Load older" keyset cursor,
+// which travels as headers, not query parameters (see
+// logsBeforeTSHeader/logsBeforeIDHeader in console.go for why). Headers are
+// outside what the signed actor assertion binds (Method+Path+Body only), so
+// adding them after signing does not invalidate the assertion.
+func hostedNamespaceRequestWithHeaders(
+	t *testing.T,
+	mux *http.ServeMux,
+	key ed25519.PrivateKey,
+	now time.Time,
+	userID, role, method, requestPath, body string,
+	headers map[string]string,
+) *httptest.ResponseRecorder {
+	t.Helper()
+	bodyBytes := []byte(body)
+	claims := actorClaimsForTest(now, method, requestPath, bodyBytes)
+	claims.UserID, claims.Role = userID, role
+	request := actorRequest(method, requestPath, bodyBytes, signActorAssertionForTest(t, key, claims))
+	request.Header.Set("Authorization", "Bearer machine-token")
+	request.Header.Set("Content-Type", "application/json")
+	for k, v := range headers {
+		request.Header.Set(k, v)
+	}
+	recorder := httptest.NewRecorder()
+	mux.ServeHTTP(recorder, request)
+	return recorder
+}
+
+// TestHostedOperatorLogsPaginationBackfillsPastInvisibleRows is the
+// regression test for the "Load older" silent-truncation bug: a
+// namespace-scoped operator's visible accounts are a strict subset of a
+// busier shared platform's audit volume, so a raw store page routinely mixes
+// visible and invisible rows. Before the fix, handleLogs filtered exactly one
+// raw page and returned whatever survived — a raw page with, say, 80 visible
+// rows out of 100 came back as an 80-row response, and the frontend's
+// hasMoreLogs (items.length === LOGS_PAGE_SIZE) reads anything short of a
+// full page as "no more history," silently hiding "Load older" even though
+// substantially more visible history exists just past the unfetched
+// remainder.
+//
+// This seeds 320 rows on a 1-in-5 "private" (invisible to the operator)
+// cadence, so every 100-row raw window contains a real mix, and proves:
+//  1. the first page backfills past the invisible rows to a FULL 100-row
+//     page instead of returning short;
+//  2. a "Load older" continuation (the same cursor request the frontend
+//     issues off the oldest loaded row) also backfills to a full page, with
+//     the correct next 100 visible rows — i.e. the cursor path shares the
+//     same backfill behavior as the first page, not a separate code path;
+//  3. both pages are exactly the visible rows in newest-first order, with no
+//     gaps or duplicates across the page boundary;
+//  4. across both requests — each internally issuing multiple raw store
+//     fetches to backfill past the invisible rows — visibility stays
+//     batched: zero per-row Account() store lookups. This is the same bound
+//     TestHostedOperatorActivityListBatchesVisibilityChecks proves for a
+//     single page; here it must also hold across handleLogs' internal
+//     multi-fetch backfill loop and across the cursor ("Load older") branch,
+//     proving the rebase onto PR #42's batched-visibility helpers did not
+//     reintroduce a per-row store call anywhere in the paginated path.
+//  5. the "Load older" cursor request — signed and routed exactly as the
+//     hosted Platform proxy does for a real operator — succeeds. It travels
+//     as logsBeforeTSHeader/logsBeforeIDHeader request headers rather than a
+//     query string: the hosted actor assertion binds Method+Path+Body and
+//     unconditionally rejects any request whose path carries a query string
+//     (normalizedActorRequestPath in actor_assertion.go), and "operator" is
+//     reachable ONLY through that hosted assertion path (self-hosted mode
+//     has no operator role at all — connectionNamespaceActor always returns
+//     "owner" there). A query-string cursor would therefore 401 for every
+//     operator, in the only place operators exist — this test's use of the
+//     real hosted request-signing helper is what proves the header-based
+//     transport actually clears that boundary.
+func TestHostedOperatorLogsPaginationBackfillsPastInvisibleRows(t *testing.T) {
+	ctx := context.Background()
+	base, err := LoadFileStore(filepath.Join(t.TempDir(), "accounts.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &accountQueryCountingStore{FileStore: base}
+	team, err := store.CreateConnectionNamespace(ctx, ConnectionNamespace{
+		Label: "Team", CreatedBy: "usr_owner",
+		ManagerGrants: []ConnectionNamespaceManagerGrant{{Subject: "usr_operator"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	private, err := store.CreateConnectionNamespace(ctx, ConnectionNamespace{
+		Label: "Private", CreatedBy: "usr_owner",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, account := range []Account{
+		{
+			Name: "team_notion", Label: "Team Notion", Group: team.Label,
+			URL: "https://team.example/mcp", AuthMode: "token", BearerToken: "team-secret",
+			ConnectionNamespaceID: team.ID, ConnectionScope: ConnectionScopeShared,
+		},
+		{
+			Name: "private_notion", Label: "Private Notion", Group: private.Label,
+			URL: "https://private.example/mcp", AuthMode: "token", BearerToken: "private-secret",
+			ConnectionNamespaceID: private.ID, ConnectionScope: ConnectionScopeShared,
+		},
+	} {
+		if err := store.Create(ctx, account); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	verifier, key, now := newActorVerifier(t)
+	gateway := NewGateway(store, nil)
+	gateway.SetAudit(store)
+	api := NewConsoleAPI(
+		store,
+		gateway,
+		nil,
+		"local-password",
+		"local-secret",
+		"https://engine.example",
+		"https://app.example",
+		"",
+		WithAdminToken("machine-token"),
+		WithLocalAdminAuth(false),
+		WithPlatformActorVerifier(verifier),
+	)
+	mux := http.NewServeMux()
+	api.Routes(mux)
+
+	// 320 rows, oldest to newest; every 5th belongs to the invisible Private
+	// account, so every 100-row raw window mixes visible and invisible rows.
+	const total = 320
+	baseTS := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	toolName := func(i int) string { return fmt.Sprintf("t%d", i) }
+	for i := 0; i < total; i++ {
+		account := "team_notion"
+		if i%5 == 0 {
+			account = "private_notion"
+		}
+		store.LogCall(CallRecord{Account: account, Tool: toolName(i), TS: baseTS.Add(time.Duration(i) * time.Second)})
+	}
+	var wantVisible []string // tool names, newest-first
+	for i := total - 1; i >= 0; i-- {
+		if i%5 != 0 {
+			wantVisible = append(wantVisible, toolName(i))
+		}
+	}
+	if len(wantVisible) < 2*logsPageSize {
+		t.Fatalf("fixture too small: only %d visible rows, want >= %d", len(wantVisible), 2*logsPageSize)
+	}
+	toolNamesOf := func(recs []CallRecord) []string {
+		out := make([]string, len(recs))
+		for i, r := range recs {
+			out[i] = r.Tool
+		}
+		return out
+	}
+
+	store.accountQueries.Store(0)
+	response := hostedNamespaceRequest(t, mux, key, now, "usr_operator", "operator", http.MethodGet, "/api/logs", "")
+	if response.Code != http.StatusOK {
+		t.Fatalf("GET /api/logs = %d: %s", response.Code, response.Body)
+	}
+	var page1 []CallRecord
+	if err := json.Unmarshal(response.Body.Bytes(), &page1); err != nil {
+		t.Fatalf("decode page1: %v", err)
+	}
+	if len(page1) != logsPageSize {
+		t.Fatalf("page1 = %d rows, want a FULL page of %d (must backfill past invisible rows, not return short): %v",
+			len(page1), logsPageSize, toolNamesOf(page1))
+	}
+	wantPage1 := wantVisible[:logsPageSize]
+	for i, rec := range page1 {
+		if rec.Tool != wantPage1[i] {
+			t.Fatalf("page1 mismatch at row %d: got=%v want=%v", i, toolNamesOf(page1), wantPage1)
+		}
+	}
+
+	// "Load older": cursor off the oldest row of page1, exactly as the
+	// frontend's loadOlderLogs does. The cursor travels as request headers,
+	// not query parameters: the hosted actor assertion signed below binds
+	// Method+Path+Body only (see actorClaimsForTest), so this — unlike a
+	// ?before_ts= query string — is not rejected by
+	// normalizedActorRequestPath's empty-RawQuery requirement.
+	oldest := page1[len(page1)-1]
+	response = hostedNamespaceRequestWithHeaders(t, mux, key, now, "usr_operator", "operator", http.MethodGet, "/api/logs", "", map[string]string{
+		logsBeforeTSHeader: oldest.TS.Format(time.RFC3339Nano),
+		logsBeforeIDHeader: fmt.Sprint(oldest.ID),
+	})
+	if response.Code != http.StatusOK {
+		t.Fatalf("GET /api/logs with cursor headers = %d: %s", response.Code, response.Body)
+	}
+	var page2 []CallRecord
+	if err := json.Unmarshal(response.Body.Bytes(), &page2); err != nil {
+		t.Fatalf("decode page2: %v", err)
+	}
+	if len(page2) != logsPageSize {
+		t.Fatalf("page2 (\"Load older\") = %d rows, want a FULL page of %d: %v", len(page2), logsPageSize, toolNamesOf(page2))
+	}
+	wantPage2 := wantVisible[logsPageSize : 2*logsPageSize]
+	for i, rec := range page2 {
+		if rec.Tool != wantPage2[i] {
+			t.Fatalf("page2 mismatch at row %d: got=%v want=%v", i, toolNamesOf(page2), wantPage2)
+		}
+	}
+
+	if got := store.accountQueries.Load(); got != 0 {
+		t.Fatalf("paginated operator /api/logs issued %d per-row Account queries across the backfill, want none (batched read)", got)
 	}
 }
 

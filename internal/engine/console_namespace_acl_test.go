@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -384,5 +386,116 @@ func TestSetBearerTokenUsesOwnershipRevisionCAS(t *testing.T) {
 	after, _ := store.Account("notion")
 	if after.ConnectionNamespaceID != to.ID || after.BearerToken != "old-token" {
 		t.Fatalf("stale token update restored old assignment or changed token: %+v", after)
+	}
+}
+
+// accountQueryCountingStore counts per-row Account lookups so the activity
+// list test can prove the visibility check is batched.
+type accountQueryCountingStore struct {
+	*FileStore
+	accountQueries atomic.Int32
+}
+
+func (s *accountQueryCountingStore) Account(name string) (Account, bool) {
+	s.accountQueries.Add(1)
+	return s.FileStore.Account(name)
+}
+
+func TestHostedOperatorActivityListBatchesVisibilityChecks(t *testing.T) {
+	ctx := context.Background()
+	base, err := LoadFileStore(filepath.Join(t.TempDir(), "accounts.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &accountQueryCountingStore{FileStore: base}
+	team, err := store.CreateConnectionNamespace(ctx, ConnectionNamespace{
+		Label: "Team", CreatedBy: "usr_owner",
+		ManagerGrants: []ConnectionNamespaceManagerGrant{{Subject: "usr_operator"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	private, err := store.CreateConnectionNamespace(ctx, ConnectionNamespace{
+		Label: "Private", CreatedBy: "usr_owner",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, account := range []Account{
+		{
+			Name: "team_notion", Label: "Team Notion", Group: team.Label,
+			URL: "https://team.example/mcp", AuthMode: "token", BearerToken: "team-secret",
+			ConnectionNamespaceID: team.ID, ConnectionScope: ConnectionScopeShared,
+		},
+		{
+			Name: "private_notion", Label: "Private Notion", Group: private.Label,
+			URL: "https://private.example/mcp", AuthMode: "token", BearerToken: "private-secret",
+			ConnectionNamespaceID: private.ID, ConnectionScope: ConnectionScopeShared,
+		},
+	} {
+		if err := store.Create(ctx, account); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	verifier, key, now := newActorVerifier(t)
+	gateway := NewGateway(store, nil)
+	gateway.SetAudit(store)
+	api := NewConsoleAPI(
+		store,
+		gateway,
+		nil,
+		"local-password",
+		"local-secret",
+		"https://engine.example",
+		"https://app.example",
+		"",
+		WithAdminToken("machine-token"),
+		WithLocalAdminAuth(false),
+		WithPlatformActorVerifier(verifier),
+	)
+	mux := http.NewServeMux()
+	api.Routes(mux)
+
+	// A full activity page of mixed visible/hidden records.
+	for i := 0; i < 100; i++ {
+		account := "team_notion"
+		if i%2 == 1 {
+			account = "private_notion"
+		}
+		store.LogCall(CallRecord{Account: account, Tool: "search"})
+	}
+
+	// The per-row reference behavior, evaluated through the live single-record
+	// path before any counting begins.
+	operator := PlatformActor{UserID: "usr_operator", Role: "operator"}
+	calls, err := store.RecentCalls(ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := make([]CallRecord, 0, len(calls))
+	for _, call := range calls {
+		if api.visibleCall(ctx, operator, call) {
+			expected = append(expected, call)
+		}
+	}
+	if len(expected) != 50 {
+		t.Fatalf("reference partitioning kept %d records, want the 50 Team records", len(expected))
+	}
+	var wantBody bytes.Buffer
+	if err := json.NewEncoder(&wantBody).Encode(expected); err != nil {
+		t.Fatal(err)
+	}
+
+	store.accountQueries.Store(0)
+	response := hostedNamespaceRequest(t, mux, key, now, "usr_operator", "operator", http.MethodGet, "/api/logs", "")
+	if response.Code != http.StatusOK {
+		t.Fatalf("GET /api/logs = %d: %s", response.Code, response.Body)
+	}
+	if got := store.accountQueries.Load(); got != 0 {
+		t.Fatalf("operator /api/logs issued %d per-row Account queries, want none (batched read)", got)
+	}
+	if !bytes.Equal(response.Body.Bytes(), wantBody.Bytes()) {
+		t.Fatalf("batched activity response differs from per-row behavior:\n got: %s\nwant: %s", response.Body, wantBody.String())
 	}
 }

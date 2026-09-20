@@ -133,6 +133,15 @@ func TestEffectiveStaticCredsLeavesLegacyDCRAccountsOnDCRPath(t *testing.T) {
 	}
 }
 
+func TestPendingConnectPersistsScopeOnlyForStaticClients(t *testing.T) {
+	if got := (&pendingConnect{scope: "mcp:connect"}).persistedScope(); got != "" {
+		t.Errorf("dynamic persisted scope = %q, want empty so reauthorization remains on DCR", got)
+	}
+	if got := (&pendingConnect{scope: "mcp:connect", staticClient: true}).persistedScope(); got != "mcp:connect" {
+		t.Errorf("static persisted scope = %q, want mcp:connect", got)
+	}
+}
+
 func TestEffectiveStaticCredsRejectsGmailClientWithoutSecret(t *testing.T) {
 	persisted := Account{
 		ClientID: "gmail-client-id",
@@ -141,6 +150,17 @@ func TestEffectiveStaticCredsRejectsGmailClientWithoutSecret(t *testing.T) {
 	creds := effectiveStaticCreds(nil, persisted, true, gmailMCPURL)
 	if err := validateStaticCredsForUpstream(creds, gmailMCPURL); err == nil {
 		t.Fatal("expected Gmail's confidential Web OAuth client to require a secret")
+	}
+}
+
+func TestValidateStaticCredsForUpstreamRejectsSlackClientWithoutSecret(t *testing.T) {
+	creds := &StaticCreds{ClientID: "slack-client-id", Scope: "channels:read chat:write"}
+	if err := validateStaticCredsForUpstream(creds, slackMCPURL); err == nil {
+		t.Fatal("expected Slack's confidential OAuth client to require a secret")
+	}
+	creds.ClientSecret = "slack-client-secret"
+	if err := validateStaticCredsForUpstream(creds, slackMCPURL); err != nil {
+		t.Errorf("validateStaticCredsForUpstream() with secret set = %v, want nil", err)
 	}
 }
 

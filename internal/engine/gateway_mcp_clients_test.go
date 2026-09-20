@@ -33,6 +33,13 @@ func clientEndpointToolNames(t *testing.T, gateway *Gateway, slug string) []stri
 	return names
 }
 
+func clientEndpointToolNamesWithLibrary(upstream ...string) []string {
+	names := append([]string(nil), upstream...)
+	names = append(names, mcpClientLibraryToolNames...)
+	sort.Strings(names)
+	return names
+}
+
 func newMCPClientGateway(t *testing.T) (*FileStore, *Gateway) {
 	t.Helper()
 	store, err := LoadFileStore(filepath.Join(t.TempDir(), "accounts.json"))
@@ -255,10 +262,10 @@ func TestMCPClientEndpointsKeepPersonalConnectionsSubjectBound(t *testing.T) {
 	if err := gateway.RefreshMCPClients(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := clientEndpointToolNames(t, gateway, alice.Slug), []string{"alice_notion__search", "team_notion__search"}; !sameStrings(got, want) {
+	if got, want := clientEndpointToolNames(t, gateway, alice.Slug), clientEndpointToolNamesWithLibrary("alice_notion__search", "team_notion__search"); !sameStrings(got, want) {
 		t.Fatalf("alice client tools=%v want=%v", got, want)
 	}
-	if got, want := clientEndpointToolNames(t, gateway, bob.Slug), []string{"bob_notion__search", "team_notion__search"}; !sameStrings(got, want) {
+	if got, want := clientEndpointToolNames(t, gateway, bob.Slug), clientEndpointToolNamesWithLibrary("bob_notion__search", "team_notion__search"); !sameStrings(got, want) {
 		t.Fatalf("bob client tools=%v want=%v", got, want)
 	}
 
@@ -280,7 +287,7 @@ func TestMCPClientEndpointsKeepPersonalConnectionsSubjectBound(t *testing.T) {
 	if err := gateway.RefreshMCPClients(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := clientEndpointToolNames(t, gateway, alice.Slug), []string{"alice_notion__search"}; !sameStrings(got, want) {
+	if got, want := clientEndpointToolNames(t, gateway, alice.Slug), clientEndpointToolNamesWithLibrary("alice_notion__search"); !sameStrings(got, want) {
 		t.Fatalf("alice tools after folder move=%v want=%v", got, want)
 	}
 }
@@ -321,13 +328,13 @@ func TestGatewayAccountMoveRotatesAffectedMCPClientDeliveryEpochs(t *testing.T) 
 	if err := gateway.RefreshMCPClients(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := clientEndpointToolNames(t, gateway, loses.Slug), []string{"team_notion__search"}; !sameStrings(got, want) {
+	if got, want := clientEndpointToolNames(t, gateway, loses.Slug), clientEndpointToolNamesWithLibrary("team_notion__search"); !sameStrings(got, want) {
 		t.Fatalf("source endpoint tools before move=%v want=%v", got, want)
 	}
-	if got := clientEndpointToolNames(t, gateway, gains.Slug); len(got) != 0 {
-		t.Fatalf("target endpoint unexpectedly had tools before move: %v", got)
+	if got, want := clientEndpointToolNames(t, gateway, gains.Slug), clientEndpointToolNamesWithLibrary(); !sameStrings(got, want) {
+		t.Fatalf("target endpoint tools before move=%v want=%v", got, want)
 	}
-	if got, want := clientEndpointToolNames(t, gateway, keeps.Slug), []string{"team_notion__search"}; !sameStrings(got, want) {
+	if got, want := clientEndpointToolNames(t, gateway, keeps.Slug), clientEndpointToolNamesWithLibrary("team_notion__search"); !sameStrings(got, want) {
 		t.Fatalf("both endpoint tools before move=%v want=%v", got, want)
 	}
 
@@ -373,13 +380,13 @@ func TestGatewayAccountMoveRotatesAffectedMCPClientDeliveryEpochs(t *testing.T) 
 	if !sameStrings(revoked, wantRevoked) {
 		t.Fatalf("OAuth refresh grants revoked=%v want=%v", revoked, wantRevoked)
 	}
-	if got := clientEndpointToolNames(t, gateway, loses.Slug); len(got) != 0 {
-		t.Fatalf("source endpoint retained moved tool: %v", got)
+	if got, want := clientEndpointToolNames(t, gateway, loses.Slug), clientEndpointToolNamesWithLibrary(); !sameStrings(got, want) {
+		t.Fatalf("source endpoint tools after move=%v want=%v", got, want)
 	}
-	if got, want := clientEndpointToolNames(t, gateway, gains.Slug), []string{"team_notion__search"}; !sameStrings(got, want) {
+	if got, want := clientEndpointToolNames(t, gateway, gains.Slug), clientEndpointToolNamesWithLibrary("team_notion__search"); !sameStrings(got, want) {
 		t.Fatalf("target endpoint tools after move=%v want=%v", got, want)
 	}
-	if got, want := clientEndpointToolNames(t, gateway, keeps.Slug), []string{"team_notion__search"}; !sameStrings(got, want) {
+	if got, want := clientEndpointToolNames(t, gateway, keeps.Slug), clientEndpointToolNamesWithLibrary("team_notion__search"); !sameStrings(got, want) {
 		t.Fatalf("both endpoint tools after move=%v want=%v", got, want)
 	}
 }

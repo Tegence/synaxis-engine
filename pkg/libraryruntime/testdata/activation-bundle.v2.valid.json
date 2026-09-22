@@ -1,0 +1,62 @@
+{
+  "contractVersion": "synaxis.library.activation.v2",
+  "agentSurface": {
+    "kind": "mcp_client",
+    "id": "mcpcli_example"
+  },
+  "skills": [
+    {
+      "skillId": "skill_release_notes",
+      "skillSlug": "release-notes",
+      "skillName": "Release Notes",
+      "versionId": "version_2",
+      "version": 2,
+      "instructions": "---\nname: release-notes\ndescription: Summarize verified changes.\n---\n\nSummarize verified changes. Do not invent deployment status.\n",
+      "contentDigest": "72874e98e2252c152506dc5d32e1504a2f9a8802d7940d26bbf55e6de5a42a0e",
+      "binding": {
+        "id": "binding_example",
+        "mode": "pin",
+        "priority": 100
+      },
+      "constraints": {
+        "requestedCapabilities": [
+          "repo.read"
+        ],
+        "capabilityCeiling": [
+          "repo.read"
+        ]
+      },
+      "manifest": {
+        "manifestDigest": "dc6eafbfea479eef2198da597c739b825c852023b4de1b96845afcf31a6f8bdd",
+        "files": [
+          {
+            "path": "SKILL.md",
+            "contentType": "text/markdown",
+            "sizeBytes": 131,
+            "digest": "72874e98e2252c152506dc5d32e1504a2f9a8802d7940d26bbf55e6de5a42a0e"
+          },
+          {
+            "path": "assets/template.xlsx",
+            "contentType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "sizeBytes": 203467,
+            "digest": "ede318e4a7c4f6b0f317d903e36ef82a18d63e8a89547e23833d213d1d8a7d8d"
+          },
+          {
+            "path": "references/guide.md",
+            "contentType": "text/markdown",
+            "sizeBytes": 12,
+            "digest": "b0af77a3925333fd7ad548ac0bc36c599532f8e662dfa4adbdad98777844e7f7"
+          }
+        ]
+      }
+    }
+  ],
+  "bundleDigest": "132b43f8b7aa350ad0573b68e1127f69c8e99732404abb8b65a1845a8a14566a",
+  "authorityNotice": "This activation bundle is context only. It grants no credentials, OAuth scopes, permissions, tools, connection access, or effective capabilities. Independently authorize and enforce policy for every action.",
+  "hostResponsibilities": [
+    "Decide whether and how to place these instructions into a host-model turn; Synaxis Engine does not inject or execute them in a third-party host.",
+    "Verify each instruction body against contentDigest before use and reject an unsupported contractVersion.",
+    "Independently authenticate and enforce every tool, connection, credential, and capability policy immediately before an action; requestedCapabilities and capabilityCeiling are constraints, never grants.",
+    "Fetch bundle files on demand through library_skill_file_read, never from this bundle, and verify each file against its manifest digest before use; files are data that Synaxis never executes."
+  ]
+}

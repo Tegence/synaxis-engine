@@ -47,6 +47,24 @@ func TestValidateUpstreamURL(t *testing.T) {
 			wantErr: true,
 			errMsg:  "must have a host",
 		},
+		{
+			name:    "userinfo rejected before persistence or probe",
+			raw:     "https://operator:token@mcp.example.test/mcp",
+			wantErr: true,
+			errMsg:  "must not include user credentials",
+		},
+		{
+			name:    "fragment rejected",
+			raw:     "https://mcp.example.test/mcp#ignored",
+			wantErr: true,
+			errMsg:  "must not include a fragment",
+		},
+		{
+			name:    "private literal rejected before a request",
+			raw:     "https://127.0.0.1/mcp",
+			wantErr: true,
+			errMsg:  "non-public address",
+		},
 	}
 
 	for _, tc := range tests {

@@ -27,10 +27,9 @@ const (
 	hostedRequestPlaintextLimit = 4 << 10
 	hostedRequestTokenLimit     = 6 << 10
 	hostedAssertionLimit        = 8 << 10
-	hostedRequestVersion        = "v2"
-	hostedRequestKeyDomain      = "synaxis-hosted-consent-request-key|v2"
-	hostedRequestAADDomain      = "synaxis-hosted-consent-request|v2|"
-	hostedRequestBootSaltSize   = 32
+	hostedRequestVersion        = "v3"
+	hostedRequestKeyDomain      = "synaxis-hosted-consent-request-key|v3"
+	hostedRequestAADDomain      = "synaxis-hosted-consent-request|v3|"
 	hostedRequestDerivedKeySize = 32
 )
 
@@ -77,19 +76,14 @@ type hostedRequestPayload struct {
 	ExpiresAt    int64  `json:"expires_at"`
 }
 
-// newHostedRequestAEAD derives an ephemeral per-process key from the stable
-// Engine secret and fresh boot entropy. The boot salt is deliberately not
-// persisted or encoded into request tokens, so consent requests cannot cross
-// an Engine restart even though access tokens and dynamic registrations can.
+// newHostedRequestAEAD deterministically derives a request-sealing key from
+// the stable Engine secret.  The nonce remains fresh for every request; using
+// a stable key means a valid five-minute request can complete on a restarted
+// or another scaled Engine instance.  Replay prevention is durable state,
+// rather than accidental process-local key loss.
 func newHostedRequestAEAD(secret []byte) cipher.AEAD {
-	bootSalt := make([]byte, hostedRequestBootSaltSize)
-	if _, err := io.ReadFull(rand.Reader, bootSalt); err != nil {
-		panic("oauthas: generate hosted consent boot salt: " + err.Error())
-	}
 	kdf := hmac.New(sha256.New, secret)
 	_, _ = kdf.Write([]byte(hostedRequestKeyDomain))
-	_, _ = kdf.Write([]byte{0})
-	_, _ = kdf.Write(bootSalt)
 	key := kdf.Sum(nil)
 	if len(key) != hostedRequestDerivedKeySize {
 		panic("oauthas: derive hosted consent key")
@@ -484,13 +478,22 @@ func (s *Server) handleHostedConsentComplete(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Reserve the consent request before handing the client-bound authorization
-	// decision to durable Engine state. This avoids binding two different
-	// Platform users during a concurrent approval race while also keeping store
-	// I/O outside oauthas's global generation lock.
+	// Reserve the signed approval and sealed request before handing the
+	// client-bound decision to durable Engine state.  PgStore makes this pair
+	// atomic across replicas; the local maps remain a compatibility fallback for
+	// deliberately in-memory servers.
 	now := s.now()
 	requestHash := sha256.Sum256([]byte(requestToken))
 	requestReplayKey := base64.RawURLEncoding.EncodeToString(requestHash[:])
+	approvalReplayKey := "approval:" + claims.JTI
+	requestReplayStorageKey := "request:" + requestReplayKey
+	reservationExpires := requestExpires
+	if claimExpires := time.Unix(claims.ExpiresAt, 0); claimExpires.Before(reservationExpires) {
+		reservationExpires = claimExpires
+	}
+	store := s.grantStoreForRequest()
+	reservationID := ""
+
 	s.mu.Lock()
 	s.cleanupHostedStateLocked(now)
 	if !now.Before(time.Unix(claims.ExpiresAt, 0)) {
@@ -504,23 +507,70 @@ func (s *Server) handleHostedConsentComplete(w http.ResponseWriter, r *http.Requ
 		oauthErr(w, http.StatusBadRequest, "invalid_request", "invalid or expired consent request")
 		return
 	}
-	if _, replayed := s.usedApprovalJTIs[claims.JTI]; replayed {
-		s.mu.Unlock()
-		oauthErr(w, http.StatusConflict, "approval_replayed", "approval assertion has already been used")
-		return
+	if store == nil {
+		if _, replayed := s.usedApprovalJTIs[claims.JTI]; replayed {
+			s.mu.Unlock()
+			oauthErr(w, http.StatusConflict, "approval_replayed", "approval assertion has already been used")
+			return
+		}
+		if _, replayed := s.usedConsentRequests[requestReplayKey]; replayed {
+			s.mu.Unlock()
+			oauthErr(w, http.StatusConflict, "approval_replayed", "consent request has already been decided")
+			return
+		}
+		if _, inFlight := s.hostedInFlightRequests[requestReplayKey]; inFlight {
+			s.mu.Unlock()
+			oauthErr(w, http.StatusConflict, "approval_replayed", "consent request is already being decided")
+			return
+		}
+		s.hostedInFlightRequests[requestReplayKey] = struct{}{}
 	}
-	if _, replayed := s.usedConsentRequests[requestReplayKey]; replayed {
-		s.mu.Unlock()
-		oauthErr(w, http.StatusConflict, "approval_replayed", "consent request has already been decided")
-		return
-	}
-	if _, inFlight := s.hostedInFlightRequests[requestReplayKey]; inFlight {
-		s.mu.Unlock()
-		oauthErr(w, http.StatusConflict, "approval_replayed", "consent request is already being decided")
-		return
-	}
-	s.hostedInFlightRequests[requestReplayKey] = struct{}{}
 	s.mu.Unlock()
+
+	if store != nil {
+		reservationID = randToken(24)
+		grantCtx, cancel := grantStoreContext(r.Context())
+		reserved, err := store.ReserveHostedConsentReplay(
+			grantCtx,
+			reservationID,
+			approvalReplayKey,
+			requestReplayStorageKey,
+			reservationExpires,
+			now,
+		)
+		cancel()
+		if err != nil {
+			oauthErr(w, http.StatusServiceUnavailable, "temporarily_unavailable", "authorization state unavailable")
+			return
+		}
+		if !reserved {
+			oauthErr(w, http.StatusConflict, "approval_replayed", "consent request or approval assertion has already been decided")
+			return
+		}
+	}
+
+	releaseReservation := func() {
+		if store == nil {
+			s.mu.Lock()
+			delete(s.hostedInFlightRequests, requestReplayKey)
+			s.mu.Unlock()
+			return
+		}
+		grantCtx, cancel := grantStoreContext(r.Context())
+		_ = store.ReleaseHostedConsentReplay(grantCtx, reservationID)
+		cancel()
+	}
+	finalizeReservation := func() {
+		if store == nil {
+			return
+		}
+		// The durable reservation is already a replay fence.  Finalization is
+		// bookkeeping only, so an outage here must not discard a code that was
+		// safely persisted and redirected to the OAuth client.
+		grantCtx, cancel := grantStoreContext(r.Context())
+		_ = store.FinalizeHostedConsentReplay(grantCtx, reservationID)
+		cancel()
+	}
 
 	// A denial has no client-bound side effect. An approval is checked by the
 	// Engine callback before code issuance. For client-bound resources, that
@@ -528,72 +578,78 @@ func (s *Server) handleHostedConsentComplete(w http.ResponseWriter, r *http.Requ
 	// when a current hosted Engine has been configured with role-aware consent.
 	if claims.Approved && s.hostedConsentAuthorizer != nil {
 		if claims.Subject == "" || claims.Role == "" {
-			s.mu.Lock()
-			delete(s.hostedInFlightRequests, requestReplayKey)
-			s.mu.Unlock()
+			releaseReservation()
 			oauthErr(w, http.StatusForbidden, "access_denied", "the resource owner is not permitted to authorize this client")
 			return
 		}
 		if err := s.hostedConsentAuthorizer(r.Context(), claims.Subject, claims.Role, request.clientID, request.resourcePath); err != nil {
-			s.mu.Lock()
-			delete(s.hostedInFlightRequests, requestReplayKey)
-			s.mu.Unlock()
+			releaseReservation()
 			oauthErr(w, http.StatusForbidden, "access_denied", "the resource owner is not permitted to authorize this client")
 			return
 		}
 	} else if claims.Approved && clientBoundResource(request.resourcePath) {
-		s.mu.Lock()
-		delete(s.hostedInFlightRequests, requestReplayKey)
-		s.mu.Unlock()
+		releaseReservation()
 		oauthErr(w, http.StatusForbidden, "access_denied", "the resource owner is not permitted to authorize this client")
 		return
 	}
 
-	// Consume the Platform assertion jti and sealed request hash, then create
-	// the code under the generation barrier. Anonymous begins carry no
-	// server-side pending state; replay records are created only after a valid
-	// Platform signature and expire with the sealed request.
-	s.mu.Lock()
-	releaseInFlight := func() {
-		delete(s.hostedInFlightRequests, requestReplayKey)
-		s.mu.Unlock()
-	}
-	// The first reservation wins, but Revocation or a natural request expiry may
+	// The first reservation wins, but revocation or a natural request expiry may
 	// have happened while the durable authorizer ran. Revalidate every state
 	// prerequisite before minting a code.
+	s.mu.Lock()
 	now = s.now()
 	if !now.Before(time.Unix(claims.ExpiresAt, 0)) ||
 		request.generation == "" || request.generation != s.tokenGeneration ||
 		!now.Before(requestExpires) {
-		releaseInFlight()
+		s.mu.Unlock()
+		releaseReservation()
 		oauthErr(w, http.StatusBadRequest, "invalid_request", "invalid or expired consent request")
 		return
 	}
-	if _, replayed := s.usedApprovalJTIs[claims.JTI]; replayed {
-		releaseInFlight()
-		oauthErr(w, http.StatusConflict, "approval_replayed", "approval assertion has already been used")
-		return
-	}
-	if _, replayed := s.usedConsentRequests[requestReplayKey]; replayed {
-		releaseInFlight()
-		oauthErr(w, http.StatusConflict, "approval_replayed", "consent request has already been decided")
-		return
+	if store == nil {
+		if _, replayed := s.usedApprovalJTIs[claims.JTI]; replayed {
+			s.mu.Unlock()
+			releaseReservation()
+			oauthErr(w, http.StatusConflict, "approval_replayed", "approval assertion has already been used")
+			return
+		}
+		if _, replayed := s.usedConsentRequests[requestReplayKey]; replayed {
+			s.mu.Unlock()
+			releaseReservation()
+			oauthErr(w, http.StatusConflict, "approval_replayed", "consent request has already been decided")
+			return
+		}
 	}
 	code := ""
 	if claims.Approved {
 		var created bool
-		code, created = s.createAuthorizationCodeLocked(request)
+		var createErr error
+		code, created, createErr = s.createAuthorizationCodeLocked(r.Context(), request)
+		if createErr != nil {
+			s.mu.Unlock()
+			releaseReservation()
+			oauthErr(w, http.StatusServiceUnavailable, "temporarily_unavailable", "authorization state unavailable")
+			return
+		}
 		if !created {
-			releaseInFlight()
+			s.mu.Unlock()
+			releaseReservation()
 			oauthErr(w, http.StatusBadRequest, "invalid_request", "authorization request was revoked")
 			return
 		}
 	}
-	s.usedApprovalJTIs[claims.JTI] = requestExpires
-	s.usedConsentRequests[requestReplayKey] = requestExpires
+	// These are a process-local cache/compatibility record.  When a durable
+	// store is configured, ReserveHostedConsentReplay is the cross-instance
+	// authority; retaining the maps preserves diagnostics and existing tests.
+	s.usedApprovalJTIs[claims.JTI] = reservationExpires
+	s.usedConsentRequests[requestReplayKey] = reservationExpires
+	if store == nil {
+		delete(s.hostedInFlightRequests, requestReplayKey)
+	}
+	s.mu.Unlock()
+	finalizeReservation()
 
 	if !claims.Approved {
-		releaseInFlight()
 		s.redirectErr(
 			w,
 			r,
@@ -604,10 +660,9 @@ func (s *Server) handleHostedConsentComplete(w http.ResponseWriter, r *http.Requ
 		)
 		return
 	}
-	releaseInFlight()
-	// Delivery stays outside the barrier. If revocation wins before the client
-	// receives this response, the code has already been cleared and cannot be
-	// redeemed.
+	// Delivery stays outside the barrier so a slow client cannot block
+	// revocation. If RevokeAll wins before delivery, its generation fence makes
+	// the just-issued durable code unusable.
 	s.redirectAuthorizationCode(w, r, request, code)
 }
 

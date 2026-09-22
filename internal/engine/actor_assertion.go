@@ -236,9 +236,125 @@ func platformServiceControlRoute(method, requestPath string) bool {
 		return true
 	case method == http.MethodGet && requestPath == "/api/activation":
 		return true
+	case method == http.MethodGet && platformServiceLibraryPublicationCandidateRoute(requestPath):
+		return true
+	case method == http.MethodPost && platformServiceLibraryPublicationClaimRoute(requestPath):
+		return true
+	case platformServiceControlV1Route(method, requestPath):
+		return true
 	default:
 		return false
 	}
+}
+
+// platformServiceControlV1Route is the /control/v1 counterpart of the closed
+// service allowlist above. The service principal receives version discovery,
+// the sanitized run-correlation feed, two per-client operations that a hosted
+// control plane performs from background jobs (reading a client's activation
+// snapshot and installing or clearing its opaque profile binding), and the
+// subject-scoped Library group (member artifact reads and exact-version
+// grant management, each one exact operation per route). It still cannot
+// list, register, rename, or revoke clients.
+func platformServiceControlV1Route(method, requestPath string) bool {
+	switch {
+	case method == http.MethodGet && requestPath == controlV1PathPrefix+"meta":
+		return true
+	case method == http.MethodGet && requestPath == controlV1PathPrefix+"run-correlations":
+		return true
+	case method == http.MethodGet && platformServiceControlMCPClientRoute(requestPath, "activation-snapshot"):
+		return true
+	case (method == http.MethodPut || method == http.MethodDelete) && platformServiceControlMCPClientRoute(requestPath, "profile-binding"):
+		return true
+	case method == http.MethodGet && requestPath == controlV1PathPrefix+"library/artifacts":
+		return true
+	case method == http.MethodGet && requestPath == controlV1PathPrefix+"library/recipients":
+		return true
+	case method == http.MethodGet && platformServiceControlLibraryArtifactRoute(requestPath):
+		return true
+	case method == http.MethodGet && platformServiceControlLibraryArtifactRoute(requestPath, "versions", "*"):
+		return true
+	case method == http.MethodPost && platformServiceControlLibraryArtifactRoute(requestPath, "grants"):
+		return true
+	case method == http.MethodPost && platformServiceControlLibraryArtifactRoute(requestPath, "grants", "*", "revoke"):
+		return true
+	default:
+		return false
+	}
+}
+
+// platformServiceControlLibraryArtifactRoute recognizes exactly one
+// /control/v1/library/artifacts/{id}[/suffix...] shape. A "*" suffix element
+// is a dynamic segment; every dynamic segment (the artifact, version, and
+// grant IDs) is constrained to the actor identifier alphabet so a differently
+// encoded path cannot alias a signed one.
+func platformServiceControlLibraryArtifactRoute(requestPath string, suffix ...string) bool {
+	parts := strings.Split(strings.TrimPrefix(requestPath, "/"), "/")
+	if len(parts) != 5+len(suffix) ||
+		parts[0] != "control" ||
+		parts[1] != "v1" ||
+		parts[2] != "library" ||
+		parts[3] != "artifacts" ||
+		!validActorIdentifier(parts[4]) {
+		return false
+	}
+	for i, want := range suffix {
+		got := parts[5+i]
+		if want == "*" {
+			if !validActorIdentifier(got) {
+				return false
+			}
+			continue
+		}
+		if got != want {
+			return false
+		}
+	}
+	return true
+}
+
+// platformServiceControlMCPClientRoute mirrors
+// platformServiceLibraryPublicationRoute: one exact dynamic resource route per
+// operation, with the opaque client ID constrained to the actor identifier
+// alphabet so a differently encoded path cannot alias a signed one.
+func platformServiceControlMCPClientRoute(requestPath, operation string) bool {
+	parts := strings.Split(strings.TrimPrefix(requestPath, "/"), "/")
+	if len(parts) != 5 ||
+		parts[0] != "control" ||
+		parts[1] != "v1" ||
+		parts[2] != "mcp-clients" ||
+		parts[4] != operation {
+		return false
+	}
+	return validActorIdentifier(parts[3])
+}
+
+// platformServiceLibraryPublicationCandidateRoute deliberately recognizes one
+// dynamic resource route instead of making the entire Library API available
+// to the Platform service principal. The opaque artifact ID is constrained to
+// the same unescaped identifier alphabet as every actor assertion field, so a
+// signed path cannot be confused with a differently encoded route.
+func platformServiceLibraryPublicationCandidateRoute(requestPath string) bool {
+	return platformServiceLibraryPublicationRoute(requestPath, "publication-candidate")
+}
+
+// platformServiceLibraryPublicationClaimRoute is intentionally separate from
+// the candidate read. The Platform can only claim the exact reviewed artifact
+// version/digest it just observed; it never receives general Library write
+// authority through this service principal.
+func platformServiceLibraryPublicationClaimRoute(requestPath string) bool {
+	return platformServiceLibraryPublicationRoute(requestPath, "publication-claim")
+}
+
+func platformServiceLibraryPublicationRoute(requestPath, operation string) bool {
+	parts := strings.Split(strings.TrimPrefix(requestPath, "/"), "/")
+	if len(parts) != 5 ||
+		parts[0] != "api" ||
+		parts[1] != "library" ||
+		parts[2] != "artifacts" ||
+		parts[4] != operation {
+		return false
+	}
+	return validActorIdentifier(parts[3])
 }
 
 func readBoundedActorRequestBody(r *http.Request) ([]byte, error) {
@@ -300,9 +416,14 @@ func validActorHTTPMethod(method string) bool {
 	}
 }
 
+// validActorAPIPath accepts only the two management surfaces a hosted
+// Platform may sign for: the compatibility console under /api/ and the
+// versioned control contract under /control/v1/. Every other prefix (a future
+// /control/v2, a look-alike such as /controlx, the MCP data plane, or a
+// traversal that only normalizes into a control path) fails closed.
 func validActorAPIPath(raw string) bool {
 	if raw == "" || strings.Contains(raw, "\\") || strings.ContainsRune(raw, '\x00') ||
-		strings.Contains(raw, "%") || !strings.HasPrefix(raw, "/api/") {
+		strings.Contains(raw, "%") || !validActorAPIPathPrefix(raw) {
 		return false
 	}
 	if path.Clean(raw) != raw || strings.HasSuffix(raw, "/") {
@@ -314,6 +435,10 @@ func validActorAPIPath(raw string) bool {
 		}
 	}
 	return true
+}
+
+func validActorAPIPathPrefix(raw string) bool {
+	return strings.HasPrefix(raw, "/api/") || strings.HasPrefix(raw, controlV1PathPrefix)
 }
 
 func normalizeActorAudience(raw string) string {

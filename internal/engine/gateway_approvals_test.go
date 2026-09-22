@@ -123,6 +123,7 @@ func TestReadOnlyAccountRegistersOnlyReadTools(t *testing.T) {
 // Returns the gateway and a counter of upstream save_issue dispatches.
 func newApprovalTestGateway(t *testing.T) (*Gateway, *int32) {
 	t.Helper()
+	useLoopbackUpstreamTransport(t)
 	var saves int32
 	up := server.NewMCPServer("up", "0.0.0", server.WithToolCapabilities(true))
 	up.AddTool(mcp.NewTool("save_issue", mcp.WithDescription("mutates")),
@@ -181,6 +182,56 @@ func callConnectorTool(t *testing.T, g *Gateway, slug, tool string) string {
 		t.Fatalf("marshal response: %v", err)
 	}
 	return string(out)
+}
+
+// callSubjectClientTool sends a tools/call directly to a projected,
+// subject-bound client MCP server. OAuth resource authorization is exercised
+// elsewhere; this helper deliberately targets the delivery projection so this
+// package can assert handler composition consistently across MCP surfaces.
+func callSubjectClientTool(t *testing.T, g *Gateway, slug, tool string) string {
+	t.Helper()
+	g.mu.Lock()
+	endpoint, ok := g.clientEndpoints[slug]
+	g.mu.Unlock()
+	if !ok {
+		t.Fatalf("client endpoint %q has no server", slug)
+	}
+	req, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{"name": tool, "arguments": map[string]any{"key": "val"}},
+	})
+	resp := endpoint.mcp.HandleMessage(context.Background(), req)
+	out, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+	return string(out)
+}
+
+func applyGovernancePreset(t *testing.T, g *Gateway, tool string, preset GovernancePreset) *FileStore {
+	t.Helper()
+	store, ok := g.store.(*FileStore)
+	if !ok {
+		t.Fatal("governance test gateway must use FileStore")
+	}
+	account, ok := store.Account("linear")
+	if !ok {
+		t.Fatal("governance test account missing")
+	}
+	overrides := make(map[string]ToolOverride, len(account.ToolOverrides)+1)
+	for name, override := range account.ToolOverrides {
+		overrides[name] = override
+	}
+	overrides[tool] = ToolOverride{GovernancePreset: preset}
+	if _, err := store.UpdateAccountPolicy(context.Background(), account.Name, accountPolicyPrecondition(account), AccountPolicyMutation{
+		ToolOverrides: &overrides,
+	}); err != nil {
+		t.Fatalf("save governance preset: %v", err)
+	}
+	if _, err := g.ReplaceAccount(context.Background(), account.Name); err != nil {
+		t.Fatalf("refresh governed account: %v", err)
+	}
+	return store
 }
 
 // waitPendingID polls the approval log until a pending record shows up.
@@ -426,6 +477,98 @@ func TestApprovalOnlyGatedToolParks(t *testing.T) {
 	}
 }
 
+func TestHighRiskGovernanceAppliesAcrossEveryMCPDeliverySurface(t *testing.T) {
+	g, saves := newApprovalTestGateway(t)
+	store := applyGovernancePreset(t, g, "save_issue", GovernancePresetHighRisk)
+	ctx := context.Background()
+	account, ok := store.Account("linear")
+	if !ok {
+		t.Fatal("governed account missing")
+	}
+	if _, err := g.CreateNamespace(ctx, Namespace{
+		Slug: "bundle", Label: "Bundle", Accounts: []string{"linear"},
+	}); err != nil {
+		t.Fatalf("create endpoint bundle: %v", err)
+	}
+	if err := g.UpsertConnector(ctx, VirtualConnector{
+		Slug: "curated", Label: "Curated", Tools: map[string][]string{"linear": {"save_issue"}},
+		// This duplicates the connector-level policy that high risk supersedes.
+		// The call must still park exactly once rather than nesting two waits.
+		Approval: map[string][]string{"linear": {"save_issue"}},
+	}); err != nil {
+		t.Fatalf("create curated connector: %v", err)
+	}
+	client, err := store.CreateMCPClient(ctx, MCPClient{
+		Name: "Governed Codex", Subject: "usr_governed", CreatedBy: "usr_governed",
+		ConnectionNamespaceIDs: []string{account.ConnectionNamespaceID},
+	})
+	if err != nil {
+		t.Fatalf("create MCP client: %v", err)
+	}
+	if err := g.RefreshMCPClients(ctx); err != nil {
+		t.Fatalf("refresh MCP clients: %v", err)
+	}
+	g.SetApprovalTimeout(500 * time.Millisecond)
+
+	calls := []struct {
+		name              string
+		approvalConnector string
+		call              func() string
+	}{
+		{
+			name:              "aggregate",
+			approvalConnector: governancePolicyScope,
+			call:              func() string { return callMainTool(t, g, "linear__save_issue", map[string]any{"key": "val"}) },
+		},
+		{
+			name:              "endpoint bundle",
+			approvalConnector: "bundle",
+			call:              func() string { return callConnectorTool(t, g, "bundle", "linear__save_issue") },
+		},
+		{
+			name:              "curated connector",
+			approvalConnector: "curated",
+			call:              func() string { return callConnectorTool(t, g, "curated", "linear__save_issue") },
+		},
+		{
+			name:              "subject-bound client",
+			approvalConnector: client.Slug,
+			call:              func() string { return callSubjectClientTool(t, g, client.Slug, "linear__save_issue") },
+		},
+	}
+	for index, tc := range calls {
+		t.Run(tc.name, func(t *testing.T) {
+			done := make(chan string, 1)
+			go func() { done <- tc.call() }()
+			id := waitPendingID(t, g)
+			pending := approvalRecord(t, g, id)
+			if pending.Connector != tc.approvalConnector || pending.Account != "linear" || pending.Tool != "save_issue" {
+				t.Fatalf("pending %s call = %+v", tc.name, pending)
+			}
+			if err := g.Decide(ctx, id, ApprovalApproved); err != nil {
+				t.Fatalf("approve %s call: %v", tc.name, err)
+			}
+			if response := <-done; !strings.Contains(response, "saved-upstream") || strings.Contains(response, `"isError":true`) {
+				t.Fatalf("approved %s response = %s", tc.name, response)
+			}
+			if got := atomic.LoadInt32(saves); got != int32(index+1) {
+				t.Fatalf("upstream dispatches after %s = %d, want %d", tc.name, got, index+1)
+			}
+		})
+	}
+
+	rows := callRows(t, store, "save_issue")
+	if len(rows) != len(calls) {
+		t.Fatalf("high-risk audit rows = %d, want %d: %+v", len(rows), len(calls), rows)
+	}
+	for _, row := range rows {
+		full := detail(t, store, row.ID)
+		if full.Args == "" || full.Result == "" || !strings.Contains(full.Result, "saved-upstream") {
+			t.Fatalf("high-risk call did not record its payloads: %+v", full)
+		}
+	}
+}
+
 func TestApprovalWrappingSurvivesRebuild(t *testing.T) {
 	g, _ := newApprovalTestGateway(t)
 	g.SetApprovalTimeout(60 * time.Millisecond)
@@ -448,5 +591,36 @@ func TestDecideValidation(t *testing.T) {
 	}
 	if err := g.Decide(context.Background(), "nope", "maybe"); err == nil {
 		t.Fatal("an invalid status must error")
+	}
+}
+
+
+// failingTerminalStore fails the conditional terminal transition, simulating a
+// store that is unavailable exactly when a parked call reaches its deadline.
+type failingTerminalStore struct {
+	*FileStore
+}
+
+func (s failingTerminalStore) ExpirePending(context.Context, string, time.Time) (PendingCall, error) {
+	return PendingCall{}, errors.New("store unavailable")
+}
+
+func TestFinishWaitUnavailableDropsWaiter(t *testing.T) {
+	fs, err := LoadFileStore(filepath.Join(t.TempDir(), "accounts.json"))
+	if err != nil {
+		t.Fatalf("file store: %v", err)
+	}
+	g := NewGateway(failingTerminalStore{fs}, server.NewMCPServer("test", "0.0.0", server.WithToolCapabilities(true)))
+	const id = "appr_unavailable"
+	ch := g.registerWait(id)
+	approved, reason := g.finishWait(context.Background(), id, ch, ApprovalExpired)
+	if approved || reason != "unavailable" {
+		t.Fatalf("finishWait = %v, %q; want false, %q", approved, reason, "unavailable")
+	}
+	g.approveMu.Lock()
+	_, leaked := g.approveCh[id]
+	g.approveMu.Unlock()
+	if leaked {
+		t.Fatal("waiter entry survived the store-unavailable terminal path")
 	}
 }

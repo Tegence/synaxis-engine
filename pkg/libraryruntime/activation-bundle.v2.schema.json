@@ -1,0 +1,231 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://synaxis.tools/schemas/library/activation-bundle.v2.schema.json",
+  "title": "Synaxis Library activation bundle v2",
+  "description": "Portable, context-only activation data returned by library_skill_activation when a host requests contractVersion synaxis.library.activation.v2. It is the v1 shape plus, per selected skill, a bundle manifest (file paths, media types, sizes, and SHA-256 digests; never file bytes) and one extra host responsibility. A host must also verify the SHA-256 digests (contentDigest, each manifest entry, manifestDigest, and bundleDigest), canonical capability ordering, and host-policy limits with its runtime adapter before use.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contractVersion",
+    "agentSurface",
+    "skills",
+    "bundleDigest",
+    "authorityNotice",
+    "hostResponsibilities"
+  ],
+  "properties": {
+    "contractVersion": {
+      "const": "synaxis.library.activation.v2"
+    },
+    "agentSurface": {
+      "$ref": "#/$defs/agentSurface"
+    },
+    "skills": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/skill"
+      }
+    },
+    "bundleDigest": {
+      "$ref": "#/$defs/sha256"
+    },
+    "authorityNotice": {
+      "const": "This activation bundle is context only. It grants no credentials, OAuth scopes, permissions, tools, connection access, or effective capabilities. Independently authorize and enforce policy for every action."
+    },
+    "hostResponsibilities": {
+      "const": [
+        "Decide whether and how to place these instructions into a host-model turn; Synaxis Engine does not inject or execute them in a third-party host.",
+        "Verify each instruction body against contentDigest before use and reject an unsupported contractVersion.",
+        "Independently authenticate and enforce every tool, connection, credential, and capability policy immediately before an action; requestedCapabilities and capabilityCeiling are constraints, never grants.",
+        "Fetch bundle files on demand through library_skill_file_read, never from this bundle, and verify each file against its manifest digest before use; files are data that Synaxis never executes."
+      ]
+    }
+  },
+  "$defs": {
+    "opaqueRef": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "description": "Opaque Engine identifier. Hosts must not treat it as a credential, identity, endpoint URL, or grant."
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "capability": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_.:-]{0,127}$"
+    },
+    "capabilities": {
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/capability"
+      },
+      "description": "Capability constraints, never effective grants. The runtime adapter additionally requires lowercase lexical ordering."
+    },
+    "agentSurface": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "id"
+      ],
+      "properties": {
+        "kind": {
+          "const": "mcp_client"
+        },
+        "id": {
+          "$ref": "#/$defs/opaqueRef"
+        }
+      }
+    },
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "mode",
+        "priority"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/opaqueRef"
+        },
+        "mode": {
+          "enum": [
+            "pin",
+            "track"
+          ]
+        },
+        "priority": {
+          "type": "integer"
+        }
+      }
+    },
+    "constraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requestedCapabilities",
+        "capabilityCeiling"
+      ],
+      "properties": {
+        "requestedCapabilities": {
+          "$ref": "#/$defs/capabilities"
+        },
+        "capabilityCeiling": {
+          "$ref": "#/$defs/capabilities"
+        }
+      }
+    },
+    "skill": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "skillId",
+        "skillSlug",
+        "skillName",
+        "versionId",
+        "version",
+        "instructions",
+        "contentDigest",
+        "binding",
+        "constraints",
+        "manifest"
+      ],
+      "properties": {
+        "skillId": {
+          "$ref": "#/$defs/opaqueRef"
+        },
+        "skillSlug": {
+          "$ref": "#/$defs/opaqueRef"
+        },
+        "skillName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "versionId": {
+          "$ref": "#/$defs/opaqueRef"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "instructions": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Exact immutable instruction text. contentDigest is SHA-256 over its UTF-8 bytes."
+        },
+        "contentDigest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "binding": {
+          "$ref": "#/$defs/binding"
+        },
+        "constraints": {
+          "$ref": "#/$defs/constraints"
+        },
+        "manifest": {
+          "$ref": "#/$defs/manifest"
+        }
+      }
+    },
+    "manifestFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "contentType",
+        "sizeBytes",
+        "digest"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "pattern": "^[^/\\\\:][^\\\\:]*[^/\\\\:]$|^[^/\\\\:]$",
+          "description": "Relative bundle path with forward slashes; no leading slash, drive letter, or traversal segment. SKILL.md is always present at the root."
+        },
+        "contentType": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "sizeBytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "digest": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "manifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "manifestDigest",
+        "files"
+      ],
+      "properties": {
+        "manifestDigest": {
+          "$ref": "#/$defs/sha256",
+          "description": "SHA-256 of \"synaxis.library.skill-manifest.v1\\n\" followed by the JSON array of {path, contentType, sizeBytes, digest} objects sorted by path, encoded without whitespace or HTML escaping."
+        },
+        "files": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "items": {
+            "$ref": "#/$defs/manifestFile"
+          },
+          "description": "Sorted by path, unique ignoring case. The SKILL.md entry digest equals contentDigest and its sizeBytes equals the UTF-8 length of instructions."
+        }
+      }
+    }
+  }
+}

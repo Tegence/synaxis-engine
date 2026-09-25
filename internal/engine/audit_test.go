@@ -142,6 +142,90 @@ func TestRingIDsSurviveEviction(t *testing.T) {
 	}
 }
 
+// TestKeysetBefore is a table-driven check on the (ts,id) tuple comparator
+// RecentCallsBefore relies on for both stores — same predicate as the SQL
+// `WHERE (ts, id) < ($beforeTS, $beforeID)` — with explicit focus on the
+// same-timestamp tie-break, which a wall-clock-driven fixture can't exercise
+// deterministically.
+func TestKeysetBefore(t *testing.T) {
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	t1 := t0.Add(time.Second)
+	cases := []struct {
+		name         string
+		ts, beforeTS time.Time
+		id, beforeID int64
+		want         bool
+	}{
+		{"earlier ts is before", t0, t1, 5, 5, true},
+		{"later ts is not before", t1, t0, 5, 5, false},
+		{"same ts, lower id is before", t0, t0, 3, 5, true},
+		{"same ts, equal id is not before", t0, t0, 5, 5, false},
+		{"same ts, higher id is not before", t0, t0, 7, 5, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := keysetBefore(tc.ts, tc.id, tc.beforeTS, tc.beforeID); got != tc.want {
+				t.Fatalf("keysetBefore(%v,%d,%v,%d) = %v, want %v", tc.ts, tc.id, tc.beforeTS, tc.beforeID, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRingRecentCallsBeforePagesCompleteAndOrdered pages a 250-row fixture in
+// pages of 100 (RecentCalls for the first page, then RecentCallsBefore keyed
+// off the oldest row of the previous page) and asserts the traversal is
+// complete, newest-first, and gap-free — the Activity "Load older" contract.
+func TestRingRecentCallsBeforePagesCompleteAndOrdered(t *testing.T) {
+	s := &FileStore{}
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	const total = 250
+	for i := 0; i < total; i++ {
+		s.LogCall(CallRecord{
+			Account: "a", Tool: "t",
+			TS: base.Add(time.Duration(i) * time.Second),
+		})
+	}
+
+	ctx := context.Background()
+	page, err := s.RecentCalls(ctx, 100)
+	if err != nil {
+		t.Fatalf("RecentCalls: %v", err)
+	}
+	var all []CallRecord
+	for len(page) > 0 {
+		all = append(all, page...)
+		if len(page) < 100 {
+			break
+		}
+		last := page[len(page)-1]
+		page, err = s.RecentCallsBefore(ctx, last.TS, last.ID, 100)
+		if err != nil {
+			t.Fatalf("RecentCallsBefore: %v", err)
+		}
+	}
+
+	if len(all) != total {
+		t.Fatalf("traversal visited %d rows, want %d", len(all), total)
+	}
+	seen := make(map[int64]bool, total)
+	for i, c := range all {
+		if seen[c.ID] {
+			t.Fatalf("row id=%d visited more than once", c.ID)
+		}
+		seen[c.ID] = true
+		if wantID := int64(total - i); c.ID != wantID {
+			t.Fatalf("row %d: id=%d, want %d (newest-first, gap-free)", i, c.ID, wantID)
+		}
+	}
+
+	// Paging one page past the true end returns empty, not an error.
+	oldest := all[len(all)-1]
+	tail, err := s.RecentCallsBefore(ctx, oldest.TS, oldest.ID, 100)
+	if err != nil || len(tail) != 0 {
+		t.Fatalf("paging past the oldest row: got %d rows, err=%v", len(tail), err)
+	}
+}
+
 func TestClampPayload(t *testing.T) {
 	if got := clampPayload("short", 10); got != "short" {
 		t.Fatalf("under-limit string must pass through, got %q", got)

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"os"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -25,7 +24,7 @@ func TestPgStoreMCPClientLifecycleAndNamespaceDelete(t *testing.T) {
 	}
 	defer store.Close()
 
-	suffix := strings.ToLower(newEpoch())
+	suffix := newPgFixtureSuffix()
 	var (
 		team        ConnectionNamespace
 		personal    ConnectionNamespace
@@ -138,7 +137,7 @@ func TestPgStoreMCPClientPersonalBoundarySerializesConcurrentWrites(t *testing.T
 	}
 	defer store.Close()
 
-	suffix := strings.ToLower(newEpoch())
+	suffix := newPgFixtureSuffix()
 	space, err := store.CreateConnectionNamespace(ctx, ConnectionNamespace{
 		Label: "PG MCP race " + suffix, CreatedBy: "usr_pg_owner",
 	})
@@ -219,7 +218,7 @@ func TestPgStoreAccountMoveRotatesOnlyMCPClientsWithChangedDelivery(t *testing.T
 	}
 	defer store.Close()
 
-	suffix := strings.ToLower(newEpoch())
+	suffix := newPgFixtureSuffix()
 	var (
 		source      ConnectionNamespace
 		target      ConnectionNamespace
@@ -340,7 +339,7 @@ func TestPgStoreLegacyGroupUpsertRotatesScopedClientEpochAndSetMetaRejectsOwners
 	}
 	defer store.Close()
 
-	suffix := strings.ToLower(newEpoch())
+	suffix := newPgFixtureSuffix()
 	accountName := "pg_mcp_legacy_group_" + suffix
 	source, err := store.CreateConnectionNamespace(ctx, ConnectionNamespace{Label: "PG legacy source " + suffix})
 	if err != nil {

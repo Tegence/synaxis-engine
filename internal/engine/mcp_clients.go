@@ -2,6 +2,8 @@ package engine
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"sort"
@@ -21,23 +23,76 @@ import (
 // (for example, /mcp/clients/<slug>). It is distinct from ID, which is
 // opaque and remains the authority key for management requests.
 type MCPClient struct {
-	ID                     string          `json:"id"`
-	Slug                   string          `json:"slug"`
-	Name                   string          `json:"name"`
-	Subject                string          `json:"subject"`
-	OAuthClientID          string          `json:"oauth_client_id,omitempty"`
-	ConnectionNamespaceIDs []string        `json:"connection_namespace_ids"`
-	Status                 MCPClientStatus `json:"status"`
-	Epoch                  string          `json:"epoch"`
-	Revision               int64           `json:"revision"`
-	CreatedBy              string          `json:"created_by,omitempty"`
-	CreatedAt              time.Time       `json:"created_at,omitempty"`
-	UpdatedAt              time.Time       `json:"updated_at,omitempty"`
-	RevokedAt              *time.Time      `json:"revoked_at,omitempty"`
-	RevokedBy              string          `json:"revoked_by,omitempty"`
+	ID            string `json:"id"`
+	Slug          string `json:"slug"`
+	Name          string `json:"name"`
+	Subject       string `json:"subject"`
+	OAuthClientID string `json:"oauth_client_id,omitempty"`
+	// RuntimeAttestorPublicKey is an optional, canonical raw-base64url
+	// Ed25519 public key. It authorizes only the separate host-attestation
+	// endpoint; it is neither an OAuth credential nor an MCP bearer token.
+	RuntimeAttestorPublicKey string `json:"runtime_attestor_public_key,omitempty"`
+	// AgentProfileBinding is an opaque, revisioned reference installed by a
+	// hosting control plane. The Engine validates only its shape and never
+	// interprets the policy behind it; it is not a grant, credential, or
+	// capability. Any change to the bound reference rotates Epoch because the
+	// external policy a client runs under is authorization-relevant.
+	AgentProfileBinding    *MCPClientProfileBinding `json:"agent_profile_binding,omitempty"`
+	ConnectionNamespaceIDs []string                 `json:"connection_namespace_ids"`
+	Kind                   MCPClientKind            `json:"kind"` // fixed at creation; empty means interactive
+	Status                 MCPClientStatus          `json:"status"`
+	Epoch                  string                   `json:"epoch"`
+	Revision               int64                    `json:"revision"`
+	CreatedBy              string                   `json:"created_by,omitempty"`
+	CreatedAt              time.Time                `json:"created_at,omitempty"`
+	UpdatedAt              time.Time                `json:"updated_at,omitempty"`
+	RevokedAt              *time.Time               `json:"revoked_at,omitempty"`
+	RevokedBy              string                   `json:"revoked_by,omitempty"`
+	// runtimeAttestorKeySet is an update-only presence bit. It is intentionally
+	// not persisted, so an empty public key can explicitly disable attestation.
+	runtimeAttestorKeySet bool `json:"-"`
+	// agentProfileBindingSet is the matching presence bit for a generic
+	// update. Profile bindings change only through BindMCPClientProfile and
+	// UnbindMCPClientProfile; an update that sets this bit is rejected so a
+	// rename can never silently install or clear a binding.
+	agentProfileBindingSet bool `json:"-"`
+}
+
+// MCPClientProfileBinding is the opaque Agent Access Profile reference bound
+// to one client. ProfileID and PolicyDigest are shape-validated only: the
+// Engine stores exactly what the control plane asserted so a later snapshot
+// can be compared by digest, and it never resolves or applies the policy.
+type MCPClientProfileBinding struct {
+	ProfileID       string    `json:"profile_id"`
+	ProfileRevision int64     `json:"profile_revision"`
+	PolicyDigest    string    `json:"policy_digest"`
+	BoundAt         time.Time `json:"bound_at"`
 }
 
 type MCPClientStatus string
+
+// MCPClientKind decides who may complete a client's OAuth binding.
+//
+// An interactive client is bound by its human subject through browser
+// consent to one dynamic (DCR) registration. A workload client belongs to a
+// non-human subject whose runs a hosting control plane executes: it never
+// takes browser consent, and it binds only the reserved identity
+// workload:<client id>, for which the control plane's service principal
+// brokers short-lived resource tokens. Either kind is served at the same
+// /mcp/clients/{slug} surface under the same epoch, grant, and tool policy.
+type MCPClientKind string
+
+const (
+	MCPClientKindInteractive MCPClientKind = "interactive"
+	MCPClientKindWorkload    MCPClientKind = "workload"
+
+	// workloadOAuthClientIDPrefix reserves an OAuth client-ID namespace that
+	// dynamic registration never produces (signed DCR identities use only the
+	// mcp_v1 base64url alphabet, which excludes ':'). The registry refuses to
+	// bind it through the consent path, so a workload identity cannot be
+	// claimed by, or attached to, an interactive client.
+	workloadOAuthClientIDPrefix = "workload:"
+)
 
 const (
 	MCPClientStatusActive  MCPClientStatus = "active"
@@ -93,6 +148,25 @@ type MCPClientStore interface {
 	// previously issued path tokens fail closed before a later explicit bind.
 	ResetMCPClientOAuthClient(ctx context.Context, id string, precondition MCPClientPrecondition) (MCPClient, error)
 	RevokeMCPClient(ctx context.Context, id, revokedBy string, precondition MCPClientPrecondition) (MCPClient, error)
+	// BindMCPClientProfile installs an opaque profile reference under the
+	// client's revision fence. Binding the identical (profile, revision,
+	// digest) tuple is a no-op that returns the current record; any other
+	// change rotates Epoch and bumps Revision.
+	BindMCPClientProfile(ctx context.Context, precondition MCPClientPrecondition, binding MCPClientProfileBinding) (MCPClient, error)
+	// UnbindMCPClientProfile clears the profile reference. Clearing an
+	// already-unbound client is a no-op that returns the current record.
+	UnbindMCPClientProfile(ctx context.Context, precondition MCPClientPrecondition) (MCPClient, error)
+	// BindMCPClientWorkloadIdentity binds the reserved OAuth identity
+	// workload:<id> to an active workload client. It needs no caller revision:
+	// the only value it can ever install is derived from the immutable ID, so
+	// an identical existing binding is a no-op returning the current record,
+	// and any other existing binding is ErrMCPClientWorkloadBinding. The first
+	// bind bumps Revision (a durable change) but deliberately keeps Epoch: an
+	// unbound client cannot hold a valid token, because every client-bound
+	// token use requires a matching binding, so there is nothing to revoke.
+	// An interactive client is ErrMCPClientKind; a revoked one is
+	// ErrMCPClientRevoked.
+	BindMCPClientWorkloadIdentity(ctx context.Context, id string) (MCPClient, error)
 }
 
 var (
@@ -105,6 +179,15 @@ var (
 	ErrMCPClientNamespaceLimit   = errors.New("MCP client namespace grant limit reached")
 	ErrMCPClientNamespaceSubject = errors.New("MCP client subject cannot access a personal connection in this namespace")
 	ErrInvalidMCPClient          = errors.New("invalid MCP client")
+	// ErrMCPClientProfileBindingConflict reports that a different profile is
+	// already bound and the caller did not ask to replace it.
+	ErrMCPClientProfileBindingConflict = errors.New("MCP client is bound to a different agent profile")
+	// ErrMCPClientKind reports an operation the client's kind does not permit,
+	// such as brokering a workload token for an interactive client.
+	ErrMCPClientKind = errors.New("MCP client kind does not permit this operation")
+	// ErrMCPClientWorkloadBinding reports a workload client whose OAuth
+	// binding is something other than its reserved workload identity.
+	ErrMCPClientWorkloadBinding = errors.New("MCP client is bound to a different OAuth identity")
 )
 
 func newMCPClientID() string { return "mcpcli_" + newEpoch() }
@@ -116,7 +199,49 @@ func copyMCPClient(client MCPClient) MCPClient {
 		revokedAt := *client.RevokedAt
 		cp.RevokedAt = &revokedAt
 	}
+	if client.AgentProfileBinding != nil {
+		binding := *client.AgentProfileBinding
+		cp.AgentProfileBinding = &binding
+	}
 	return cp
+}
+
+// normalizeMCPClientProfileBinding validates the opaque reference's shape
+// only. The profile ID shares the actor identifier alphabet so it can travel
+// in a signed control path; the digest must be a canonical SHA-256 hex value.
+func normalizeMCPClientProfileBinding(binding MCPClientProfileBinding) (MCPClientProfileBinding, error) {
+	binding.ProfileID = strings.TrimSpace(binding.ProfileID)
+	if !validActorIdentifier(binding.ProfileID) {
+		return MCPClientProfileBinding{}, fmt.Errorf("%w: profile ID is invalid", ErrInvalidMCPClient)
+	}
+	if binding.ProfileRevision < 1 {
+		return MCPClientProfileBinding{}, fmt.Errorf("%w: profile revision must be at least 1", ErrInvalidMCPClient)
+	}
+	if !libraryDigestPattern.MatchString(binding.PolicyDigest) {
+		return MCPClientProfileBinding{}, fmt.Errorf("%w: policy digest is invalid", ErrInvalidMCPClient)
+	}
+	if binding.BoundAt.IsZero() {
+		binding.BoundAt = time.Now().UTC()
+	}
+	binding.BoundAt = binding.BoundAt.UTC()
+	return binding, nil
+}
+
+// sameMCPClientProfileReference ignores BoundAt: two bindings that name the
+// same profile revision and digest are the same authorization fact, so
+// re-binding them must not rotate the client epoch.
+func sameMCPClientProfileReference(a, b *MCPClientProfileBinding) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.ProfileID == b.ProfileID && a.ProfileRevision == b.ProfileRevision && a.PolicyDigest == b.PolicyDigest
+}
+
+func sameMCPClientProfileBinding(a, b *MCPClientProfileBinding) bool {
+	if !sameMCPClientProfileReference(a, b) {
+		return false
+	}
+	return a == nil || a.BoundAt.Equal(b.BoundAt)
 }
 
 func copyMCPClients(in []*MCPClient) []*MCPClient {
@@ -167,6 +292,32 @@ func validMCPClientOAuthClientID(value string) bool {
 	return true
 }
 
+func normalizeMCPClientRuntimeAttestorPublicKey(value string) (string, error) {
+	if value == "" {
+		return "", nil
+	}
+	if strings.TrimSpace(value) != value {
+		return "", fmt.Errorf("%w: runtime attestor public key is invalid", ErrInvalidMCPClient)
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil || len(decoded) != ed25519.PublicKeySize || base64.RawURLEncoding.EncodeToString(decoded) != value {
+		return "", fmt.Errorf("%w: runtime attestor public key is invalid", ErrInvalidMCPClient)
+	}
+	return value, nil
+}
+
+func mcpClientRuntimeAttestorPublicKey(value string) (ed25519.PublicKey, bool) {
+	normalized, err := normalizeMCPClientRuntimeAttestorPublicKey(value)
+	if err != nil || normalized == "" {
+		return nil, false
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(normalized)
+	if err != nil {
+		return nil, false
+	}
+	return ed25519.PublicKey(decoded), true
+}
+
 func validateMCPClientName(value string) error {
 	if value == "" || utf8.RuneCountInString(value) > maxMCPClientNameRunes {
 		return fmt.Errorf("%w: name is required and must be at most %d characters", ErrInvalidMCPClient, maxMCPClientNameRunes)
@@ -190,6 +341,54 @@ func normalizeMCPClientStatus(status MCPClientStatus) (MCPClientStatus, error) {
 	default:
 		return "", fmt.Errorf("%w: status is invalid", ErrInvalidMCPClient)
 	}
+}
+
+// normalizeMCPClientKind maps the legacy empty value to interactive and
+// accepts exactly the two defined kinds. It is deliberately strict (no case
+// folding or trimming): kind is an authorization fact, so a near-miss value
+// is rejected rather than guessed.
+func normalizeMCPClientKind(kind MCPClientKind) (MCPClientKind, error) {
+	switch kind {
+	case "", MCPClientKindInteractive:
+		return MCPClientKindInteractive, nil
+	case MCPClientKindWorkload:
+		return MCPClientKindWorkload, nil
+	default:
+		return "", fmt.Errorf("%w: kind must be %q or %q", ErrInvalidMCPClient, MCPClientKindInteractive, MCPClientKindWorkload)
+	}
+}
+
+// mcpClientKind reads a record's kind with the empty-means-interactive rule,
+// so a record that has not passed a store normalizer is still classified.
+func mcpClientKind(client MCPClient) MCPClientKind {
+	if client.Kind == MCPClientKindWorkload {
+		return MCPClientKindWorkload
+	}
+	return MCPClientKindInteractive
+}
+
+// workloadOAuthClientID is the one OAuth identity a workload client may bind.
+func workloadOAuthClientID(clientID string) string {
+	return workloadOAuthClientIDPrefix + clientID
+}
+
+func isWorkloadOAuthClientID(oauthClientID string) bool {
+	return strings.HasPrefix(oauthClientID, workloadOAuthClientIDPrefix)
+}
+
+// mcpClientOAuthBindingConsistent is the kind/binding invariant every store
+// write upholds: a workload client is unbound or bound to its own reserved
+// identity, and an interactive client never holds a reserved identity. The
+// runtime token check repeats it so a corrupt or hand-edited record fails
+// closed instead of authorizing through the wrong flow.
+func mcpClientOAuthBindingConsistent(client MCPClient) bool {
+	if client.OAuthClientID == "" {
+		return true
+	}
+	if mcpClientKind(client) == MCPClientKindWorkload {
+		return client.OAuthClientID == workloadOAuthClientID(client.ID)
+	}
+	return !isWorkloadOAuthClientID(client.OAuthClientID)
 }
 
 func mcpClientPreconditionMatches(client MCPClient, precondition MCPClientPrecondition) bool {
@@ -237,8 +436,16 @@ func accountOwnershipChanged(before, after Account) bool {
 // bearer capability: a signed Platform actor must be the same subject and be
 // a connection-capable member. Shared/root delivery remains a separate
 // owner/admin-only decision in Gateway/OAuth wiring.
+//
+// It is the gate for the human consent and DCR-bind paths, so it never
+// admits a workload client: that client's identity is brokered only by the
+// control plane's service principal, even when a member's user ID happens to
+// equal the workload subject (for example the self-hosted local admin).
 func MCPClientAllowsActor(client MCPClient, actor PlatformActor) bool {
 	if client.Status != MCPClientStatusActive || actor.UserID == "" || actor.UserID != client.Subject {
+		return false
+	}
+	if mcpClientKind(client) == MCPClientKindWorkload {
 		return false
 	}
 	switch actor.Role {
@@ -273,6 +480,16 @@ func prepareMCPClientForCreate(client *MCPClient) error {
 	if err := validateMCPClientSubject(client.Subject); err != nil {
 		return err
 	}
+	kind, err := normalizeMCPClientKind(client.Kind)
+	if err != nil {
+		return err
+	}
+	client.Kind = kind
+	var keyErr error
+	client.RuntimeAttestorPublicKey, keyErr = normalizeMCPClientRuntimeAttestorPublicKey(client.RuntimeAttestorPublicKey)
+	if keyErr != nil {
+		return keyErr
+	}
 	client.CreatedBy = strings.TrimSpace(client.CreatedBy)
 	if client.CreatedBy != "" && !validActorIdentifier(client.CreatedBy) {
 		return fmt.Errorf("%w: creator is invalid", ErrInvalidMCPClient)
@@ -283,6 +500,11 @@ func prepareMCPClientForCreate(client *MCPClient) error {
 		// OAuth bind must pass through BindMCPClientOAuthClient with the signed
 		// subject actor, after the registry record exists.
 		return fmt.Errorf("%w: OAuth client ID must be bound explicitly", ErrInvalidMCPClient)
+	}
+	if client.AgentProfileBinding != nil || client.agentProfileBindingSet {
+		// Likewise, a profile reference is installed only through the explicit
+		// revision-fenced bind operation once the record exists.
+		return fmt.Errorf("%w: agent profile binding must be bound explicitly", ErrInvalidMCPClient)
 	}
 	status, err := normalizeMCPClientStatus(client.Status)
 	if err != nil || status != MCPClientStatusActive {
@@ -346,6 +568,17 @@ func prepareLoadedMCPClient(client *MCPClient, existingIDs, existingSlugs, exist
 	if err := validateMCPClientSubject(client.Subject); err != nil {
 		return false, err
 	}
+	// Records written before kinds existed carry no value and are interactive.
+	// An unknown value fails the load closed, exactly like an unknown status:
+	// guessing either kind could open or close a consent path it should not.
+	client.Kind, err = normalizeMCPClientKind(client.Kind)
+	if err != nil {
+		return false, fmt.Errorf("%w: stored kind is invalid", ErrInvalidMCPClient)
+	}
+	client.RuntimeAttestorPublicKey, err = normalizeMCPClientRuntimeAttestorPublicKey(client.RuntimeAttestorPublicKey)
+	if err != nil {
+		return false, err
+	}
 	client.CreatedBy = strings.TrimSpace(client.CreatedBy)
 	if client.CreatedBy != "" && !validActorIdentifier(client.CreatedBy) {
 		return false, fmt.Errorf("%w: stored creator is invalid", ErrInvalidMCPClient)
@@ -367,6 +600,13 @@ func prepareLoadedMCPClient(client *MCPClient, existingIDs, existingSlugs, exist
 	client.ConnectionNamespaceIDs, err = normalizeMCPClientNamespaceIDs(client.ConnectionNamespaceIDs)
 	if err != nil {
 		return false, err
+	}
+	if client.AgentProfileBinding != nil {
+		binding, err := normalizeMCPClientProfileBinding(*client.AgentProfileBinding)
+		if err != nil {
+			return false, fmt.Errorf("%w: stored agent profile binding is invalid", ErrInvalidMCPClient)
+		}
+		client.AgentProfileBinding = &binding
 	}
 	unsafeNamespaceGrant := false
 	for _, namespaceID := range client.ConnectionNamespaceIDs {
@@ -414,10 +654,11 @@ func prepareLoadedMCPClient(client *MCPClient, existingIDs, existingSlugs, exist
 }
 
 func sameMCPClient(a, b MCPClient) bool {
-	if a.ID != b.ID || a.Slug != b.Slug || a.Name != b.Name || a.Subject != b.Subject ||
-		a.OAuthClientID != b.OAuthClientID || a.Status != b.Status || a.Epoch != b.Epoch ||
+	if a.ID != b.ID || a.Slug != b.Slug || a.Name != b.Name || a.Subject != b.Subject || a.Kind != b.Kind ||
+		a.OAuthClientID != b.OAuthClientID || a.RuntimeAttestorPublicKey != b.RuntimeAttestorPublicKey || a.Status != b.Status || a.Epoch != b.Epoch ||
 		a.Revision != b.Revision || a.CreatedBy != b.CreatedBy || !a.CreatedAt.Equal(b.CreatedAt) ||
-		!a.UpdatedAt.Equal(b.UpdatedAt) || a.RevokedBy != b.RevokedBy || !sameStrings(a.ConnectionNamespaceIDs, b.ConnectionNamespaceIDs) {
+		!a.UpdatedAt.Equal(b.UpdatedAt) || a.RevokedBy != b.RevokedBy || !sameStrings(a.ConnectionNamespaceIDs, b.ConnectionNamespaceIDs) ||
+		!sameMCPClientProfileBinding(a.AgentProfileBinding, b.AgentProfileBinding) {
 		return false
 	}
 	if a.RevokedAt == nil || b.RevokedAt == nil {
@@ -650,10 +891,26 @@ func (s *FileStore) CreateMCPClient(_ context.Context, client MCPClient) (MCPCli
 	if err := s.validateMCPClientNamespacesLocked(client); err != nil {
 		return MCPClient{}, err
 	}
+	beforeSkills := cloneBuiltInLibrarySkills(s.librarySkills)
+	beforeVersions := cloneBuiltInLibrarySkillVersions(s.librarySkillVersions)
+	beforeBindings := copyLibrarySkillBindings(s.librarySkillBindings)
+	beforeGenerations := copyLibrarySkillBindingGenerations(s.librarySkillBindingGenerations)
 	copy := copyMCPClient(client)
 	s.mcpClients = append(s.mcpClients, &copy)
+	if _, err := s.reconcileInstalledBuiltInLibraryForNewClientLocked(); err != nil {
+		s.mcpClients = s.mcpClients[:len(s.mcpClients)-1]
+		s.librarySkills = beforeSkills
+		s.librarySkillVersions = beforeVersions
+		s.librarySkillBindings = beforeBindings
+		s.librarySkillBindingGenerations = beforeGenerations
+		return MCPClient{}, err
+	}
 	if err := s.saveLocked(); err != nil {
 		s.mcpClients = s.mcpClients[:len(s.mcpClients)-1]
+		s.librarySkills = beforeSkills
+		s.librarySkillVersions = beforeVersions
+		s.librarySkillBindings = beforeBindings
+		s.librarySkillBindingGenerations = beforeGenerations
 		return MCPClient{}, err
 	}
 	return copyMCPClient(copy), nil
@@ -682,11 +939,31 @@ func (s *FileStore) UpdateMCPClient(_ context.Context, update MCPClient, precond
 	if update.Slug != "" && normalizeMCPClientSlug(update.Slug) != client.Slug {
 		return MCPClient{}, fmt.Errorf("%w: endpoint slug is immutable", ErrInvalidMCPClient)
 	}
-	if name == client.Name {
+	if update.Kind != "" && update.Kind != mcpClientKind(*client) {
+		return MCPClient{}, fmt.Errorf("%w: kind is immutable", ErrInvalidMCPClient)
+	}
+	if update.agentProfileBindingSet || update.AgentProfileBinding != nil {
+		return MCPClient{}, fmt.Errorf("%w: agent profile binding changes require the profile-binding operation", ErrInvalidMCPClient)
+	}
+	key := client.RuntimeAttestorPublicKey
+	if update.runtimeAttestorKeySet {
+		var keyErr error
+		key, keyErr = normalizeMCPClientRuntimeAttestorPublicKey(update.RuntimeAttestorPublicKey)
+		if keyErr != nil {
+			return MCPClient{}, keyErr
+		}
+	}
+	if name == client.Name && key == client.RuntimeAttestorPublicKey {
 		return copyMCPClient(*client), nil
 	}
 	before := copyMCPClient(*client)
 	client.Name = name
+	if key != client.RuntimeAttestorPublicKey {
+		client.RuntimeAttestorPublicKey = key
+		// A key rotation is an authorization boundary: pending signed receipts
+		// for the old key must fail even before their expiry.
+		client.Epoch = newEpoch()
+	}
 	client.Revision++
 	client.UpdatedAt = time.Now().UTC()
 	if err := s.saveLocked(); err != nil {
@@ -737,6 +1014,11 @@ func (s *FileStore) BindMCPClientOAuthClient(_ context.Context, id, oauthClientI
 	oauthClientID = strings.TrimSpace(oauthClientID)
 	if !validMCPClientOAuthClientID(oauthClientID) {
 		return MCPClient{}, fmt.Errorf("%w: OAuth client ID is invalid", ErrInvalidMCPClient)
+	}
+	if isWorkloadOAuthClientID(oauthClientID) {
+		// The consent path binds DCR identities only; the reserved namespace is
+		// installed exclusively by BindMCPClientWorkloadIdentity.
+		return MCPClient{}, fmt.Errorf("%w: OAuth client ID is reserved", ErrInvalidMCPClient)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -799,6 +1081,46 @@ func (s *FileStore) ResetMCPClientOAuthClient(_ context.Context, id string, prec
 	return copyMCPClient(*client), nil
 }
 
+func (s *FileStore) BindMCPClientWorkloadIdentity(_ context.Context, id string) (MCPClient, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	client, ok := s.mcpClientByIDLocked(strings.TrimSpace(id))
+	if !ok {
+		return MCPClient{}, ErrMCPClientNotFound
+	}
+	// Kind is checked before status so an interactive record, revoked or not,
+	// is reported identically to a caller brokering workload identities.
+	if mcpClientKind(*client) != MCPClientKindWorkload {
+		return MCPClient{}, ErrMCPClientKind
+	}
+	if client.Status == MCPClientStatusRevoked {
+		return MCPClient{}, ErrMCPClientRevoked
+	}
+	identity := workloadOAuthClientID(client.ID)
+	if client.OAuthClientID == identity {
+		return copyMCPClient(*client), nil
+	}
+	if client.OAuthClientID != "" {
+		return MCPClient{}, ErrMCPClientWorkloadBinding
+	}
+	if !validMCPClientOAuthClientID(identity) {
+		return MCPClient{}, fmt.Errorf("%w: workload identity is invalid", ErrInvalidMCPClient)
+	}
+	if existing, exists := s.mcpClientByOAuthIDLocked(identity); exists && existing.ID != client.ID {
+		return MCPClient{}, ErrMCPClientWorkloadBinding
+	}
+	before := copyMCPClient(*client)
+	client.OAuthClientID = identity
+	// Revision, not Epoch: see MCPClientStore.BindMCPClientWorkloadIdentity.
+	client.Revision++
+	client.UpdatedAt = time.Now().UTC()
+	if err := s.saveLocked(); err != nil {
+		*client = before
+		return MCPClient{}, err
+	}
+	return copyMCPClient(*client), nil
+}
+
 func (s *FileStore) RevokeMCPClient(_ context.Context, id, revokedBy string, precondition MCPClientPrecondition) (MCPClient, error) {
 	revokedBy = strings.TrimSpace(revokedBy)
 	if revokedBy != "" && !validActorIdentifier(revokedBy) {
@@ -824,6 +1146,70 @@ func (s *FileStore) RevokeMCPClient(_ context.Context, id, revokedBy string, pre
 	client.UpdatedAt = now
 	client.RevokedAt = &now
 	client.RevokedBy = revokedBy
+	if err := s.saveLocked(); err != nil {
+		*client = before
+		return MCPClient{}, err
+	}
+	return copyMCPClient(*client), nil
+}
+
+func (s *FileStore) BindMCPClientProfile(_ context.Context, precondition MCPClientPrecondition, binding MCPClientProfileBinding) (MCPClient, error) {
+	binding, err := normalizeMCPClientProfileBinding(binding)
+	if err != nil {
+		return MCPClient{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	client, ok := s.mcpClientByIDLocked(strings.TrimSpace(precondition.ID))
+	if !ok {
+		return MCPClient{}, ErrMCPClientNotFound
+	}
+	if !mcpClientPreconditionMatches(*client, precondition) {
+		return MCPClient{}, ErrMCPClientRevision
+	}
+	if client.Status == MCPClientStatusRevoked {
+		return MCPClient{}, ErrMCPClientRevoked
+	}
+	if sameMCPClientProfileReference(client.AgentProfileBinding, &binding) {
+		return copyMCPClient(*client), nil
+	}
+	before := copyMCPClient(*client)
+	now := time.Now().UTC()
+	binding.BoundAt = now
+	client.AgentProfileBinding = &binding
+	// The bound policy reference is an authorization fact: tokens minted under
+	// the previous binding must fail closed before the new one is observed.
+	client.Epoch = newEpoch()
+	client.Revision++
+	client.UpdatedAt = now
+	if err := s.saveLocked(); err != nil {
+		*client = before
+		return MCPClient{}, err
+	}
+	return copyMCPClient(*client), nil
+}
+
+func (s *FileStore) UnbindMCPClientProfile(_ context.Context, precondition MCPClientPrecondition) (MCPClient, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	client, ok := s.mcpClientByIDLocked(strings.TrimSpace(precondition.ID))
+	if !ok {
+		return MCPClient{}, ErrMCPClientNotFound
+	}
+	if !mcpClientPreconditionMatches(*client, precondition) {
+		return MCPClient{}, ErrMCPClientRevision
+	}
+	if client.Status == MCPClientStatusRevoked {
+		return MCPClient{}, ErrMCPClientRevoked
+	}
+	if client.AgentProfileBinding == nil {
+		return copyMCPClient(*client), nil
+	}
+	before := copyMCPClient(*client)
+	client.AgentProfileBinding = nil
+	client.Epoch = newEpoch()
+	client.Revision++
+	client.UpdatedAt = time.Now().UTC()
 	if err := s.saveLocked(); err != nil {
 		*client = before
 		return MCPClient{}, err

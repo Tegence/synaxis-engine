@@ -13,6 +13,24 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
+// mcpClientProjectionTTL bounds how long a subject-bound client endpoint may
+// serve requests without re-deriving itself from durable state. Every
+// mutation that can affect a client's projection (console handlers via
+// refreshMCPClientProjection/RefreshMCPClients, and account/namespace changes
+// via RefreshConnectors) already calls buildMCPClient synchronously — for
+// every active client — before the mutating request returns, which resets
+// this window. So in the steady state this TTL only bounds staleness from a
+// source OTHER than an in-process mutation (e.g. a durable write this replica
+// has not yet been told to refresh for); it is not the primary freshness
+// mechanism.
+const mcpClientProjectionTTL = 5 * time.Second
+
+// errMCPClientConsentRefused is the one refusal AuthorizeMCPConsent gives an
+// actor who may not consent for a client-bound resource. The OAuth server
+// maps any refusal to the same generic access_denied, and keeping a single
+// error here keeps the Engine side just as uninformative.
+var errMCPClientConsentRefused = errors.New("actor cannot authorize this MCP client")
+
 // mcpClientStore returns the durable subject-bound delivery registry. It is a
 // facet rather than a requirement of AccountStore so older self-hosted store
 // implementations keep compiling, but production FileStore and PgStore both
@@ -40,7 +58,12 @@ func (g *Gateway) buildMCPClient(client MCPClient) error {
 	}
 	endpoint, ok := g.clientEndpoints[client.Slug]
 	if !ok {
-		m := server.NewMCPServer("narthex-client-"+client.Slug, "0.1.0", server.WithToolCapabilities(true))
+		_, libraryAvailable := g.store.(LibraryStore)
+		_, memoryAvailable := g.store.(LibraryMemoryStore)
+		m := newSynaxisMCPServer("narthex-client-"+client.Slug, mcpBootstrapSurfaceClient, mcpBootstrapFeatures{
+			library: libraryAvailable,
+			memory:  libraryAvailable && memoryAvailable,
+		})
 		endpoint = &connectorServer{
 			mcp:     m,
 			handler: server.NewStreamableHTTPServer(m, server.WithEndpointPath("/mcp/clients/"+client.Slug)),
@@ -52,6 +75,7 @@ func (g *Gateway) buildMCPClient(client MCPClient) error {
 	endpoint.epoch = client.Epoch
 	endpoint.revision = client.Revision
 	endpoint.guards = nil
+	endpoint.refreshedAt = time.Now()
 
 	var names []string
 	var tools []cachedTool
@@ -95,6 +119,22 @@ func (g *Gateway) buildMCPClient(client MCPClient) error {
 	for _, tool := range tools {
 		endpoint.mcp.AddTool(tool.tool, tool.handler)
 	}
+	// The root /mcp server retains its owner/admin Library projection. A
+	// subject-bound client endpoint instead gets a small, independently
+	// guarded projection whose identity is derived from this durable client
+	// record. Register after deleting endpoint.names above so a refresh cannot
+	// leave a stale built-in behind.
+	if libraryStore, ok := g.store.(LibraryStore); ok {
+		names = append(names, registerMCPClientLibraryTools(
+			endpoint.mcp,
+			libraryStore,
+			g.audit,
+			client,
+			func(ctx context.Context) bool {
+				return g.mcpClientMayUseLibrary(ctx, client.Slug, client.ID, client.Subject, client.Epoch)
+			},
+		)...)
+	}
 	endpoint.names = names
 	return nil
 }
@@ -117,15 +157,18 @@ func (g *Gateway) refreshMCPClientsLocked(ctx context.Context) error {
 	store, ok := g.mcpClientStore()
 	if !ok {
 		g.mu.Lock()
-		stale := make([]string, 0, len(g.clientEndpoints))
-		for slug := range g.clientEndpoints {
-			stale = append(stale, slug)
+		stale := make(map[string]string, len(g.clientEndpoints))
+		for slug, endpoint := range g.clientEndpoints {
+			stale[slug] = endpoint.epoch
 		}
 		g.clientEndpoints = map[string]*connectorServer{}
 		revoke := g.revokeResource
+		revokeEpoch := g.revokeResourceEpoch
 		g.mu.Unlock()
-		if revoke != nil {
-			for _, slug := range stale {
+		for slug, epoch := range stale {
+			if revokeEpoch != nil && epoch != "" {
+				revokeEpoch("/mcp/clients/"+slug, epoch)
+			} else if revoke != nil {
 				revoke("/mcp/clients/" + slug)
 			}
 		}
@@ -151,25 +194,28 @@ func (g *Gateway) refreshMCPClientsLocked(ctx context.Context) error {
 	}
 
 	g.mu.Lock()
-	var revoked []string
+	revoked := make(map[string]string)
 	for slug := range g.clientEndpoints {
 		epoch, live := seen[slug]
 		if !live {
 			delete(g.clientEndpoints, slug)
-			revoked = append(revoked, slug)
+			revoked[slug] = previousEpochs[slug]
 			continue
 		}
 		// If a previous endpoint generation was served before this refresh,
 		// discard pending OAuth code/refresh state for its path as a faster
 		// complement to the epoch check in RequireAuth.
 		if previousEpochs[slug] != "" && previousEpochs[slug] != epoch {
-			revoked = append(revoked, slug)
+			revoked[slug] = previousEpochs[slug]
 		}
 	}
 	revoke := g.revokeResource
+	revokeEpoch := g.revokeResourceEpoch
 	g.mu.Unlock()
-	if revoke != nil {
-		for _, slug := range revoked {
+	for slug, epoch := range revoked {
+		if revokeEpoch != nil && epoch != "" {
+			revokeEpoch("/mcp/clients/"+slug, epoch)
+		} else if revoke != nil {
 			revoke("/mcp/clients/" + slug)
 		}
 	}
@@ -209,16 +255,25 @@ func (g *Gateway) MCPClientHandler(slug string) (http.Handler, bool) {
 		return nil, false
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Rebuild directly from durable state at the request boundary. This
-		// keeps tools/list as fresh as the current folder/account assignment on
-		// every replica, rather than relying on console process affinity.
-		if err := g.refreshMCPClientRequest(r.Context(), slug); err != nil {
-			if errors.Is(err, ErrMCPClientNotFound) || errors.Is(err, ErrMCPClientRevoked) {
-				http.NotFound(w, r)
+		// Rebuild from durable state only when the cached projection is older
+		// than mcpClientProjectionTTL (or has disappeared/changed kind). A
+		// mutation-triggered rebuild — console handlers, account/namespace
+		// changes — already refreshed it well within that window (see
+		// mcpClientProjectionTTL's doc comment), so this bounds worst-case
+		// staleness rather than driving freshness on every request.
+		g.mu.Lock()
+		current, found := g.clientEndpoints[slug]
+		stale := !found || current.kind != endpointKindClient || time.Since(current.refreshedAt) >= mcpClientProjectionTTL
+		g.mu.Unlock()
+		if stale {
+			if err := g.refreshMCPClientRequest(r.Context(), slug); err != nil {
+				if errors.Is(err, ErrMCPClientNotFound) || errors.Is(err, ErrMCPClientRevoked) {
+					http.NotFound(w, r)
+					return
+				}
+				http.Error(w, "MCP client endpoint unavailable", http.StatusServiceUnavailable)
 				return
 			}
-			http.Error(w, "MCP client endpoint unavailable", http.StatusServiceUnavailable)
-			return
 		}
 		g.mu.Lock()
 		live, found := g.clientEndpoints[slug]
@@ -254,6 +309,13 @@ func (g *Gateway) MCPClientAllowsOAuthClient(oauthClientID, resource string) boo
 	if !ok || client.OAuthClientID != oauthClientID {
 		return false
 	}
+	// A matching binding must also be the kind of binding the client may
+	// hold: a workload client only its reserved workload identity, an
+	// interactive client never one. The stores never write anything else, so
+	// this only makes a corrupt record fail closed.
+	if !mcpClientOAuthBindingConsistent(client) {
+		return false
+	}
 	if g.mcpClientProjectionMatches(client) {
 		return true
 	}
@@ -286,7 +348,10 @@ func (g *Gateway) mcpClientProjectionMatches(client MCPClient) bool {
 // For /mcp/clients/{slug}, an owner, admin, or operator may authorize only a
 // registration owned by their exact subject. The first approved OAuth DCR
 // client binds through a CAS mutation; a different DCR client never silently
-// replaces it.
+// replaces it. A workload client is refused for every actor, before any
+// binding, with the same error as a subject mismatch: its OAuth identity is
+// brokered by the control plane and never claimed through browser consent.
+// Both the hosted and the self-hosted password consent paths call this.
 func (g *Gateway) AuthorizeMCPConsent(ctx context.Context, subject, role, oauthClientID, resource string) error {
 	subject = strings.TrimSpace(subject)
 	role = strings.TrimSpace(role)
@@ -313,8 +378,10 @@ func (g *Gateway) AuthorizeMCPConsent(ctx context.Context, subject, role, oauthC
 		return errors.New("MCP client endpoint is unavailable")
 	}
 	actor := PlatformActor{UserID: subject, Role: role}
+	// MCPClientAllowsActor never admits a workload client, whatever the
+	// actor, so this single refusal covers both cases indistinguishably.
 	if !MCPClientAllowsActor(client, actor) {
-		return errors.New("actor cannot authorize this MCP client")
+		return errMCPClientConsentRefused
 	}
 	if client.OAuthClientID != "" && client.OAuthClientID != oauthClientID {
 		return ErrMCPClientOAuthBinding
@@ -402,6 +469,23 @@ func (g *Gateway) mcpClientMayUseAccount(ctx context.Context, slug, accountName,
 		return false
 	}
 	return !account.IsPersonal() || account.OwnerSubject == client.Subject
+}
+
+// mcpClientMayUseLibrary is the final durable guard for a direct-agent
+// Library built-in. Unlike connection delivery it intentionally does not
+// consult ConnectionNamespaceIDs: Library scopes are generic records and must
+// never inherit or reinterpret a credential-owning connection namespace.
+// Matching the immutable registration ID, subject, and current epoch prevents
+// a stale stream (or another client registered by the same subject) from
+// inheriting this endpoint's private artifact surface after a refresh,
+// authorization reset, or revocation.
+func (g *Gateway) mcpClientMayUseLibrary(ctx context.Context, slug, clientID, subject, epoch string) bool {
+	store, ok := g.mcpClientStore()
+	if !ok {
+		return false
+	}
+	client, ok := store.ActiveMCPClient(ctx, slug)
+	return ok && client.ID == clientID && client.Subject == subject && client.Epoch == epoch
 }
 
 func mcpClientSlugFromResource(resource string) (string, bool) {

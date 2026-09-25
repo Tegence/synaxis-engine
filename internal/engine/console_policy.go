@@ -30,8 +30,10 @@ func writeAccountPolicyMutationError(w http.ResponseWriter, err error, fallback 
 	writeJSON(w, http.StatusBadGateway, map[string]string{"error": fallback})
 }
 
-// handleToolPolicy persists one tool's model-visible alias/description and
-// enabled state. Connector allowlists keep using the stable upstream name.
+// handleToolPolicy persists one tool's model-visible alias/description,
+// availability, and durable governance profile. Connector allowlists keep
+// using the stable upstream name, while a governance profile applies to every
+// delivery surface the tool can reach.
 func (c *ConsoleAPI) handleToolPolicy(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -61,9 +63,10 @@ func (c *ConsoleAPI) handleToolPolicy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Alias       *string `json:"alias"`
-		Description *string `json:"description"`
-		Enabled     *bool   `json:"enabled"`
+		Alias            *string           `json:"alias"`
+		Description      *string           `json:"description"`
+		Enabled          *bool             `json:"enabled"`
+		GovernancePreset *GovernancePreset `json:"governancePreset"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
@@ -104,6 +107,18 @@ func (c *ConsoleAPI) handleToolPolicy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if req.GovernancePreset != nil {
+		preset, err := normalizedGovernancePreset(*req.GovernancePreset)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "governancePreset must be read_only, safe_write, high_risk, or empty"})
+			return
+		}
+		if preset == GovernancePresetReadOnly && !current.ReadOnly {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "read-only governance requires a tool Synaxis classifies as read-only"})
+			return
+		}
+		override.GovernancePreset = preset
+	}
 
 	disabled := append([]string(nil), account.DisabledTools...)
 	if req.Enabled != nil {
@@ -117,7 +132,7 @@ func (c *ConsoleAPI) handleToolPolicy(w http.ResponseWriter, r *http.Request) {
 	if overrides == nil {
 		overrides = map[string]ToolOverride{}
 	}
-	if override.Alias == "" && override.Description == "" {
+	if override.Alias == "" && override.Description == "" && override.GovernancePreset == "" {
 		delete(overrides, toolName)
 	} else {
 		overrides[toolName] = override
@@ -145,6 +160,7 @@ func (c *ConsoleAPI) handleToolPolicy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	current.Alias, current.Description = override.Alias, override.Description
+	current.GovernancePreset = override.GovernancePreset
 	if req.Enabled != nil {
 		current.Enabled = *req.Enabled
 	}
@@ -460,12 +476,20 @@ func (c *ConsoleAPI) handlePortableConfigImport(w http.ResponseWriter, r *http.R
 				return
 			}
 			aliases[effective] = tool
+			if _, err := normalizedGovernancePreset(override.GovernancePreset); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid governance preset for " + account.Name + "/" + tool})
+				return
+			}
 		}
 	}
 	seenNamespaces := map[string]bool{}
 	for i, namespace := range config.Namespaces {
 		if namespace.Slug == "" || slugify(namespace.Slug) != namespace.Slug {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("namespaces[%d].slug must be normalized", i)})
+			return
+		}
+		if reservedEndpointSlugs[namespace.Slug] {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "that slug is reserved"})
 			return
 		}
 		if seenNamespaces[namespace.Slug] {
@@ -495,6 +519,10 @@ func (c *ConsoleAPI) handlePortableConfigImport(w http.ResponseWriter, r *http.R
 	for i, connector := range config.Connectors {
 		if connector.Slug == "" || slugify(connector.Slug) != connector.Slug {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("connectors[%d].slug must be normalized", i)})
+			return
+		}
+		if reservedEndpointSlugs[connector.Slug] {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "that slug is reserved"})
 			return
 		}
 		if seenConnectors[connector.Slug] {

@@ -102,6 +102,14 @@ func (c *ConsoleAPI) canDeleteConnectionNamespace(actor PlatformActor, _ Connect
 }
 
 func (c *ConsoleAPI) canManageAccount(ctx context.Context, actor PlatformActor, a Account) bool {
+	return canManageAccountPreloaded(actor, a, c.namespacesForAccount(ctx, a))
+}
+
+// canManageAccountPreloaded is the same account boundary as canManageAccount
+// evaluated against preloaded namespace data, so list endpoints do not pay a
+// store round trip per row. A namespace absent from namespacesByID denies
+// exactly as a failed store lookup would.
+func canManageAccountPreloaded(actor PlatformActor, a Account, namespacesByID map[string]ConnectionNamespace) bool {
 	if connectionNamespaceAdministrator(actor) {
 		return true
 	}
@@ -111,12 +119,55 @@ func (c *ConsoleAPI) canManageAccount(ctx context.Context, actor PlatformActor, 
 	if a.IsPersonal() {
 		return a.OwnerSubject != "" && a.OwnerSubject == actor.UserID
 	}
-	store, ok := c.connectionNamespaceStore()
-	if !ok || a.ConnectionNamespaceID == "" {
+	if a.ConnectionNamespaceID == "" {
 		return false
 	}
-	ns, ok := store.ConnectionNamespace(ctx, a.ConnectionNamespaceID)
+	ns, ok := namespacesByID[a.ConnectionNamespaceID]
 	return ok && connectionNamespaceManager(ns, actor.UserID)
+}
+
+// namespacesForAccount loads the one ownership namespace an account-level
+// check needs. Personal and namespace-less accounts need no lookup.
+func (c *ConsoleAPI) namespacesForAccount(ctx context.Context, a Account) map[string]ConnectionNamespace {
+	namespacesByID := map[string]ConnectionNamespace{}
+	if a.IsPersonal() || a.ConnectionNamespaceID == "" {
+		return namespacesByID
+	}
+	if store, ok := c.connectionNamespaceStore(); ok {
+		if ns, found := store.ConnectionNamespace(ctx, a.ConnectionNamespaceID); found {
+			namespacesByID[a.ConnectionNamespaceID] = ns
+		}
+	}
+	return namespacesByID
+}
+
+// callVisibilityData preloads every account once plus each connection
+// namespace referenced by the given call records, so the activity list can
+// evaluate the operator visibility boundary with a bounded number of store
+// reads instead of one account+namespace pair per record. Namespace lookups
+// use the request context so a client disconnect cancels them.
+func (c *ConsoleAPI) callVisibilityData(ctx context.Context, calls []CallRecord) (map[string]Account, map[string]ConnectionNamespace) {
+	accounts := c.store.Accounts()
+	accountsByName := make(map[string]Account, len(accounts))
+	for _, a := range accounts {
+		accountsByName[a.Name] = a
+	}
+	namespaceIDs := make(map[string]struct{})
+	for _, call := range calls {
+		a, found := accountsByName[call.Account]
+		if found && !a.IsPersonal() && a.ConnectionNamespaceID != "" {
+			namespaceIDs[a.ConnectionNamespaceID] = struct{}{}
+		}
+	}
+	namespacesByID := make(map[string]ConnectionNamespace, len(namespaceIDs))
+	if store, ok := c.connectionNamespaceStore(); ok {
+		for id := range namespaceIDs {
+			if ns, found := store.ConnectionNamespace(ctx, id); found {
+				namespacesByID[id] = ns
+			}
+		}
+	}
+	return accountsByName, namespacesByID
 }
 
 // canReadAccount is intentionally the same boundary as management for now.
@@ -202,6 +253,8 @@ func (c *ConsoleAPI) readableAccount(w http.ResponseWriter, r *http.Request, id 
 	return a, actor, true
 }
 
+// visibleCall checks one record against live store reads; single-record
+// routes (call detail, replay) keep this per-row freshness.
 func (c *ConsoleAPI) visibleCall(ctx context.Context, actor PlatformActor, call CallRecord) bool {
 	if connectionNamespaceAdministrator(actor) {
 		return true
@@ -211,6 +264,19 @@ func (c *ConsoleAPI) visibleCall(ctx context.Context, actor PlatformActor, call 
 	}
 	a, found := c.store.Account(call.Account)
 	return found && c.canReadAccount(ctx, actor, a)
+}
+
+// visibleCallPreloaded is visibleCall evaluated against preloaded accounts and
+// namespaces: same short-circuits and denial cases, no store reads per row.
+func visibleCallPreloaded(actor PlatformActor, call CallRecord, accountsByName map[string]Account, namespacesByID map[string]ConnectionNamespace) bool {
+	if connectionNamespaceAdministrator(actor) {
+		return true
+	}
+	if actor.Role != "operator" || strings.TrimSpace(call.Account) == "" {
+		return false
+	}
+	a, found := accountsByName[call.Account]
+	return found && canManageAccountPreloaded(actor, a, namespacesByID)
 }
 
 func (c *ConsoleAPI) visibleApproval(ctx context.Context, actor PlatformActor, call PendingCall) bool {

@@ -61,11 +61,29 @@ source control and build uploads.
   scoped `/mcp/clients/{slug}` endpoint only for the exact owner subject.
 - MCP client grant, account-move, reset, and revocation changes rotate the
   affected endpoint epoch so prior resource tokens fail closed.
+- `library_skill_activation` is a context-only handoff on a verified,
+  subject-bound MCP-client endpoint. Do not expose it on root `/mcp`, accept
+  caller-controlled scope/binding context, or add credentials, connection
+  access, runtime grants, or effective capabilities to its contract.
 - Hosted `/api/activation` is service-actor-only and returns only an aggregate
   connection count. Never expand it with account or provider metadata.
 - Process-local OAuth and pending-connect state, plus each live approval
   waiter/request, mean one maximum production instance until they are durable
   or coordinated. Approval records and decisions are durable with PostgreSQL.
+- An MCP client's agent profile binding is an opaque, revisioned reference
+  installed by a hosting control plane. The Engine validates only its shape,
+  never resolves or applies the policy it names, and treats it as an
+  authorization fact: any change to the bound reference rotates the client's
+  endpoint epoch so prior resource tokens fail closed.
+- Run correlations record what the Engine observed: a signed host claim that
+  this client, at this epoch, associated a run with a gateway request while
+  its activation bundle digest was as stated. They are not proof that
+  instructions were injected or that anything executed, and they persist only
+  scoped hashes of the host-chosen execution ID and nonce.
+- The runtime activation fetch (`GET /runtime/clients/{slug}/activation`) is
+  a host-signed, timestamp-bound, no-CORS ingress like the skill-run
+  attestation route. It is never mounted under `/api` or the root `/mcp`, and
+  browser-shaped requests receive the same 404 as an unknown client.
 
 New behavior needs focused tests in the existing standard-library style.
 

@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -384,6 +385,12 @@ WHERE version.artifact_id=$1 AND version.id=$2 AND version.format=$3`, artifactI
 // in its documented plaintext mode. It is called only by EncryptExisting,
 // after a cipher is configured. Both Cipher helpers are idempotent, so a
 // second startup migration authenticates and preserves already encrypted data.
+//
+// Only rows the upgrade changes are rewritten. The media size CHECK is
+// re-applied under THE RULE in store_pg.go (rule 6): after a rollback it may be
+// NOT VALID and narrower than a newer release's blobs, and Postgres checks it
+// on every row an UPDATE writes, so rewriting an already encrypted newer blob
+// unchanged would stop the previous release from starting.
 func (s *PgStore) encryptExistingLibraryArtifactMedia(ctx context.Context) error {
 	rows, err := s.pool.Query(ctx, `SELECT artifact_version_id,alt_text,encrypted_data FROM narthex_library_artifact_media_blobs ORDER BY artifact_version_id`)
 	if err != nil {
@@ -409,21 +416,18 @@ func (s *PgStore) encryptExistingLibraryArtifactMedia(ctx context.Context) error
 	}
 	rows.Close()
 	for _, item := range payloads {
-		altText, err := s.dec(item.altText)
-		if err != nil {
-			return fmt.Errorf("decrypt library artifact media %q alt text: %w", item.versionID, err)
-		}
-		data, err := s.decBytes(item.data)
-		if err != nil {
-			return fmt.Errorf("decrypt library artifact media %q bytes: %w", item.versionID, err)
-		}
-		encryptedAltText, err := s.enc(altText)
+		// Encrypting authenticates stored ciphertext under the configured key
+		// and returns it unchanged, and encrypts legacy plaintext.
+		encryptedAltText, err := s.enc(item.altText)
 		if err != nil {
 			return fmt.Errorf("encrypt library artifact media %q alt text: %w", item.versionID, err)
 		}
-		encryptedData, err := s.encBytes(data)
+		encryptedData, err := s.encBytes(item.data)
 		if err != nil {
 			return fmt.Errorf("encrypt library artifact media %q bytes: %w", item.versionID, err)
+		}
+		if encryptedAltText == item.altText && bytes.Equal(encryptedData, item.data) {
+			continue
 		}
 		if _, err := s.pool.Exec(ctx, `UPDATE narthex_library_artifact_media_blobs SET alt_text=$2,encrypted_data=$3 WHERE artifact_version_id=$1`, item.versionID, encryptedAltText, encryptedData); err != nil {
 			return fmt.Errorf("write encrypted library artifact media %q: %w", item.versionID, err)

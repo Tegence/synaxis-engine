@@ -14,7 +14,9 @@ import (
 // row is the durable subject/scope policy for one named AI client; the public
 // OAuth client ID is optional until a future DCR/consent path atomically binds
 // it. Namespace grants deliberately reference the credential-folder table,
-// never the legacy endpoint-bundle tables.
+// never the legacy endpoint-bundle tables. This runs on every start, including
+// the previous release's start over a newer database: its CHECK adds and its
+// constraint drops follow THE RULE in store_pg.go (below libraryMigrate).
 const mcpClientsSchema = `
 CREATE TABLE IF NOT EXISTS narthex_mcp_clients (
     id              TEXT PRIMARY KEY,

@@ -499,6 +499,13 @@ func (s *PgStore) encryptExistingCallPayloads(ctx context.Context) error {
 	return nil
 }
 
+// Engine schema DDL, in this file and in the other *_pg.go schema consts, is
+// idempotent and runs in full on every start (NewPgStore). It must also run
+// cleanly when the previous release starts over a database that this release
+// has already written to: Engine N-1 starts on schema N. Re-add a CHECK
+// constraint only through engineReappliedChecks (THE RULE below
+// libraryMigrate), never as a plain validating ADD CONSTRAINT.
+
 // The legacy workspace column stores Account.Group: a display-only alias for
 // the owning connection namespace. Its name is preserved so rolling upgrades
 // and portable config remain compatible; connection_namespace_id below is the
@@ -537,6 +544,18 @@ CREATE TABLE IF NOT EXISTS narthex_engine_state (
 );`
 
 // idempotent migrations for tables created before these columns existed.
+//
+// The connection_scope list is not yet safe to widen across a rollback: this
+// const rewrites any unknown scope to 'shared' on every start, EncryptExisting
+// re-upserts every account through normalizedConnectionScope, which rejects
+// one, and Account.IsPersonal treats one as not personal. The previous release
+// would therefore silently move a newer account onto shared surfaces, or fail
+// to start. Adding a scope takes two releases: first one that keeps an unknown
+// scope as stored, neither rewrites nor rejects it at startup, and keeps such
+// accounts off shared surfaces; then a later one that adds the scope, listing
+// the check in engineReappliedChecks (rules 3 and 4 of THE RULE below
+// libraryMigrate). TestEngineConnectionScopeListIsPinned holds the lists
+// involved to one set until then.
 const accountsMigrate = `
 ALTER TABLE narthex_accounts ADD COLUMN IF NOT EXISTS disabled_tools TEXT[];
 ALTER TABLE narthex_accounts ADD COLUMN IF NOT EXISTS tool_overrides JSONB NOT NULL DEFAULT '{}'::jsonb;
@@ -1086,14 +1105,8 @@ CREATE TABLE IF NOT EXISTS narthex_library_mcp_client_skill_authoring_audit_even
     CONSTRAINT narthex_library_mcp_client_skill_authoring_audit_events_payload_digest_check
         CHECK (payload_digest = '' OR payload_digest ~ '^[a-f0-9]{64}$')
 );
--- Bundle uploads are a fifth leased operation. Existing databases carry the
--- older four-value check (PostgreSQL truncates the constraint name to 63
--- characters), so it is dropped and recreated idempotently.
-ALTER TABLE narthex_library_mcp_client_skill_authoring_audit_events
-    DROP CONSTRAINT IF EXISTS narthex_library_mcp_client_skill_authoring_audit_events_operation_check;
-ALTER TABLE narthex_library_mcp_client_skill_authoring_audit_events
-    ADD CONSTRAINT narthex_library_mcp_client_skill_authoring_audit_events_operation_check
-    CHECK (operation IN ('grant','revoke','create','update','adopt','upload'));
+-- The operation check is re-added on every start, rollback-safely, by
+-- engineReappliedChecks (THE RULE below libraryMigrate). Never re-add it here.
 CREATE INDEX IF NOT EXISTS narthex_library_mcp_client_skill_authoring_audit_events_client_idx
     ON narthex_library_mcp_client_skill_authoring_audit_events (client_id, created_at DESC, id DESC);
 `
@@ -1175,39 +1188,11 @@ ALTER TABLE narthex_library_artifacts
 ALTER TABLE narthex_library_artifacts
     ADD COLUMN IF NOT EXISTS agent_surface_id TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS narthex_library_artifacts_surface_created_idx ON narthex_library_artifacts (agent_surface_id, created_at DESC, id DESC) WHERE agent_surface_id <> '';
+-- The artifact version format, media size, and lease kind checks are
+-- re-added, rollback-safely, by engineReappliedChecks (THE RULE below). This
+-- block only adds a missing constraint, once, guarded by its name alone.
 DO $$
 BEGIN
-	-- Older installations accepted only text/Markdown versions. Replace that
-	-- one named check exactly once when image support is absent; this remains
-	-- additive for all other artifact columns and preserves existing rows.
-	IF NOT EXISTS (
-		SELECT 1 FROM pg_constraint
-		WHERE conname='narthex_library_artifact_versions_format_check'
-		  AND conrelid='narthex_library_artifact_versions'::regclass
-		  AND pg_get_constraintdef(oid) LIKE '%image%'
-	) THEN
-		ALTER TABLE narthex_library_artifact_versions
-			DROP CONSTRAINT IF EXISTS narthex_library_artifact_versions_format_check;
-		ALTER TABLE narthex_library_artifact_versions
-			ADD CONSTRAINT narthex_library_artifact_versions_format_check
-			CHECK (format IN ('markdown','text','image'));
-	END IF;
-	-- Keep the SQL admission limit equal to the bounded MCP/base64 transport
-	-- limit. Replacing the named check is idempotent and prevents a direct SQL
-	-- write or an older bootstrap from inserting a blob that the Engine cannot
-	-- safely deliver.
-	IF NOT EXISTS (
-		SELECT 1 FROM pg_constraint
-		WHERE conname='narthex_library_artifact_media_blobs_size_check'
-		  AND conrelid='narthex_library_artifact_media_blobs'::regclass
-		  AND pg_get_constraintdef(oid) LIKE '%524288%'
-	) THEN
-		ALTER TABLE narthex_library_artifact_media_blobs
-			DROP CONSTRAINT IF EXISTS narthex_library_artifact_media_blobs_size_check;
-		ALTER TABLE narthex_library_artifact_media_blobs
-			ADD CONSTRAINT narthex_library_artifact_media_blobs_size_check
-			CHECK (size_bytes > 0 AND size_bytes <= 524288);
-	END IF;
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint
         WHERE conname='narthex_library_runs_attestation_check'
@@ -1217,44 +1202,252 @@ BEGIN
             ADD CONSTRAINT narthex_library_runs_attestation_check
             CHECK (attestation='' OR (attestation='host_attested' AND origin='skill_run'));
     END IF;
-	-- Existing lease tables predate explicit kind metadata. Rebuild the named
-	-- constraint when needed so a rolling upgrade cannot admit an unrecognized
-	-- mode that the Engine would otherwise only reject in application code.
-	IF NOT EXISTS (
-		SELECT 1 FROM pg_constraint
-		WHERE conname='narthex_library_mcp_client_skill_authoring_leases_kind_check'
-		  AND conrelid='narthex_library_mcp_client_skill_authoring_leases'::regclass
-		  AND pg_get_constraintdef(oid) LIKE '%generic%'
-		  AND pg_get_constraintdef(oid) LIKE '%adoption%'
-		  -- The generated CHECK has exactly the two quoted enum values. This
-		  -- additionally repairs an early/partial migration that happened to
-		  -- mention both names but admitted a third kind.
-		  AND length(pg_get_constraintdef(oid)) - length(replace(pg_get_constraintdef(oid), '''', '')) = 4
-	) THEN
-		ALTER TABLE narthex_library_mcp_client_skill_authoring_leases
-			DROP CONSTRAINT IF EXISTS narthex_library_mcp_client_skill_authoring_leases_kind_check;
-		ALTER TABLE narthex_library_mcp_client_skill_authoring_leases
-			ADD CONSTRAINT narthex_library_mcp_client_skill_authoring_leases_kind_check
-			CHECK (kind IN ('generic','adoption'));
-	END IF;
-	-- A version update and owner/admin adoption remain distinct append-only
-	-- operations for review and incident analysis. Rebuild the named check for
-	-- older Engine databases that predate either operation.
-	IF NOT EXISTS (
-		SELECT 1 FROM pg_constraint
-	WHERE conname='narthex_library_mcp_client_skill_authoring_audit_events_operation_check'
-		  AND conrelid='narthex_library_mcp_client_skill_authoring_audit_events'::regclass
-		  AND pg_get_constraintdef(oid) LIKE '%update%'
-		  AND pg_get_constraintdef(oid) LIKE '%adopt%'
-	) THEN
-		ALTER TABLE narthex_library_mcp_client_skill_authoring_audit_events
-			DROP CONSTRAINT IF EXISTS narthex_library_mcp_client_skill_authoring_audit_events_operation_check;
-		ALTER TABLE narthex_library_mcp_client_skill_authoring_audit_events
-			ADD CONSTRAINT narthex_library_mcp_client_skill_authoring_audit_events_operation_check
-			CHECK (operation IN ('grant','revoke','create','update','adopt'));
-	END IF;
 END $$;
 `
+
+// ---------------------------------------------------------------------------
+// THE RULE for CHECK constraints that Engine schema bootstrap re-adds
+// ---------------------------------------------------------------------------
+// Schema bootstrap is forward-only and runs on every start. A rollback, or a
+// rolling update that briefly runs two releases, starts the previous Engine
+// binary over a database that a newer binary has already migrated and written
+// to. The previous binary must still start: Engine N-1 starts on schema N.
+//
+//  1. A CHECK constraint whose definition changes between releases is listed
+//     in engineReappliedChecks and re-added only by reapplyCheckConstraints. Never
+//     write a plain, validating `ALTER TABLE ... ADD CONSTRAINT ... CHECK (...)`
+//     re-add in a schema const: Postgres validates it against every stored row,
+//     one row holding a value that a newer release added fails it with
+//     check_violation (23514), NewPgStore returns the error, and the older
+//     Engine cannot start.
+//  2. reapplyCheckConstraints records the expression it applied in the
+//     constraint's comment, and re-adds the constraint whenever the recorded
+//     expression is not this release's: on the first start after the
+//     expression changes, on every rollback and roll-forward, and over a
+//     constraint that CREATE TABLE or a binary built before this rule added.
+//     To change a listed constraint, change its expression here and the inline
+//     CHECK that creates it for a fresh install; nothing else decides when it
+//     is re-added. The re-add is NOT VALID, so existing rows are not scanned
+//     while every new INSERT and UPDATE is still checked, and VALIDATE
+//     CONSTRAINT follows, tolerating only check_violation. Fresh installs and
+//     forward starts end with every listed constraint VALIDATED. When an older
+//     binary starts over rows its narrower definition rejects, that constraint
+//     alone is left NOT VALID and a log line names it. It stays NOT VALID until
+//     a start whose definition admits the stored rows validates it again. Any
+//     other error still fails startup and rolls the re-add back.
+//  3. Widening an allowed-value list is safe only for a constraint listed
+//     here, and only while nothing the previous release runs at startup
+//     (schema consts, backfills, EncryptExisting) rewrites or rejects the new
+//     value and its code reads that value safely. narthex_accounts
+//     connection_scope is not safe to widen yet: see the note above
+//     accountsMigrate. Narrowing a list, or adding a CHECK that existing rows
+//     break, is a data migration: clean those rows up first, because a
+//     violation no longer stops startup.
+//  4. Inline CHECKs in CREATE TABLE IF NOT EXISTS and ADD COLUMN IF NOT EXISTS
+//     are never re-applied. A one-time ADD CONSTRAINT in a DO block guarded by
+//     the constraint's name alone (IF NOT EXISTS (SELECT 1 FROM pg_constraint
+//     WHERE conname = '<constraint>' AND conrelid = '<table>'::regclass)) never
+//     runs again once the constraint exists. Both are safe. To change such a
+//     constraint later, list it here. Never drop or rename it anywhere else:
+//     its guard would then add it again, validating, on every start of this
+//     release and of every older one. Only reapplyCheckConstraint drops a
+//     listed constraint, and every other DROP or RENAME CONSTRAINT that
+//     bootstrap runs is reviewed in reviewedConstraintRemovals
+//     (schema_rules_test.go).
+//  5. This protects only rollbacks TO a binary that contains it. Engine
+//     binaries built before this rule re-add these constraints as plain
+//     validating CHECKs, so a rollback to one of them over rows that use a
+//     value added later still fails to start.
+//  6. Postgres checks a NOT VALID CHECK on every row an UPDATE writes, even
+//     when the checked column is unchanged. So every startup write to a table
+//     listed here (schema consts, backfills, and the EncryptExisting
+//     migration) must match only legacy rows that no current release writes,
+//     such as plaintext written before a cipher was configured, and must skip
+//     rows it would leave unchanged. Otherwise the previous release fails to
+//     start on the first newer row it rewrites. After a rollback, runtime
+//     writes to such a newer row fail the same way until a release whose list
+//     admits it starts again.
+//  7. The other statements that run on every start must also stay valid on a
+//     newer schema: never relax pending_calls.expires_at NOT NULL or change
+//     pending_calls.args from TEXT, keep the
+//     narthex_mcp_client_namespaces_connection_namespace_id_fkey target, and
+//     never reuse the dropped narthex_library_memory_versions_source_digest_check
+//     name. Additive DDL (IF NOT EXISTS) is always safe.
+//
+// schema_rules_test.go enforces rules 1 and 4 without a database, including
+// every DROP and RENAME CONSTRAINT outside the helper, and pins the
+// connection_scope exception to rule 3. schema_rollback_pg_test.go covers the
+// Postgres behaviour, including rule 2's recorded expression and rule 6 for
+// the EncryptExisting migration.
+
+// reappliedCheck is one CHECK constraint that schema bootstrap re-adds under
+// THE RULE above.
+type reappliedCheck struct {
+	table      string
+	constraint string
+	// expression is the boolean CHECK expression, without CHECK or NOT VALID.
+	// It is always a literal from this file and is interpolated as SQL: never
+	// build it from runtime input. The helper records it in the constraint's
+	// comment and re-adds the constraint whenever the recorded expression
+	// differs, so changing it here, together with the inline CHECK that
+	// creates the constraint for a fresh install, is the whole change.
+	expression string
+}
+
+// reappliedCheckCommentPrefix starts the comment in which
+// reapplyCheckConstraint records the expression it applied.
+const reappliedCheckCommentPrefix = "engine reapplied check: "
+
+// appliedComment is the comment a listed constraint carries while this
+// release's expression is applied. Whitespace is normalized, so reformatting
+// the expression does not re-add the constraint.
+func (check reappliedCheck) appliedComment() string {
+	return reappliedCheckCommentPrefix + strings.Join(strings.Fields(check.expression), " ")
+}
+
+// quoteSQLLiteral quotes s as a standard-conforming SQL string literal.
+func quoteSQLLiteral(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+// engineReappliedChecks runs after libraryMigrate, so every column it names
+// exists. Keep each constraint's name and list in step with the inline CHECK
+// that creates it for a fresh install.
+var engineReappliedChecks = []reappliedCheck{
+	{
+		// Bundle uploads are a fifth leased operation, after owner/admin
+		// adoption and version updates, which remain distinct append-only
+		// operations for review and incident analysis. Existing databases carry
+		// an older, shorter list. PostgreSQL truncates this constraint name to
+		// 63 characters.
+		table:      "narthex_library_mcp_client_skill_authoring_audit_events",
+		constraint: "narthex_library_mcp_client_skill_authoring_audit_events_operation_check",
+		expression: `operation IN ('grant','revoke','create','update','adopt','upload')`,
+	},
+	{
+		// Older installations accepted only text/Markdown versions.
+		table:      "narthex_library_artifact_versions",
+		constraint: "narthex_library_artifact_versions_format_check",
+		expression: `format IN ('markdown','text','image')`,
+	},
+	{
+		// Keep the SQL admission limit equal to the bounded MCP/base64 transport
+		// limit, so a direct SQL write cannot insert a blob that the Engine
+		// cannot safely deliver.
+		table:      "narthex_library_artifact_media_blobs",
+		constraint: "narthex_library_artifact_media_blobs_size_check",
+		expression: `size_bytes > 0 AND size_bytes <= 524288`,
+	},
+	{
+		// Existing lease tables predate explicit kind metadata. Rebuilding the
+		// check when needed keeps a rolling upgrade from admitting a mode that
+		// the Engine would otherwise only reject in application code, and
+		// repairs an early, partial migration that admitted a third kind.
+		table:      "narthex_library_mcp_client_skill_authoring_leases",
+		constraint: "narthex_library_mcp_client_skill_authoring_leases_kind_check",
+		expression: `kind IN ('generic','adoption')`,
+	},
+}
+
+// pgIdentifierMaxBytes is PostgreSQL's default NAMEDATALEN - 1. A longer
+// identifier in a statement is truncated to this many bytes, so the catalog
+// stores the truncated name.
+const pgIdentifierMaxBytes = 63
+
+func storedPgIdentifier(name string) string {
+	if len(name) > pgIdentifierMaxBytes {
+		return name[:pgIdentifierMaxBytes]
+	}
+	return name
+}
+
+type schemaTxBeginner interface {
+	Begin(context.Context) (pgx.Tx, error)
+}
+
+// reapplyCheckConstraints applies THE RULE to each check in order. NewPgStore
+// calls it while it holds the schema bootstrap advisory lock, so no other
+// Engine start runs DDL at the same time.
+func reapplyCheckConstraints(ctx context.Context, db schemaTxBeginner, checks []reappliedCheck) error {
+	for _, check := range checks {
+		if err := reapplyCheckConstraint(ctx, db, check); err != nil {
+			return fmt.Errorf("re-apply %s on %s: %w", check.constraint, check.table, err)
+		}
+	}
+	return nil
+}
+
+// reapplyCheckConstraint runs in one transaction on one pooled connection:
+// read the expression the stored constraint records, re-add the constraint
+// NOT VALID and record this release's expression unless it is already the
+// recorded one, then validate it inside a savepoint. Only check_violation is
+// tolerated: the savepoint rolls the validation back, the NOT VALID
+// constraint and its comment commit, and the log names it. A current
+// constraint that an earlier start left NOT VALID is validated again here.
+func reapplyCheckConstraint(ctx context.Context, db schemaTxBeginner, check reappliedCheck) error {
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	table := pgx.Identifier{check.table}.Sanitize()
+	constraint := pgx.Identifier{check.constraint}.Sanitize()
+	applied := check.appliedComment()
+
+	var recorded string
+	var validated bool
+	readd := false
+	err = tx.QueryRow(ctx, `
+SELECT coalesce(obj_description(oid, 'pg_constraint'), ''), convalidated
+FROM pg_constraint
+WHERE conrelid=$1::text::regclass AND conname=$2::text`,
+		check.table, storedPgIdentifier(check.constraint)).Scan(&recorded, &validated)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		readd = true
+	case err != nil:
+		return fmt.Errorf("read stored constraint: %w", err)
+	default:
+		readd = recorded != applied
+	}
+	if readd {
+		if _, err := tx.Exec(ctx, `ALTER TABLE `+table+` DROP CONSTRAINT IF EXISTS `+constraint); err != nil {
+			return fmt.Errorf("drop: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `ALTER TABLE `+table+` ADD CONSTRAINT `+constraint+` CHECK (`+check.expression+`) NOT VALID`); err != nil {
+			return fmt.Errorf("add NOT VALID: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `COMMENT ON CONSTRAINT `+constraint+` ON `+table+` IS `+quoteSQLLiteral(applied)); err != nil {
+			return fmt.Errorf("record expression: %w", err)
+		}
+		validated = false
+	}
+	if !validated {
+		// pgx runs a nested Begin as a savepoint.
+		validation, err := tx.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		if _, err := validation.Exec(ctx, `ALTER TABLE `+table+` VALIDATE CONSTRAINT `+constraint); err != nil {
+			if !isCheckViolation(err) {
+				return fmt.Errorf("validate: %w", err)
+			}
+			if rollbackErr := validation.Rollback(ctx); rollbackErr != nil {
+				return fmt.Errorf("roll back validation: %w", rollbackErr)
+			}
+			log.Printf("engine: schema constraint %s on %s left NOT VALID: stored rows fall outside this release's definition, most likely written by a newer release; new writes are still checked (%v)",
+				storedPgIdentifier(check.constraint), check.table, err)
+		} else if err := validation.Commit(ctx); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+func isCheckViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23514"
+}
 
 const accountCols = `name,label,workspace,url,auth_mode,connection_namespace_id,connection_scope,owner_subject,revision,incarnation_id,client_id,client_secret,access_token,refresh_token,token_endpoint,resource,scope,bearer_token,disabled_tools,tool_overrides,read_only`
 
@@ -1381,6 +1574,10 @@ func NewPgStore(ctx context.Context, dsn string) (*PgStore, error) {
 	if _, err := pool.Exec(ctx, libraryMigrate); err != nil {
 		closePool()
 		return nil, fmt.Errorf("migrate library schema: %w", err)
+	}
+	if err := reapplyCheckConstraints(ctx, pool, engineReappliedChecks); err != nil {
+		closePool()
+		return nil, fmt.Errorf("re-apply schema CHECK constraints: %w", err)
 	}
 	if err := store.backfillPlainLibraryArtifactSurfaceIDs(ctx); err != nil {
 		closePool()

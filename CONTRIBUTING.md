@@ -22,6 +22,60 @@ With no `DATABASE_URL`, the engine uses the local JSON file store. Persistence
 changes must work with both the file and Postgres stores, or degrade through
 the documented optional store facets.
 
+## Schema changes
+
+The Postgres store has no migration framework. `NewPgStore` applies the
+idempotent DDL in `internal/engine/*_pg.go` on every start, under an advisory
+lock. The policy is **Engine N-1 starts on schema N**: the previous release
+must start, and keep serving, on a database that the current release has
+already migrated and written to, so an update can be rolled back by
+redeploying the previous binary. That previous release also runs its own copy
+of the DDL on every start.
+
+- Prefer additive DDL: `CREATE TABLE IF NOT EXISTS`, `ADD COLUMN IF NOT
+  EXISTS`, and `CREATE INDEX IF NOT EXISTS`, with a new column's CHECK inline.
+- Re-add a CHECK constraint only through `engineReappliedChecks` (THE RULE in
+  `internal/engine/store_pg.go`). The helper records the expression it applied
+  in the constraint's comment and re-adds the constraint whenever that differs
+  from the current release's expression, so changing a listed constraint means
+  editing its expression and the matching inline CHECK, nothing else. It
+  re-adds the constraint `NOT VALID` and then validates it, tolerating only a
+  check violation. Never write a plain
+  validating `ADD CONSTRAINT ... CHECK` re-add; `schema_rules_test.go` fails on
+  one. A one-time add inside a `DO` block, guarded by the constraint's name
+  alone, is also safe, as long as nothing drops or renames that constraint:
+  its guard would then add it again, validating, on every start. The same
+  test fails on such a drop or rename, and on any other `DROP` or `RENAME
+  CONSTRAINT` outside the helper until it is reviewed.
+- Widening an allowed-value list is safe only for a constraint in
+  `engineReappliedChecks`, and only when nothing the previous release runs at
+  startup rewrites or rejects the new value and its code reads that value
+  safely. `connection_scope` on `narthex_accounts` is not safe to widen yet:
+  every start rewrites an unknown scope to `shared`, so a rollback would
+  silently widen access to those accounts. Adding a scope takes two releases:
+  first one that keeps an unknown scope as stored, neither rewrites nor
+  rejects it, and keeps such accounts off shared surfaces; then the one that
+  adds the scope. Narrowing a list, relaxing a `NOT NULL`, changing a column
+  type, or dropping or renaming a constraint needs a data migration first,
+  because the previous release still runs its own statements.
+- Startup writes (schema backfills and the `EncryptExisting` migration) must
+  match only legacy rows and skip rows they would leave unchanged: Postgres
+  checks even a `NOT VALID` CHECK on every row an `UPDATE` writes.
+- When an older release starts over rows its narrower list rejects, it leaves
+  only that constraint `NOT VALID`, logs `engine: schema constraint <name> on
+  <table> left NOT VALID`, and still checks new writes. The next start of a
+  release whose list admits those rows validates it again. To list them, run
+  `SELECT conrelid::regclass, conname FROM pg_constraint WHERE NOT
+  convalidated;`.
+
+The Postgres contracts, including the rollback contract in
+`schema_rollback_pg_test.go`, run against a disposable database:
+
+```bash
+TEST_DATABASE_URL=postgres://user:password@127.0.0.1:5432/engine_test?sslmode=disable \
+  go test -count=1 ./internal/engine/ -run 'Pg|Postgres'
+```
+
 For an interactive local sandbox:
 
 ```bash

@@ -782,6 +782,7 @@ type FileStore struct {
 	// version. It is deliberately per-version rather than content-deduplicated.
 	libraryArtifactMediaBlobs []*libraryArtifactMediaBlob
 	libraryArtifactGrants     []*LibraryArtifactGrant
+	libraryCollaborations     map[string]*libraryCollaborationState
 	libraryRuns               []*LibraryRun
 	// Memories are a separate Library facet: logical lifecycle records,
 	// immutable authored versions, and exact-version surface grants.
@@ -854,6 +855,7 @@ type fileStoreData struct {
 	LibraryArtifactVersions                   []*LibraryArtifactVersion                      `json:"library_artifact_versions,omitempty"`
 	LibraryArtifactMediaBlobs                 []*libraryArtifactMediaBlob                    `json:"library_artifact_media_blobs,omitempty"`
 	LibraryArtifactGrants                     []*LibraryArtifactGrant                        `json:"library_artifact_grants,omitempty"`
+	LibraryCollaborations                     map[string]*libraryCollaborationState          `json:"library_collaborations,omitempty"`
 	LibraryRuns                               []*LibraryRun                                  `json:"library_runs,omitempty"`
 	LibraryMemories                           []*LibraryMemory                               `json:"library_memories,omitempty"`
 	LibraryMemoryVersions                     []*LibraryMemoryVersion                        `json:"library_memory_versions,omitempty"`
@@ -952,6 +954,7 @@ func LoadFileStore(path string) (*FileStore, error) {
 	s.libraryMemories, s.libraryMemoryVersions, s.libraryMemoryGrants = d.LibraryMemories, d.LibraryMemoryVersions, d.LibraryMemoryGrants
 	s.libraryRuntimeAttestations = d.LibraryRuntimeAttestations
 	s.libraryRunCorrelations = d.LibraryRunCorrelations
+	s.libraryCollaborations = d.LibraryCollaborations
 	s.controlIdempotencyRecords = d.ControlIdempotencyRecords
 	s.libraryMCPClientArtifactVersionRequests = d.LibraryMCPClientArtifactVersionRequests
 	s.libraryMCPClientSkillAuthoringLeases = d.LibraryMCPClientSkillAuthoringLeases
@@ -1104,6 +1107,7 @@ func (s *FileStore) saveLocked() error {
 		LibraryArtifactVersions:                   s.libraryArtifactVersions,
 		LibraryArtifactMediaBlobs:                 s.libraryArtifactMediaBlobs,
 		LibraryArtifactGrants:                     s.libraryArtifactGrants,
+		LibraryCollaborations:                     s.libraryCollaborations,
 		LibraryRuns:                               s.libraryRuns,
 		LibraryMemories:                           s.libraryMemories,
 		LibraryMemoryVersions:                     s.libraryMemoryVersions,

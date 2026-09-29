@@ -916,6 +916,16 @@ CREATE TABLE IF NOT EXISTS narthex_library_artifact_media_blobs (
                (mime_type <> 'image/svg+xml' AND delivery_mode='inline'))
 );
 
+CREATE TABLE IF NOT EXISTS narthex_library_collaborations (
+ artifact_id TEXT PRIMARY KEY REFERENCES narthex_library_artifacts(id) ON DELETE CASCADE,
+ state TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS narthex_library_collaboration_principals (
+ artifact_id TEXT NOT NULL REFERENCES narthex_library_artifacts(id) ON DELETE CASCADE,
+ principal_hash TEXT NOT NULL,
+ PRIMARY KEY (artifact_id, principal_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_library_collaboration_principals ON narthex_library_collaboration_principals(principal_hash);
 CREATE TABLE IF NOT EXISTS narthex_library_artifact_grants (
     id                      TEXT PRIMARY KEY,
     artifact_id             TEXT NOT NULL REFERENCES narthex_library_artifacts(id) ON DELETE RESTRICT,

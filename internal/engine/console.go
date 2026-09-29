@@ -2260,6 +2260,10 @@ func (c *ConsoleAPI) handleConnect(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	if a.AuthMode == "token" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "this connection uses an access token; update its token instead of starting OAuth"})
+		return
+	}
 	// Optional body selects the connect path. A no-body request reuses a static
 	// client that was safely saved with the account, if one exists; otherwise it
 	// takes the legacy RFC 7591 DCR path. If any static field or provider
@@ -2356,6 +2360,14 @@ func oauthConnectReturnState(err error) string {
 }
 
 func (c *ConsoleAPI) handleToken(w http.ResponseWriter, r *http.Request) {
+	// Older console clients used POST; PUT is the documented update method.
+	// Reject safe methods before reading a body so a GET can never rotate a
+	// credential without the normal mutation checks.
+	if r.Method != http.MethodPut && r.Method != http.MethodPost {
+		w.Header().Set("Allow", "PUT, POST")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
 	id := r.PathValue("id")
 	a, _, ok := c.managedAccount(w, r, id)
 	if !ok {

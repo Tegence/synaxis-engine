@@ -371,6 +371,7 @@ func (c *ConsoleAPI) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/control/v1/library/artifacts/{id}/versions/{version}", c.controlV1(c.handleControlLibraryArtifactVersion))
 	mux.HandleFunc("/control/v1/library/artifacts/{id}/grants", c.controlV1(c.handleControlLibraryArtifactGrants))
 	mux.HandleFunc("/control/v1/library/artifacts/{id}/grants/{grant}/revoke", c.controlV1(c.handleControlLibraryArtifactGrantRevoke))
+	mux.HandleFunc("/control/v1/library/collaboration", c.controlV1Credential(c.handleControlLibraryCollaboration))
 	mux.HandleFunc("/control/v1/library/recipients", c.controlV1(c.handleControlLibraryRecipients))
 	// Any other shape or method under the group reaches the same auth
 	// chain rather than Go's plain-text 404, so a wrong method, a bare
@@ -448,6 +449,9 @@ func (c *ConsoleAPI) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/library/skill-drafts/platform-import", sec(c.handleLibraryPlatformSkillDraftImport))
 	mux.HandleFunc("/api/library/artifact-drafts", sec(c.handleLibraryArtifactDrafts))
 	mux.HandleFunc("/api/library/artifact-drafts/platform-import", sec(c.handleLibraryPlatformArtifactDraftImport))
+	mux.HandleFunc("/api/library/artifacts/{id}/collaboration", sec(c.handleLibraryCollaboration))
+	mux.HandleFunc("/api/public/artifacts/mcp/{artifact}/{grant}", pub(c.handleCollaborationMCP))
+	mux.HandleFunc("/api/public/artifacts/collaborate", pub(c.handlePublicLibraryCollaboration))
 	mux.HandleFunc("/api/library/artifacts", sec(c.handleLibraryArtifacts))
 	mux.HandleFunc("/api/library/artifacts/{id}", sec(c.handleLibraryArtifactByID))
 	mux.HandleFunc("/api/library/artifacts/{id}/versions", sec(c.handleLibraryArtifactVersions))
@@ -2260,6 +2264,10 @@ func (c *ConsoleAPI) handleConnect(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	if a.AuthMode == "token" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "this connection uses an access token; update its token instead of starting OAuth"})
+		return
+	}
 	// Optional body selects the connect path. A no-body request reuses a static
 	// client that was safely saved with the account, if one exists; otherwise it
 	// takes the legacy RFC 7591 DCR path. If any static field or provider
@@ -2356,6 +2364,14 @@ func oauthConnectReturnState(err error) string {
 }
 
 func (c *ConsoleAPI) handleToken(w http.ResponseWriter, r *http.Request) {
+	// Older console clients used POST; PUT is the documented update method.
+	// Reject safe methods before reading a body so a GET can never rotate a
+	// credential without the normal mutation checks.
+	if r.Method != http.MethodPut && r.Method != http.MethodPost {
+		w.Header().Set("Allow", "PUT, POST")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
 	id := r.PathValue("id")
 	a, _, ok := c.managedAccount(w, r, id)
 	if !ok {

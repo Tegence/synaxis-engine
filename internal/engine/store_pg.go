@@ -916,6 +916,16 @@ CREATE TABLE IF NOT EXISTS narthex_library_artifact_media_blobs (
                (mime_type <> 'image/svg+xml' AND delivery_mode='inline'))
 );
 
+CREATE TABLE IF NOT EXISTS narthex_library_collaborations (
+ artifact_id TEXT PRIMARY KEY REFERENCES narthex_library_artifacts(id) ON DELETE CASCADE,
+ state TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS narthex_library_collaboration_principals (
+ artifact_id TEXT NOT NULL REFERENCES narthex_library_artifacts(id) ON DELETE CASCADE,
+ principal_hash TEXT NOT NULL,
+ PRIMARY KEY (artifact_id, principal_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_library_collaboration_principals ON narthex_library_collaboration_principals(principal_hash);
 CREATE TABLE IF NOT EXISTS narthex_library_artifact_grants (
     id                      TEXT PRIMARY KEY,
     artifact_id             TEXT NOT NULL REFERENCES narthex_library_artifacts(id) ON DELETE RESTRICT,
@@ -1850,6 +1860,48 @@ func (s *PgStore) CurrentTokenGeneration(ctx context.Context) (string, error) {
 		return "", errors.New("load current token generation: stored generation is empty")
 	}
 	return generation, nil
+}
+
+// Health alerts share the generic engine-state key/value table: one
+// healthAlertKeyPrefix+account row per account with an outstanding alert.
+const healthAlertKeyPrefix = "health_alert:"
+
+var _ HealthAlertStore = (*PgStore)(nil)
+
+func (s *PgStore) HealthAlerts(ctx context.Context) (map[string]string, error) {
+	rows, err := s.pool.Query(ctx, `SELECT key, value FROM narthex_engine_state WHERE starts_with(key, $1)`, healthAlertKeyPrefix)
+	if err != nil {
+		return nil, fmt.Errorf("load health alerts: %w", err)
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var key, status string
+		if err := rows.Scan(&key, &status); err != nil {
+			return nil, fmt.Errorf("load health alerts: %w", err)
+		}
+		out[strings.TrimPrefix(key, healthAlertKeyPrefix)] = status
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("load health alerts: %w", err)
+	}
+	return out, nil
+}
+
+func (s *PgStore) SetHealthAlert(ctx context.Context, account, status string) error {
+	var err error
+	if status == "" {
+		_, err = s.pool.Exec(ctx, `DELETE FROM narthex_engine_state WHERE key=$1`, healthAlertKeyPrefix+account)
+	} else {
+		_, err = s.pool.Exec(ctx, `
+INSERT INTO narthex_engine_state (key,value)
+VALUES ($1,$2)
+ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value`, healthAlertKeyPrefix+account, status)
+	}
+	if err != nil {
+		return fmt.Errorf("persist health alert: %w", err)
+	}
+	return nil
 }
 
 // RotateTokenGeneration uses compare-and-swap so a stale Engine instance can

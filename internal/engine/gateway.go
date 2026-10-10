@@ -44,10 +44,16 @@ type Gateway struct {
 	// the connection-namespace grants held by that registration.
 	clientEndpoints map[string]*connectorServer // slug -> subject-bound MCP server
 	refreshMu       map[string]*sync.Mutex      // per-account refresh serialization
-	alertState      map[string]bool             // account -> currently-down (alert dedup)
-	webhook         string                      // optional alert webhook URL
-	consoleURL      string                      // linked in approval webhook messages
-	publicURL       string                      // this Engine's own public base; builds decide_url (see notify.go)
+	// Health-alert state, owned by the watch loop (see evalAlerts). alertState
+	// maps account -> status of its outstanding down alert; nil until loaded
+	// from a HealthAlertStore. failStreak is deliberately in-memory only: a
+	// restart must not count toward a transient-failure alert.
+	alertMu    sync.Mutex
+	alertState map[string]string
+	failStreak map[string]int
+	webhook    string // optional alert webhook URL
+	consoleURL string // linked in approval webhook messages
+	publicURL  string // this Engine's own public base; builds decide_url (see notify.go)
 	// platformEventsURL/platformEventsToken: hosted-only Platform ingest
 	// target + the shared admin-token credential (see SetPlatformEvents).
 	platformEventsURL   string
@@ -1187,14 +1193,15 @@ func (g *Gateway) tick(ctx context.Context) {
 	if refreshed > 0 {
 		log.Printf("engine: refresh-ahead refreshed %d oauth account(s)", refreshed)
 	}
-	for _, h := range g.liveHealth(ctx) { // health sweep covers token accounts too; alerts need fresh probes, not the console read cache
+	rows := g.liveHealth(ctx) // health sweep covers token accounts too; alerts need fresh probes, not the console read cache
+	for _, h := range rows {
 		if h.internalErr != nil && !errors.Is(h.internalErr, errHealthProbeInFlight) {
 			// Preserve the real cause only in Engine-controlled diagnostics.
-			// Browser responses and outbound alerts use healthPresentation below.
+			// Browser responses and outbound alerts use healthPresentation.
 			log.Printf("engine: health probe account=%q status=%s err=%v", h.UUID, h.Status, h.internalErr)
 		}
-		g.evalAlert(h)
 	}
+	g.evalAlerts(ctx, rows)
 	g.purgeAudit(ctx)
 }
 
@@ -1219,39 +1226,120 @@ func (g *Gateway) purgeAudit(ctx context.Context) {
 	}
 }
 
-// evalAlert fires only on a state change, so a sustained outage alerts once.
-func (g *Gateway) evalAlert(h AccountHealth) {
-	status, detail, recovery := healthPresentation(h.Status)
-	g.mu.Lock()
+// evalAlerts turns one health sweep into down/recovered alerts; each fires
+// only on a state change, so a sustained outage alerts once. Managed Engines
+// boot on throttled CPU, where probes time out en masse, so:
+//   - a transient failure (timeout/unreachable) alerts only on its second
+//     consecutive failed probe;
+//   - a sweep in which every probed account timed out says nothing about the
+//     providers, so its timeouts are ignored;
+//   - outstanding alerts persist through a HealthAlertStore, so a restart does
+//     not re-announce a known-down account (e.g. one never authorized).
+func (g *Gateway) evalAlerts(ctx context.Context, rows []AccountHealth) {
+	g.alertMu.Lock()
+	defer g.alertMu.Unlock()
 	if g.alertState == nil {
-		g.alertState = map[string]bool{}
+		state := map[string]string{}
+		if s, ok := g.store.(HealthAlertStore); ok {
+			loaded, err := s.HealthAlerts(ctx)
+			if err != nil {
+				// Without the prior state every known-down account would
+				// re-alert; skip this sweep and retry on the next one.
+				log.Printf("engine: load health alert state: %v", err)
+				return
+			}
+			for account, status := range loaded {
+				state[account] = status
+			}
+		}
+		g.alertState, g.failStreak = state, map[string]int{}
 	}
-	was := g.alertState[h.UUID]
-	now := status != healthStatusOK
-	g.alertState[h.UUID] = now
-	g.mu.Unlock()
-	switch {
-	case now && !was:
-		// Do not interpolate h.Detail here. AccountHealth is public and may be
-		// assembled by callers/tests; outbound alerts must remain safe even if a
-		// future caller accidentally supplies an upstream error string.
-		message := fmt.Sprintf("⚠️ Synaxis: account %q needs attention (%s). %s", h.UUID, status, detail)
-		if recovery != "" {
-			message += fmt.Sprintf(" Recommended recovery: %s.", recovery)
+	probed, timedOut := 0, 0
+	for _, h := range rows {
+		status, _, _ := healthPresentation(h.Status)
+		if status == healthStatusNeedsAuth { // decided from stored credentials, never probed
+			continue
 		}
-		summary := fmt.Sprintf("A probe failed and the account is marked down (%s). %s", status, detail)
-		if recovery != "" {
-			summary += fmt.Sprintf(" Recommended recovery: %s.", recovery)
+		probed++
+		if status == healthStatusTimeout {
+			timedOut++
 		}
-		g.fireEvent(WebhookEvent{
-			Event: EventUpstreamDown, ID: h.UUID, Account: accountDisplay(g.store, h.UUID),
-			Summary: summary, Text: message, Content: message,
-		})
-	case !now && was:
-		message := fmt.Sprintf("✅ Synaxis: account %q recovered", h.UUID)
-		g.fireEvent(WebhookEvent{
-			Event: EventUpstreamRecovered, ID: h.UUID, Account: accountDisplay(g.store, h.UUID),
-			Summary: "The probe succeeded again.", Text: message, Content: message,
-		})
+	}
+	// ponytail: one probed account cannot tell an Engine stall from a provider
+	// outage, so it falls back to the two-probe rule alone.
+	stalled := probed >= 2 && timedOut == probed
+	if stalled {
+		log.Printf("engine: every probed account (%d) timed out; treating the sweep as an Engine stall, not alerting", probed)
+	}
+	seen := make(map[string]bool, len(rows))
+	for _, h := range rows {
+		seen[h.UUID] = true
+		if status, _, _ := healthPresentation(h.Status); !(stalled && status == healthStatusTimeout) {
+			g.evalAlertLocked(ctx, h)
+		}
+	}
+	for account := range g.failStreak {
+		if !seen[account] {
+			delete(g.failStreak, account)
+		}
+	}
+	for account := range g.alertState {
+		if !seen[account] { // deleted account: drop its state so a re-created one starts clean
+			g.setAlertStateLocked(ctx, account, "")
+		}
+	}
+}
+
+func (g *Gateway) evalAlertLocked(ctx context.Context, h AccountHealth) {
+	status, detail, recovery := healthPresentation(h.Status)
+	was := g.alertState[h.UUID] != ""
+	if status == healthStatusOK {
+		delete(g.failStreak, h.UUID)
+		if was {
+			message := fmt.Sprintf("✅ Synaxis: account %q recovered", h.UUID)
+			g.fireEvent(WebhookEvent{
+				Event: EventUpstreamRecovered, ID: h.UUID, Account: accountDisplay(g.store, h.UUID),
+				Summary: "The probe succeeded again.", Text: message, Content: message,
+			})
+			g.setAlertStateLocked(ctx, h.UUID, "")
+		}
+		return
+	}
+	g.failStreak[h.UUID]++
+	transient := status == healthStatusTimeout || status == healthStatusUnreachable
+	if was || (transient && g.failStreak[h.UUID] < 2) {
+		return
+	}
+	// Do not interpolate h.Detail here. AccountHealth is public and may be
+	// assembled by callers/tests; outbound alerts must remain safe even if a
+	// future caller accidentally supplies an upstream error string.
+	message := fmt.Sprintf("⚠️ Synaxis: account %q needs attention (%s). %s", h.UUID, status, detail)
+	if recovery != "" {
+		message += fmt.Sprintf(" Recommended recovery: %s.", recovery)
+	}
+	summary := fmt.Sprintf("A probe failed and the account is marked down (%s). %s", status, detail)
+	if recovery != "" {
+		summary += fmt.Sprintf(" Recommended recovery: %s.", recovery)
+	}
+	g.fireEvent(WebhookEvent{
+		Event: EventUpstreamDown, ID: h.UUID, Account: accountDisplay(g.store, h.UUID),
+		Summary: summary, Text: message, Content: message,
+	})
+	g.setAlertStateLocked(ctx, h.UUID, status)
+}
+
+// setAlertStateLocked records an alert transition ("" = no outstanding alert).
+// It runs after fireEvent: a failed write costs at most one duplicate alert
+// after a restart, never a lost one.
+func (g *Gateway) setAlertStateLocked(ctx context.Context, account, status string) {
+	if status == "" {
+		delete(g.alertState, account)
+	} else {
+		g.alertState[account] = status
+	}
+	if s, ok := g.store.(HealthAlertStore); ok {
+		if err := s.SetHealthAlert(ctx, account, status); err != nil {
+			log.Printf("engine: persist health alert state account=%q: %v", account, err)
+		}
 	}
 }

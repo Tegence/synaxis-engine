@@ -46,6 +46,49 @@ func TestEnginePostgresPoolConfigIsCapacityBounded(t *testing.T) {
 	}
 }
 
+func TestPgStoreHealthAlertsPersistAcrossRestart(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("set TEST_DATABASE_URL to run the Postgres integration test")
+	}
+	ctx := context.Background()
+	first, err := NewPgStore(ctx, dsn)
+	if err != nil {
+		t.Fatalf("NewPgStore: %v", err)
+	}
+	defer first.Close()
+	account := "health-alert-" + newPgFixtureSuffix()
+	defer first.SetHealthAlert(ctx, account, "")
+
+	if err := first.SetHealthAlert(ctx, account, healthStatusTimeout); err != nil {
+		t.Fatalf("SetHealthAlert: %v", err)
+	}
+	if err := first.SetHealthAlert(ctx, account, healthStatusNeedsAuth); err != nil {
+		t.Fatalf("SetHealthAlert overwrite: %v", err)
+	}
+	second, err := NewPgStore(ctx, dsn)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer second.Close()
+	alerts, err := second.HealthAlerts(ctx)
+	if err != nil {
+		t.Fatalf("HealthAlerts: %v", err)
+	}
+	if alerts[account] != healthStatusNeedsAuth {
+		t.Fatalf("health alert after restart = %q, want %q", alerts[account], healthStatusNeedsAuth)
+	}
+	if _, leaked := alerts["oauth_token_generation"]; leaked {
+		t.Fatal("HealthAlerts returned an unrelated engine-state key")
+	}
+	if err := second.SetHealthAlert(ctx, account, ""); err != nil {
+		t.Fatalf("clear health alert: %v", err)
+	}
+	if alerts, err = first.HealthAlerts(ctx); err != nil || alerts[account] != "" {
+		t.Fatalf("cleared health alert = %q, %v; want none", alerts[account], err)
+	}
+}
+
 func TestPgStoreTokenGenerationPersistsAndUsesCASRotation(t *testing.T) {
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {

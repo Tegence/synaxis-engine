@@ -20,6 +20,17 @@ import (
 	"narthex/backend/internal/oauthas"
 )
 
+// allowsOAuthClient is MCPClientAllowsOAuthClient for tests whose durable
+// reads must succeed.
+func allowsOAuthClient(t *testing.T, g *Gateway, oauthClientID, resource string) bool {
+	t.Helper()
+	ok, err := g.MCPClientAllowsOAuthClient(oauthClientID, resource)
+	if err != nil {
+		t.Fatalf("MCPClientAllowsOAuthClient(%q, %q): %v", oauthClientID, resource, err)
+	}
+	return ok
+}
+
 func clientEndpointToolNames(t *testing.T, gateway *Gateway, slug string) []string {
 	t.Helper()
 	gateway.mu.Lock()
@@ -460,7 +471,7 @@ func TestMCPClientOAuthBindingRequiresItsOwnerAndDiesOnReset(t *testing.T) {
 		t.Fatal(err)
 	}
 	resource := "/mcp/clients/" + client.Slug
-	if gateway.MCPClientAllowsOAuthClient("dcr-alice", resource) {
+	if allowsOAuthClient(t, gateway, "dcr-alice", resource) {
 		t.Fatal("unbound OAuth registration was accepted")
 	}
 	if err := gateway.AuthorizeMCPConsent(ctx, "usr_bob", "operator", "dcr-alice", resource); err == nil {
@@ -469,10 +480,10 @@ func TestMCPClientOAuthBindingRequiresItsOwnerAndDiesOnReset(t *testing.T) {
 	if err := gateway.AuthorizeMCPConsent(ctx, "usr_alice", "operator", "dcr-alice", resource); err != nil {
 		t.Fatalf("owner consent: %v", err)
 	}
-	if !gateway.MCPClientAllowsOAuthClient("dcr-alice", resource) {
+	if !allowsOAuthClient(t, gateway, "dcr-alice", resource) {
 		t.Fatal("bound OAuth registration was not accepted")
 	}
-	if gateway.MCPClientAllowsOAuthClient("dcr-other", resource) {
+	if allowsOAuthClient(t, gateway, "dcr-other", resource) {
 		t.Fatal("different OAuth registration was accepted")
 	}
 
@@ -483,7 +494,7 @@ func TestMCPClientOAuthBindingRequiresItsOwnerAndDiesOnReset(t *testing.T) {
 	if _, err := store.ResetMCPClientOAuthClient(ctx, bound.ID, MCPClientPrecondition{ID: bound.ID, Revision: bound.Revision}); err != nil {
 		t.Fatal(err)
 	}
-	if gateway.MCPClientAllowsOAuthClient("dcr-alice", resource) {
+	if allowsOAuthClient(t, gateway, "dcr-alice", resource) {
 		t.Fatal("pre-reset OAuth registration remained valid")
 	}
 	if _, live := gateway.MCPClientEpoch(client.Slug); !live {
@@ -492,7 +503,7 @@ func TestMCPClientOAuthBindingRequiresItsOwnerAndDiesOnReset(t *testing.T) {
 	if err := gateway.AuthorizeMCPConsent(ctx, "usr_alice", "operator", "dcr-new", resource); err != nil {
 		t.Fatalf("rebind after explicit reset: %v", err)
 	}
-	if !gateway.MCPClientAllowsOAuthClient("dcr-new", resource) {
+	if !allowsOAuthClient(t, gateway, "dcr-new", resource) {
 		t.Fatal("rebound OAuth registration was not accepted")
 	}
 	if err := gateway.AuthorizeMCPConsent(ctx, "usr_alice", "operator", "dcr-third", resource); !errors.Is(err, ErrMCPClientOAuthBinding) {

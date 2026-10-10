@@ -26,6 +26,11 @@ type PgStore struct {
 	// succeeds, so a partially constructed store never owns a worker.
 	audit *auditWriter
 
+	// bootID is random per process and stamped on the approvals it parks
+	// (pending_calls.owner_boot_id), so operators can tell which Engine process
+	// owned a call that boot recovery cancelled.
+	bootID string
+
 	poolCloseOnce           sync.Once
 	poolCloseAfterAuditOnce sync.Once
 }
@@ -916,6 +921,16 @@ CREATE TABLE IF NOT EXISTS narthex_library_artifact_media_blobs (
                (mime_type <> 'image/svg+xml' AND delivery_mode='inline'))
 );
 
+CREATE TABLE IF NOT EXISTS narthex_library_collaborations (
+ artifact_id TEXT PRIMARY KEY REFERENCES narthex_library_artifacts(id) ON DELETE CASCADE,
+ state TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS narthex_library_collaboration_principals (
+ artifact_id TEXT NOT NULL REFERENCES narthex_library_artifacts(id) ON DELETE CASCADE,
+ principal_hash TEXT NOT NULL,
+ PRIMARY KEY (artifact_id, principal_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_library_collaboration_principals ON narthex_library_collaboration_principals(principal_hash);
 CREATE TABLE IF NOT EXISTS narthex_library_artifact_grants (
     id                      TEXT PRIMARY KEY,
     artifact_id             TEXT NOT NULL REFERENCES narthex_library_artifacts(id) ON DELETE RESTRICT,
@@ -1510,7 +1525,7 @@ func NewPgStore(ctx context.Context, dsn string) (*PgStore, error) {
 		closePool()
 		return nil, fmt.Errorf("ensure MCP client registry schema: %w", err)
 	}
-	store := &PgStore{pool: pool}
+	store := &PgStore{pool: pool, bootID: newApprovalID()}
 	if err := store.backfillConnectionNamespaces(ctx); err != nil {
 		closePool()
 		return nil, fmt.Errorf("backfill connection namespaces: %w", err)
@@ -1852,6 +1867,48 @@ func (s *PgStore) CurrentTokenGeneration(ctx context.Context) (string, error) {
 	return generation, nil
 }
 
+// Health alerts share the generic engine-state key/value table: one
+// healthAlertKeyPrefix+account row per account with an outstanding alert.
+const healthAlertKeyPrefix = "health_alert:"
+
+var _ HealthAlertStore = (*PgStore)(nil)
+
+func (s *PgStore) HealthAlerts(ctx context.Context) (map[string]string, error) {
+	rows, err := s.pool.Query(ctx, `SELECT key, value FROM narthex_engine_state WHERE starts_with(key, $1)`, healthAlertKeyPrefix)
+	if err != nil {
+		return nil, fmt.Errorf("load health alerts: %w", err)
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var key, status string
+		if err := rows.Scan(&key, &status); err != nil {
+			return nil, fmt.Errorf("load health alerts: %w", err)
+		}
+		out[strings.TrimPrefix(key, healthAlertKeyPrefix)] = status
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("load health alerts: %w", err)
+	}
+	return out, nil
+}
+
+func (s *PgStore) SetHealthAlert(ctx context.Context, account, status string) error {
+	var err error
+	if status == "" {
+		_, err = s.pool.Exec(ctx, `DELETE FROM narthex_engine_state WHERE key=$1`, healthAlertKeyPrefix+account)
+	} else {
+		_, err = s.pool.Exec(ctx, `
+INSERT INTO narthex_engine_state (key,value)
+VALUES ($1,$2)
+ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value`, healthAlertKeyPrefix+account, status)
+	}
+	if err != nil {
+		return fmt.Errorf("persist health alert: %w", err)
+	}
+	return nil
+}
+
 // RotateTokenGeneration uses compare-and-swap so a stale Engine instance can
 // never overwrite a newer revocation generation. On a stale expectation it
 // returns the already-current value for the caller to adopt.
@@ -1938,7 +1995,9 @@ CREATE TABLE IF NOT EXISTS pending_calls (
     decided_at              TIMESTAMPTZ,
     decided_by              TEXT NOT NULL DEFAULT '',
     decision_note           TEXT NOT NULL DEFAULT '',
-    kind                    TEXT NOT NULL DEFAULT ''
+    kind                    TEXT NOT NULL DEFAULT '',
+    owner_boot_id           TEXT NOT NULL DEFAULT '',
+    heartbeat_at            TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS pending_calls_ts_idx ON pending_calls (ts DESC);`
 
@@ -1956,6 +2015,11 @@ ALTER TABLE pending_calls ADD COLUMN IF NOT EXISTS account_incarnation_id TEXT N
 ALTER TABLE pending_calls ADD COLUMN IF NOT EXISTS account_revision BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE pending_calls ADD COLUMN IF NOT EXISTS connection_namespace_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE pending_calls ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT '';
+-- Rows that exist when the column is first added (a previous revision may
+-- still be serving them) read as freshly heartbeated, so that first boot's
+-- recovery leaves them alone; see RecoverPendingApprovals.
+ALTER TABLE pending_calls ADD COLUMN IF NOT EXISTS owner_boot_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE pending_calls ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT now();
 UPDATE pending_calls
 SET expires_at = ts + interval '3 minutes'
 WHERE expires_at IS NULL;
@@ -2287,10 +2351,20 @@ func (s *PgStore) scanAccount(row accountScanner) (Account, error) {
 }
 
 func (s *PgStore) Accounts() []Account {
-	rows, err := s.pool.Query(context.Background(), `SELECT `+accountCols+` FROM narthex_accounts ORDER BY name`)
+	out, err := s.ListAccounts(context.Background())
 	if err != nil {
 		log.Printf("engine: list accounts failed: %v", err)
-		return nil
+	}
+	return out
+}
+
+// ListAccounts is Accounts with the read failure reported. A row that cannot
+// be decrypted is still omitted (and logged): that is a persistent property of
+// the row, not a failed read.
+func (s *PgStore) ListAccounts(ctx context.Context) ([]Account, error) {
+	rows, err := s.pool.Query(ctx, `SELECT `+accountCols+` FROM narthex_accounts ORDER BY name`)
+	if err != nil {
+		return nil, err
 	}
 	defer rows.Close()
 	var out []Account
@@ -2305,10 +2379,7 @@ func (s *PgStore) Accounts() []Account {
 		}
 		out = append(out, a)
 	}
-	if err := rows.Err(); err != nil {
-		log.Printf("engine: iterate accounts failed: %v", err)
-	}
-	return out
+	return out, rows.Err()
 }
 
 func (s *PgStore) Token(name string) string {
@@ -3918,10 +3989,18 @@ func (s *PgStore) LogPending(ctx context.Context, p PendingCall) error {
 	}
 	_, err = s.pool.Exec(ctx, `
 INSERT INTO pending_calls
-    (id,ts,connector,account,account_incarnation_id,account_revision,connection_namespace_id,tool,args,status,expires_at,kind)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+    (id,ts,connector,account,account_incarnation_id,account_revision,connection_namespace_id,tool,args,status,expires_at,kind,owner_boot_id)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
 		p.ID, p.TS, p.Connector, p.Account, p.AccountIncarnationID, p.AccountRevision, p.ConnectionNamespaceID,
-		p.Tool, encryptedArgs, p.Status, p.ExpiresAt, p.Kind)
+		p.Tool, encryptedArgs, p.Status, p.ExpiresAt, p.Kind, s.bootID)
+	return err
+}
+
+// HeartbeatPending records that the process parking this call is still
+// waiting on it. RecoverPendingApprovals only cancels rows whose heartbeat is
+// older than approvalOwnerStaleAfter.
+func (s *PgStore) HeartbeatPending(ctx context.Context, id string) error {
+	_, err := s.pool.Exec(ctx, `UPDATE pending_calls SET heartbeat_at=now() WHERE id=$1 AND status='pending'`, id)
 	return err
 }
 
@@ -3969,6 +4048,23 @@ func (s *PgStore) SetDecision(ctx context.Context, id, status string) error {
 func (s *PgStore) DecidePending(ctx context.Context, id string, decision ApprovalDecision) (PendingCall, error) {
 	decision, err := normalizeHumanDecision(decision)
 	if err != nil {
+		return PendingCall{}, err
+	}
+	// A call whose owning process stopped heartbeating has no waiter left to
+	// dispatch it, so cancel it rather than record a decision for a call that
+	// will never run. Rows without an owner were parked by an Engine that
+	// predates heartbeats; their liveness is unknown, so they are left alone.
+	abandoned, err := s.scanPendingCall(s.pool.QueryRow(ctx, `
+UPDATE pending_calls
+SET status='cancelled', decided_at=now(), decided_by='engine',
+    decision_note='Engine stopped; original MCP request was not replayed'
+WHERE id=$1 AND status='pending' AND expires_at > now() AND owner_boot_id <> ''
+  AND heartbeat_at < now() - ($2::bigint * interval '1 second')
+RETURNING `+pendingCallColumns, id, int64(approvalOwnerStaleAfter/time.Second)))
+	if err == nil {
+		return abandoned, ErrApprovalNotPending
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
 		return PendingCall{}, err
 	}
 	actor, note, err := s.encryptDecisionMetadata(decision.Actor, decision.Note)
@@ -4067,10 +4163,12 @@ WHERE status='pending' AND expires_at <= $1`, now)
 	return tag.RowsAffected(), nil
 }
 
-// ApprovalRecovery summarizes startup recovery. Non-expired rows are
-// cancelled, not approved or replayed: their original MCP transport request
-// ended with the previous Engine process and generic tool calls are not safe to
-// re-run from stored arguments.
+// ApprovalRecovery summarizes startup recovery. Non-expired rows whose owning
+// process stopped heartbeating are cancelled, not approved or replayed: their
+// original MCP transport request ended with that process and generic tool
+// calls are not safe to re-run from stored arguments. Rows a live process is
+// still heartbeating (for example the previous revision during a rollout,
+// which keeps serving while this one boots) stay parked with their waiter.
 type ApprovalRecovery struct {
 	Expired   int64
 	Cancelled int64
@@ -4093,13 +4191,15 @@ WHERE status='pending' AND expires_at <= $1`, now)
 	}
 	result.Expired = tag.RowsAffected()
 
-	// Only rows still pending after the deadline sweep are cancelled. This is
-	// an explicit interrupted-request outcome, not a fabricated timeout.
+	// Only rows still pending after the deadline sweep, and whose owner stopped
+	// heartbeating, are cancelled. This is an explicit interrupted-request
+	// outcome, not a fabricated timeout. Heartbeats are written and compared
+	// on the database clock, so Engine clock skew cannot misjudge liveness.
 	tag, err = tx.Exec(ctx, `
 UPDATE pending_calls
 SET status='cancelled', decided_at=now(), decided_by='engine',
     decision_note='Engine restarted; original MCP request was not replayed'
-WHERE status='pending'`)
+WHERE status='pending' AND heartbeat_at < now() - ($1::bigint * interval '1 second')`, int64(approvalOwnerStaleAfter/time.Second))
 	if err != nil {
 		return ApprovalRecovery{}, err
 	}

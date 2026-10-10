@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -319,8 +320,14 @@ func TestWatchTickProgressesPastHungProvider(t *testing.T) {
 	if got := hungCalls.Load(); got != 1 {
 		t.Fatalf("hung provider probes across two watch ticks = %d, want one", got)
 	}
-	if got := healthyCalls.Load(); got != 2 {
-		t.Fatalf("healthy provider probes across two watch ticks = %d, want two", got)
+	// Two probes, plus one aggregation in the first tick: the healthy account
+	// was never projected, and its successful probe lets the reconcile restore
+	// it. The hung account's failed probe keeps the reconcile away from it.
+	if got := healthyCalls.Load(); got != 3 {
+		t.Fatalf("healthy provider calls across two watch ticks = %d, want two probes and one restore", got)
+	}
+	if g.mcp.GetTool("healthy__search") == nil {
+		t.Fatal("watch tick did not restore the healthy account's tools")
 	}
 }
 
@@ -336,12 +343,14 @@ func TestHealthAlertNeverIncludesProviderDetail(t *testing.T) {
 	g := newConnectorTestGateway(t, nil)
 	g.SetAlertWebhook(webhook.URL)
 	const secret = "provider-secret-do-not-alert"
-	g.evalAlert(AccountHealth{
+	row := AccountHealth{
 		UUID:     "notion",
 		Status:   healthStatusUnreachable,
 		Detail:   secret,
 		Recovery: secret,
-	})
+	}
+	g.evalAlerts(context.Background(), []AccountHealth{row})
+	g.evalAlerts(context.Background(), []AccountHealth{row}) // transient: alerts on the second failed probe
 
 	select {
 	case body := <-received:
@@ -353,6 +362,83 @@ func TestHealthAlertNeverIncludesProviderDetail(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("health alert was not delivered")
+	}
+}
+
+func countAlerts(logs *syncLogBuffer, kind string) int {
+	return strings.Count(logs.String(), kind)
+}
+
+func TestHealthAlertWaitsForSecondConsecutiveTransientFailure(t *testing.T) {
+	g := newConnectorTestGateway(t, nil)
+	logs := captureEngineLog(t)
+	sweep := func(slow string) {
+		g.evalAlerts(context.Background(), []AccountHealth{
+			{UUID: "healthy", Status: healthStatusOK},
+			{UUID: "slow", Status: slow},
+		})
+	}
+
+	sweep(healthStatusTimeout)
+	sweep(healthStatusOK) // a one-off blip recovers silently
+	sweep(healthStatusTimeout)
+	if n := countAlerts(logs, "needs attention"); n != 0 {
+		t.Fatalf("single failed probes raised %d alert(s), want none:\n%s", n, logs)
+	}
+	sweep(healthStatusUnreachable)
+	if n := countAlerts(logs, `account "slow" needs attention (unreachable)`); n != 1 {
+		t.Fatalf("second consecutive failure raised %d alert(s), want one:\n%s", n, logs)
+	}
+	sweep(healthStatusTimeout)
+	sweep(healthStatusOK)
+	if countAlerts(logs, "needs attention") != 1 || countAlerts(logs, `account "slow" recovered`) != 1 {
+		t.Fatalf("sustained outage should alert once then recover once:\n%s", logs)
+	}
+}
+
+func TestHealthAlertIgnoresSweepWhereEveryProbeTimedOut(t *testing.T) {
+	g := newConnectorTestGateway(t, nil)
+	logs := captureEngineLog(t)
+	for i := 0; i < 3; i++ { // a throttled cold-start Engine, woken repeatedly
+		g.evalAlerts(context.Background(), []AccountHealth{
+			{UUID: "linear", Status: healthStatusTimeout},
+			{UUID: "notion", Status: healthStatusTimeout},
+			{UUID: "figma", Status: healthStatusNeedsAuth}, // not probed: still alerts
+		})
+	}
+	if n := countAlerts(logs, "needs attention"); n != 1 || countAlerts(logs, `account "figma" needs attention (needs_auth)`) != 1 {
+		t.Fatalf("Engine-wide timeout sweeps raised %d alert(s), want only figma's:\n%s", n, logs)
+	}
+}
+
+func TestHealthAlertIsNotRepeatedAfterEngineRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "accounts.json")
+	logs := captureEngineLog(t)
+	// Each sweep runs on a freshly booted Engine over the same store, as a
+	// scale-to-zero Engine does when the Platform wakes it.
+	sweepAfterRestart := func(rows ...AccountHealth) {
+		fs, err := LoadFileStore(path)
+		if err != nil {
+			t.Fatalf("file store: %v", err)
+		}
+		NewGateway(fs, server.NewMCPServer("test", "0.0.0")).evalAlerts(context.Background(), rows)
+	}
+	figma := AccountHealth{UUID: "figma", Status: healthStatusNeedsAuth}
+
+	sweepAfterRestart(figma)
+	sweepAfterRestart(figma)
+	if n := countAlerts(logs, "needs attention"); n != 1 {
+		t.Fatalf("persistent needs_auth alerted %d time(s) across a restart, want once:\n%s", n, logs)
+	}
+	sweepAfterRestart(AccountHealth{UUID: "figma", Status: healthStatusOK})
+	if n := countAlerts(logs, `account "figma" recovered`); n != 1 {
+		t.Fatalf("recovery after restart alerted %d time(s), want once:\n%s", n, logs)
+	}
+	sweepAfterRestart(figma)
+	sweepAfterRestart() // account deleted: its alert state goes with it
+	sweepAfterRestart(figma)
+	if n := countAlerts(logs, "needs attention"); n != 3 {
+		t.Fatalf("re-broken and re-created account alerts = %d, want 3 total:\n%s", n, logs)
 	}
 }
 

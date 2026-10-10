@@ -11,6 +11,8 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+
+	"narthex/backend/internal/oauthas"
 )
 
 // mcpClientProjectionTTL bounds how long a subject-bound client endpoint may
@@ -40,16 +42,32 @@ func (g *Gateway) mcpClientStore() (MCPClientStore, bool) {
 	return store, ok
 }
 
+// mcpClientLookup is the error-aware slug lookup. ActiveMCPClient folds a
+// failed read into "not found", which on the OAuth path became a 401 or a
+// terminal invalid_grant for a perfectly healthy agent.
+type mcpClientLookup interface {
+	LookupActiveMCPClient(ctx context.Context, slug string) (MCPClient, bool, error)
+}
+
+func lookupActiveMCPClient(ctx context.Context, store MCPClientStore, slug string) (MCPClient, bool, error) {
+	if lookup, ok := store.(mcpClientLookup); ok {
+		return lookup.LookupActiveMCPClient(ctx, slug)
+	}
+	client, found := store.ActiveMCPClient(ctx, slug)
+	return client, found, nil
+}
+
 // buildMCPClient projects one durable client registration into its dedicated
 // /mcp/clients/{slug} surface. The registry itself owns authorization; this
 // method builds only the tool projection and therefore rechecks every account
 // boundary defensively rather than trusting a human-readable folder label.
-func (g *Gateway) buildMCPClient(client MCPClient) error {
+// accounts must come from one successful durable listing: projecting from a
+// failed read would silently drop every upstream tool.
+func (g *Gateway) buildMCPClient(client MCPClient, accounts []Account) error {
 	if client.Status != MCPClientStatusActive || client.Slug == "" || client.Epoch == "" {
 		return fmt.Errorf("MCP client is not live")
 	}
 	namespaceIDs := toSet(client.ConnectionNamespaceIDs)
-	accounts := g.store.Accounts()
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -66,7 +84,7 @@ func (g *Gateway) buildMCPClient(client MCPClient) error {
 		})
 		endpoint = &connectorServer{
 			mcp:     m,
-			handler: server.NewStreamableHTTPServer(m, server.WithEndpointPath("/mcp/clients/"+client.Slug)),
+			handler: NewStreamableMCPHandler(m, "/mcp/clients/"+client.Slug),
 			kind:    endpointKindClient,
 		}
 		g.clientEndpoints[client.Slug] = endpoint
@@ -77,7 +95,6 @@ func (g *Gateway) buildMCPClient(client MCPClient) error {
 	endpoint.guards = nil
 	endpoint.refreshedAt = time.Now()
 
-	var names []string
 	var tools []cachedTool
 	for _, account := range accounts {
 		if !namespaceIDs[account.ConnectionNamespaceID] {
@@ -110,32 +127,33 @@ func (g *Gateway) buildMCPClient(client MCPClient) error {
 				tool.handler,
 			)
 			tools = append(tools, tool)
-			names = append(names, tool.tool.Name)
 		}
 	}
-	if len(endpoint.names) > 0 {
-		endpoint.mcp.DeleteTools(endpoint.names...)
-	}
-	for _, tool := range tools {
-		endpoint.mcp.AddTool(tool.tool, tool.handler)
-	}
+	projected := serverTools(tools)
 	// The root /mcp server retains its owner/admin Library projection. A
 	// subject-bound client endpoint instead gets a small, independently
 	// guarded projection whose identity is derived from this durable client
-	// record. Register after deleting endpoint.names above so a refresh cannot
+	// record. It is part of the same atomic tool set, so a refresh cannot
 	// leave a stale built-in behind.
 	if libraryStore, ok := g.store.(LibraryStore); ok {
-		names = append(names, registerMCPClientLibraryTools(
-			endpoint.mcp,
+		// The Library helpers register onto an MCPServer. A private scratch
+		// server with no sessions collects their definitions and closures
+		// without notifying anyone.
+		scratch := server.NewMCPServer("narthex-client-library", synaxisMCPServerVersion)
+		registerMCPClientLibraryTools(
+			scratch,
 			libraryStore,
 			g.audit,
 			client,
 			func(ctx context.Context) bool {
 				return g.mcpClientMayUseLibrary(ctx, client.Slug, client.ID, client.Subject, client.Epoch)
 			},
-		)...)
+		)
+		for _, tool := range scratch.ListTools() {
+			projected = append(projected, *tool)
+		}
 	}
-	endpoint.names = names
+	endpoint.setTools(projected)
 	return nil
 }
 
@@ -147,13 +165,17 @@ func (g *Gateway) buildMCPClient(client MCPClient) error {
 func (g *Gateway) RefreshMCPClients(ctx context.Context) error {
 	g.endpointMu.Lock()
 	defer g.endpointMu.Unlock()
-	return g.refreshMCPClientsLocked(ctx)
+	accounts, err := g.listAccounts(ctx)
+	if err != nil {
+		return fmt.Errorf("list accounts: %w", err)
+	}
+	return g.refreshMCPClientsLocked(ctx, accounts)
 }
 
 // refreshMCPClientsLocked requires endpointMu. It intentionally keeps the
 // OAuth revoker outside Gateway.mu: revocation can acquire OAuth locks and
 // must never run while a request handler is holding the live endpoint map.
-func (g *Gateway) refreshMCPClientsLocked(ctx context.Context) error {
+func (g *Gateway) refreshMCPClientsLocked(ctx context.Context, accounts []Account) error {
 	store, ok := g.mcpClientStore()
 	if !ok {
 		g.mu.Lock()
@@ -187,7 +209,7 @@ func (g *Gateway) refreshMCPClientsLocked(ctx context.Context) error {
 
 	seen := make(map[string]string, len(clients))
 	for _, client := range clients {
-		if err := g.buildMCPClient(client); err != nil {
+		if err := g.buildMCPClient(client, accounts); err != nil {
 			return fmt.Errorf("build MCP client %q: %w", client.Slug, err)
 		}
 		seen[client.Slug] = client.Epoch
@@ -265,14 +287,20 @@ func (g *Gateway) MCPClientHandler(slug string) (http.Handler, bool) {
 		current, found := g.clientEndpoints[slug]
 		stale := !found || current.kind != endpointKindClient || time.Since(current.refreshedAt) >= mcpClientProjectionTTL
 		g.mu.Unlock()
+		refreshFailed := false
 		if stale {
 			if err := g.refreshMCPClientRequest(r.Context(), slug); err != nil {
 				if errors.Is(err, ErrMCPClientNotFound) || errors.Is(err, ErrMCPClientRevoked) {
 					http.NotFound(w, r)
 					return
 				}
-				http.Error(w, "MCP client endpoint unavailable", http.StatusServiceUnavailable)
-				return
+				// A failed durable read is no verdict on the client: answering
+				// 404 here told Streamable HTTP clients their session was gone.
+				// Keep serving the last good projection instead; every tool call
+				// still re-checks the durable client/account boundary and fails
+				// closed on its own (clientAccountHandler, mcpClientMayUseLibrary).
+				log.Printf("engine: refresh MCP client %q: %v (serving last projection)", slug, err)
+				refreshFailed = true
 			}
 		}
 		g.mu.Lock()
@@ -282,6 +310,11 @@ func (g *Gateway) MCPClientHandler(slug string) (http.Handler, bool) {
 			handler = live.handler
 		}
 		g.mu.Unlock()
+		if handler == nil && refreshFailed {
+			w.Header().Set("Retry-After", "5")
+			http.Error(w, "MCP client endpoint unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		if handler == nil {
 			http.NotFound(w, r)
 			return
@@ -293,31 +326,36 @@ func (g *Gateway) MCPClientHandler(slug string) (http.Handler, bool) {
 // MCPClientAllowsOAuthClient is the per-token callback used by oauthas. It is
 // checked for every client-bound access-token, authorization-code, and refresh
 // redemption; an epoch alone would revoke stale tokens but could not prevent a
-// new token being minted for a rebound OAuth client.
-func (g *Gateway) MCPClientAllowsOAuthClient(oauthClientID, resource string) bool {
+// new token being minted for a rebound OAuth client. It returns an error, not
+// false, when durable state could not be read, so the OAuth server answers a
+// database hiccup with a retryable 503 rather than a 401 or invalid_grant.
+func (g *Gateway) MCPClientAllowsOAuthClient(oauthClientID, resource string) (bool, error) {
 	slug, ok := mcpClientSlugFromResource(resource)
 	if !ok || strings.TrimSpace(oauthClientID) == "" {
-		return false
+		return false, nil
 	}
 	store, ok := g.mcpClientStore()
 	if !ok {
-		return false
+		return false, nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	client, ok := store.ActiveMCPClient(ctx, slug)
+	client, ok, err := lookupActiveMCPClient(ctx, store, slug)
+	if err != nil {
+		return false, fmt.Errorf("load MCP client: %w", err)
+	}
 	if !ok || client.OAuthClientID != oauthClientID {
-		return false
+		return false, nil
 	}
 	// A matching binding must also be the kind of binding the client may
 	// hold: a workload client only its reserved workload identity, an
 	// interactive client never one. The stores never write anything else, so
 	// this only makes a corrupt record fail closed.
 	if !mcpClientOAuthBindingConsistent(client) {
-		return false
+		return false, nil
 	}
 	if g.mcpClientProjectionMatches(client) {
-		return true
+		return true, nil
 	}
 	// This callback runs outside oauthas's generation lock. A replica that has
 	// observed a durable reset/rebind but not the corresponding console refresh
@@ -325,9 +363,9 @@ func (g *Gateway) MCPClientAllowsOAuthClient(oauthClientID, resource string) boo
 	// Failure remains fail-closed: an old refresh grant must never be upgraded
 	// against a stale endpoint epoch.
 	if err := g.RefreshMCPClients(ctx); err != nil {
-		return false
+		return false, err
 	}
-	return g.mcpClientProjectionMatches(client)
+	return g.mcpClientProjectionMatches(client), nil
 }
 
 func (g *Gateway) mcpClientProjectionMatches(client MCPClient) bool {
@@ -353,6 +391,20 @@ func (g *Gateway) mcpClientProjectionMatches(client MCPClient) bool {
 // brokered by the control plane and never claimed through browser consent.
 // Both the hosted and the self-hosted password consent paths call this.
 func (g *Gateway) AuthorizeMCPConsent(ctx context.Context, subject, role, oauthClientID, resource string) error {
+	return g.authorizeMCPConsent(ctx, subject, role, oauthClientID, resource, false)
+}
+
+// ReplaceMCPConsent is AuthorizeMCPConsent for the member's explicit "Replace
+// sign-in" choice: when the subject-bound endpoint is already bound to another
+// DCR client, the same member that may bind it moves the binding to this one
+// in one revision-checked write. The epoch rotates and the previous epoch's
+// grants are revoked, so the app that held the old binding is signed out.
+// Every other check is identical; a workload client is still never claimable.
+func (g *Gateway) ReplaceMCPConsent(ctx context.Context, subject, role, oauthClientID, resource string) error {
+	return g.authorizeMCPConsent(ctx, subject, role, oauthClientID, resource, true)
+}
+
+func (g *Gateway) authorizeMCPConsent(ctx context.Context, subject, role, oauthClientID, resource string, replace bool) error {
 	subject = strings.TrimSpace(subject)
 	role = strings.TrimSpace(role)
 	oauthClientID = strings.TrimSpace(oauthClientID)
@@ -373,7 +425,10 @@ func (g *Gateway) AuthorizeMCPConsent(ctx context.Context, subject, role, oauthC
 	if !ok {
 		return errors.New("MCP client registry is unavailable")
 	}
-	client, found := store.ActiveMCPClient(ctx, slug)
+	client, found, err := lookupActiveMCPClient(ctx, store, slug)
+	if err != nil {
+		return fmt.Errorf("%w: load MCP client: %w", oauthas.ErrAuthorizationStateUnavailable, err)
+	}
 	if !found {
 		return errors.New("MCP client endpoint is unavailable")
 	}
@@ -383,11 +438,19 @@ func (g *Gateway) AuthorizeMCPConsent(ctx context.Context, subject, role, oauthC
 	if !MCPClientAllowsActor(client, actor) {
 		return errMCPClientConsentRefused
 	}
-	if client.OAuthClientID != "" && client.OAuthClientID != oauthClientID {
-		return ErrMCPClientOAuthBinding
+	if client.OAuthClientID != "" && client.OAuthClientID != oauthClientID && !replace {
+		// The actor is entitled to this endpoint; only the app differs. Say so,
+		// so consent can offer to replace the sign-in instead of reporting a
+		// generic failure.
+		return fmt.Errorf("%w: %w", ErrMCPClientOAuthBinding, oauthas.ErrClientBoundToOtherApp)
 	}
-	if client.OAuthClientID == "" {
-		bound, err := store.BindMCPClientOAuthClient(ctx, client.ID, oauthClientID, MCPClientPrecondition{
+	if client.OAuthClientID != oauthClientID {
+		bind := store.BindMCPClientOAuthClient
+		if replace {
+			bind = store.ReplaceMCPClientOAuthClient
+		}
+		previous := client.OAuthClientID
+		bound, err := bind(ctx, client.ID, oauthClientID, MCPClientPrecondition{
 			ID: client.ID, Revision: client.Revision,
 		}, actor)
 		if err != nil {
@@ -399,11 +462,14 @@ func (g *Gateway) AuthorizeMCPConsent(ctx context.Context, subject, role, oauthC
 					MCPClientAllowsActor(current, actor) && current.OAuthClientID == oauthClientID {
 					bound = current
 				} else {
-					return ErrMCPClientOAuthBinding
+					return fmt.Errorf("%w: %w", ErrMCPClientOAuthBinding, oauthas.ErrClientBoundToOtherApp)
 				}
 			} else {
 				return err
 			}
+		}
+		if previous != "" && bound.OAuthClientID == oauthClientID {
+			log.Printf("engine: MCP client %q sign-in replaced by its member; the previous app's tokens are revoked", client.Slug)
 		}
 		client = bound
 	}
@@ -427,17 +493,30 @@ func (g *Gateway) refreshMCPClientRequest(ctx context.Context, slug string) erro
 	}
 	g.endpointMu.Lock()
 	defer g.endpointMu.Unlock()
+	// Parallel requests that all found the projection stale queue here; only
+	// the first needs to rebuild.
+	g.mu.Lock()
+	current, found := g.clientEndpoints[slug]
+	fresh := found && current.kind == endpointKindClient && time.Since(current.refreshedAt) < mcpClientProjectionTTL
+	g.mu.Unlock()
+	if fresh {
+		return nil
+	}
 	// Read only after acquiring the projection mutex. Reading first leaves a
 	// window in which a console mutation publishes a newer epoch/toolset and
 	// this request then overwrites it with a stale client snapshot.
-	client, found := store.ActiveMCPClient(ctx, slug)
+	client, found, err := lookupActiveMCPClient(ctx, store, slug)
+	if err != nil {
+		return fmt.Errorf("load MCP client: %w", err)
+	}
 	if !found {
 		return ErrMCPClientNotFound
 	}
-	if err := g.buildMCPClient(client); err != nil {
-		return err
+	accounts, err := g.listAccounts(ctx)
+	if err != nil {
+		return fmt.Errorf("list accounts: %w", err)
 	}
-	return nil
+	return g.buildMCPClient(client, accounts)
 }
 
 // clientAccountHandler is a final authorization gate around each cached tool
@@ -459,8 +538,8 @@ func (g *Gateway) mcpClientMayUseAccount(ctx context.Context, slug, accountName,
 	if !ok {
 		return false
 	}
-	client, ok := store.ActiveMCPClient(ctx, slug)
-	if !ok {
+	client, ok, err := lookupActiveMCPClient(ctx, store, slug)
+	if err != nil || !ok {
 		return false
 	}
 	account, ok := g.store.Account(accountName)
@@ -484,8 +563,8 @@ func (g *Gateway) mcpClientMayUseLibrary(ctx context.Context, slug, clientID, su
 	if !ok {
 		return false
 	}
-	client, ok := store.ActiveMCPClient(ctx, slug)
-	return ok && client.ID == clientID && client.Subject == subject && client.Epoch == epoch
+	client, ok, err := lookupActiveMCPClient(ctx, store, slug)
+	return err == nil && ok && client.ID == clientID && client.Subject == subject && client.Epoch == epoch
 }
 
 func mcpClientSlugFromResource(resource string) (string, bool) {

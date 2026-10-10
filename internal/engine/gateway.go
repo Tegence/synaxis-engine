@@ -10,6 +10,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -43,11 +44,22 @@ type Gateway struct {
 	// Each endpoint is bound to one durable MCPClient subject and includes only
 	// the connection-namespace grants held by that registration.
 	clientEndpoints map[string]*connectorServer // slug -> subject-bound MCP server
-	refreshMu       map[string]*sync.Mutex      // per-account refresh serialization
-	alertState      map[string]bool             // account -> currently-down (alert dedup)
-	webhook         string                      // optional alert webhook URL
-	consoleURL      string                      // linked in approval webhook messages
-	publicURL       string                      // this Engine's own public base; builds decide_url (see notify.go)
+	// projectionFailed records that the last RefreshConnectors could not read
+	// durable state, so it is retried; projected records that one succeeded.
+	// Together they are ProjectionReady.
+	projectionFailed atomic.Bool
+	projected        atomic.Bool
+	refreshMu        map[string]*sync.Mutex // per-account refresh serialization
+	// Health-alert state, owned by the watch loop (see evalAlerts). alertState
+	// maps account -> status of its outstanding down alert; nil until loaded
+	// from a HealthAlertStore. failStreak is deliberately in-memory only: a
+	// restart must not count toward a transient-failure alert.
+	alertMu    sync.Mutex
+	alertState map[string]string
+	failStreak map[string]int
+	webhook    string // optional alert webhook URL
+	consoleURL string // linked in approval webhook messages
+	publicURL  string // this Engine's own public base; builds decide_url (see notify.go)
 	// platformEventsURL/platformEventsToken: hosted-only Platform ingest
 	// target + the shared admin-token credential (see SetPlatformEvents).
 	platformEventsURL   string
@@ -273,12 +285,26 @@ func (g *Gateway) refreshLock(name string) *sync.Mutex {
 	return mu
 }
 
+// refreshAccountTimeout bounds one provider refresh plus its persistence.
+const refreshAccountTimeout = 30 * time.Second
+
 // refreshAccount refreshes one OAuth account's tokens and persists them, under
 // a per-account lock. Used by both the on-401 path and refresh-ahead.
 func (g *Gateway) refreshAccount(ctx context.Context, name, expectedIncarnationID string) error {
 	mu := g.refreshLock(name)
 	mu.Lock()
 	defer mu.Unlock()
+	// A caller already gone (shutdown, a disconnected client) starts nothing.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// Providers that rotate refresh tokens spend the old one the moment they
+	// accept the request. A caller that gives up once it is in flight (a
+	// client disconnecting from a tool call, SIGTERM at scale-in) must not
+	// abort between that and storing the replacement, or the account is dead
+	// until reconnected.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), refreshAccountTimeout)
+	defer cancel()
 	a, ok := g.store.Account(name)
 	if !ok || expectedIncarnationID == "" || a.IncarnationID != expectedIncarnationID {
 		return ErrAccountIncarnation
@@ -394,22 +420,42 @@ func (g *Gateway) aggregateAccount(ctx context.Context, a Account) (int, error) 
 		g.mu.Unlock()
 		return 0, ErrAccountIncarnation
 	}
-	if old := g.byAcct[a.Name]; len(old) > 0 {
-		g.mcp.DeleteTools(old...)
-	}
 	rootNames := names
 	if a.IsPersonal() {
 		rootNames = nil
+		g.replaceRootToolsLocked(g.byAcct[a.Name], nil)
 	} else {
-		for _, ct := range cached {
-			g.mcp.AddTool(ct.tool, ct.handler)
-		}
+		g.replaceRootToolsLocked(g.byAcct[a.Name], cached)
 	}
 	g.byAcct[a.Name] = rootNames
 	g.cached[a.Name] = cached
 	g.projectedIncarnations[a.Name] = a.IncarnationID
 	g.mu.Unlock()
 	return len(rootNames), nil // count tools registered on shared root, not cached personal tools
+}
+
+// replaceRootToolsLocked swaps one account's shared /mcp projection from the
+// old names to tools: one deletion of only the names that disappear, then one
+// batched registration (which replaces existing names in place). Connected
+// clients get at most two tools/list_changed instead of one per tool, and no
+// surviving tool is ever briefly missing. Callers hold g.mu.
+func (g *Gateway) replaceRootToolsLocked(old []string, tools []cachedTool) {
+	keep := make(map[string]bool, len(tools))
+	for _, t := range tools {
+		keep[t.tool.Name] = true
+	}
+	var removed []string
+	for _, name := range old {
+		if !keep[name] {
+			removed = append(removed, name)
+		}
+	}
+	if len(removed) > 0 {
+		g.mcp.DeleteTools(removed...)
+	}
+	if len(tools) > 0 {
+		g.mcp.AddTools(serverTools(tools)...)
+	}
 }
 
 // accountToolHandler builds the dispatch closure shared by root, connector,
@@ -958,7 +1004,10 @@ func looksLikeAuthFailure(err error) bool {
 		strings.Contains(s, "unauthorized") ||
 		strings.Contains(s, "authorization required") ||
 		strings.Contains(s, "invalid_token") ||
-		strings.Contains(s, "invalid access token")
+		strings.Contains(s, "invalid access token") ||
+		// A provider that rejects the stored refresh token has revoked the
+		// grant: retrying cannot help, only reauthorizing can.
+		strings.Contains(s, "invalid_grant")
 }
 
 // Health live-checks every account concurrently, with an independent bounded
@@ -1055,20 +1104,129 @@ func (g *Gateway) probeAccountsHealth(ctx context.Context, cacheTTL time.Duratio
 	return out
 }
 
-// Aggregate registers tools for every account. One bad account is skipped.
+const (
+	// aggregateAccountTimeout bounds one account's discovery (dial, a possible
+	// refresh-and-redial, paginated tools/list) so one slow or hung upstream
+	// cannot spend the whole startup budget for every other account.
+	aggregateAccountTimeout = dialTimeout
+	// aggregateParallelism bounds concurrent upstream discovery at startup.
+	aggregateParallelism = 4
+	// projectionTimeout is the endpoint projection's own budget. It must never
+	// inherit an aggregation context that slow upstreams may have exhausted.
+	projectionTimeout = 15 * time.Second
+	// projectionRetryInterval paces retries of a failed endpoint projection.
+	projectionRetryInterval = 10 * time.Second
+)
+
+// Aggregate registers tools for every account. One bad account is skipped,
+// and reconcileProjection retries it later.
 func (g *Gateway) Aggregate(ctx context.Context) int {
-	total := 0
+	var (
+		wg    sync.WaitGroup
+		total atomic.Int64
+	)
+	slots := make(chan struct{}, aggregateParallelism)
 	for _, a := range g.store.Accounts() {
-		n, err := g.aggregateAccount(ctx, a)
-		if err != nil {
-			log.Printf("engine: account %q skipped (list tools failed): %v", a.Name, err)
+		wg.Add(1)
+		go func(a Account) {
+			defer wg.Done()
+			select {
+			case slots <- struct{}{}:
+				defer func() { <-slots }()
+			case <-ctx.Done():
+				log.Printf("engine: account %q skipped (list tools failed): %v", a.Name, ctx.Err())
+				return
+			}
+			started := time.Now()
+			actx, cancel := context.WithTimeout(ctx, aggregateAccountTimeout)
+			n, err := g.aggregateAccount(actx, a)
+			cancel()
+			if err != nil {
+				log.Printf("engine: account %q skipped (list tools failed after %s): %v", a.Name, time.Since(started).Round(time.Millisecond), err)
+				return
+			}
+			total.Add(int64(n))
+			log.Printf("engine: aggregated %d tools from %q in %s", n, a.Name, time.Since(started).Round(time.Millisecond))
+		}(a)
+	}
+	wg.Wait()
+	pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), projectionTimeout)
+	defer cancel()
+	g.RefreshConnectors(pctx)
+	return int(total.Load())
+}
+
+// ProjectionReady reports that connector, bundle and client endpoints have
+// been projected from durable state and the last refresh succeeded. Until
+// then a token for an endpoint missing from memory may be valid, so the OAuth
+// server answers it with a retryable 503 instead of revoking-style errors.
+// Lock-free: the OAuth server calls it while holding its own lock.
+func (g *Gateway) ProjectionReady() bool {
+	return g.projected.Load() && !g.projectionFailed.Load()
+}
+
+// listAccounts reads every account, reporting a failed read as an error where
+// the store can (see accountLister) instead of as an empty list.
+func (g *Gateway) listAccounts(ctx context.Context) ([]Account, error) {
+	if lister, ok := g.store.(accountLister); ok {
+		return lister.ListAccounts(ctx)
+	}
+	return g.store.Accounts(), nil
+}
+
+// reconcileProjection repairs what a transient failure left behind: accounts
+// whose discovery failed (skipped at startup, or a re-list after a policy edit
+// that did not complete) are aggregated again, and a failed endpoint
+// projection is retried. Before this, both stayed broken for the rest of the
+// process lifetime — tools missing everywhere, or every connector and client
+// endpoint answering 401 — while the console reported the account healthy.
+// A non-nil healthy limits the retry to accounts whose fresh health probe just
+// succeeded, so a hung or broken provider is never dialled a second time.
+func (g *Gateway) reconcileProjection(ctx context.Context, healthy map[string]bool) {
+	accounts, err := g.listAccounts(ctx)
+	if err != nil {
+		log.Printf("engine: reconcile projection: list accounts: %v", err)
+		return
+	}
+	restored := 0
+	for _, a := range accounts {
+		if g.accountProjected(a) || (a.AuthMode == "oauth" && a.AccessToken == "" && a.RefreshToken == "") {
+			continue // current, or never authorized: nothing a retry can fix
+		}
+		if healthy != nil && !healthy[a.Name] {
 			continue
 		}
-		total += n
-		log.Printf("engine: aggregated %d tools from %q", n, a.Name)
+		actx, cancel := context.WithTimeout(ctx, aggregateAccountTimeout)
+		n, err := g.aggregateAccount(actx, a)
+		cancel()
+		if err != nil {
+			log.Printf("engine: reconcile account %q: %v", a.Name, err)
+			continue
+		}
+		restored++
+		log.Printf("engine: reconcile restored %d tools from %q", n, a.Name)
 	}
-	g.RefreshConnectors(ctx)
-	return total
+	if restored > 0 || g.projectionFailed.Load() {
+		pctx, cancel := context.WithTimeout(ctx, projectionTimeout)
+		defer cancel()
+		g.RefreshConnectors(pctx)
+	}
+}
+
+// accountProjected reports whether the live cache was built from this exact
+// account incarnation, revision and URL.
+func (g *Gateway) accountProjected(a Account) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if a.IncarnationID == "" || g.projectedIncarnations[a.Name] != a.IncarnationID {
+		return false
+	}
+	for _, t := range g.cached[a.Name] {
+		if t.accountRevision != a.Revision || !equalAccountSnapshotURL(t.accountURL, a.URL) {
+			return false
+		}
+	}
+	return true
 }
 
 // AddAccount registers a single account's tools at runtime. It intentionally
@@ -1130,9 +1288,6 @@ func (g *Gateway) rebindCachedAccount(a Account, expectedPreviousRevision int64)
 		}
 	}
 
-	if old := g.byAcct[a.Name]; len(old) > 0 {
-		g.mcp.DeleteTools(old...)
-	}
 	updated := make([]cachedTool, 0, len(cached))
 	rootNames := make([]string, 0, len(cached))
 	for _, tool := range cached {
@@ -1141,9 +1296,13 @@ func (g *Gateway) rebindCachedAccount(a Account, expectedPreviousRevision int64)
 		tool.handler = g.accountToolHandler(a, up, tool.sourceName)
 		updated = append(updated, tool)
 		if !a.IsPersonal() {
-			g.mcp.AddTool(tool.tool, tool.handler)
 			rootNames = append(rootNames, tool.tool.Name)
 		}
+	}
+	if a.IsPersonal() {
+		g.replaceRootToolsLocked(g.byAcct[a.Name], nil)
+	} else {
+		g.replaceRootToolsLocked(g.byAcct[a.Name], updated)
 	}
 	g.cached[a.Name] = updated
 	g.byAcct[a.Name] = rootNames
@@ -1155,20 +1314,35 @@ func (g *Gateway) rebindCachedAccount(a Account, expectedPreviousRevision int64)
 // accounts (so tokens never reach expiry), then a health sweep that fires an
 // alert on each down/recovered transition.
 func (g *Gateway) StartWatch(ctx context.Context, interval time.Duration) {
-	select { // first tick soon after boot, then on the interval
-	case <-ctx.Done():
-		return
-	case <-time.After(60 * time.Second):
-		g.tick(ctx)
-	}
-	t := time.NewTicker(interval)
-	defer t.Stop()
+	// Repair anything startup could not project soon after boot (a
+	// scale-to-zero instance often lives for less than one interval), then
+	// tick: first soon after boot, then on the interval. A failed endpoint
+	// projection is retried every projectionRetryInterval until it succeeds,
+	// because until then client endpoints answer 503.
+	reconcile := time.After(15 * time.Second)
+	firstTick := time.After(60 * time.Second)
+	retry := time.NewTicker(projectionRetryInterval)
+	defer retry.Stop()
+	var ticks <-chan time.Time
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case <-reconcile:
+			g.reconcileProjection(ctx, nil)
+		case <-firstTick:
 			g.tick(ctx)
+			t := time.NewTicker(interval)
+			defer t.Stop()
+			ticks = t.C
+		case <-ticks:
+			g.tick(ctx)
+		case <-retry.C:
+			if g.projectionFailed.Load() {
+				pctx, cancel := context.WithTimeout(ctx, projectionTimeout)
+				g.RefreshConnectors(pctx)
+				cancel()
+			}
 		}
 	}
 }
@@ -1176,6 +1350,9 @@ func (g *Gateway) StartWatch(ctx context.Context, interval time.Duration) {
 func (g *Gateway) tick(ctx context.Context) {
 	refreshed := 0
 	for _, a := range g.store.Accounts() {
+		if ctx.Err() != nil {
+			return // shutting down: never start another provider refresh
+		}
 		if a.AuthMode == "oauth" && a.RefreshToken != "" {
 			if err := g.refreshAccount(ctx, a.Name, a.IncarnationID); err != nil {
 				log.Printf("engine: refresh-ahead %q: %v", a.Name, err)
@@ -1187,14 +1364,18 @@ func (g *Gateway) tick(ctx context.Context) {
 	if refreshed > 0 {
 		log.Printf("engine: refresh-ahead refreshed %d oauth account(s)", refreshed)
 	}
-	for _, h := range g.liveHealth(ctx) { // health sweep covers token accounts too; alerts need fresh probes, not the console read cache
+	rows := g.liveHealth(ctx) // health sweep covers token accounts too; alerts need fresh probes, not the console read cache
+	healthy := map[string]bool{}
+	for _, h := range rows {
 		if h.internalErr != nil && !errors.Is(h.internalErr, errHealthProbeInFlight) {
 			// Preserve the real cause only in Engine-controlled diagnostics.
-			// Browser responses and outbound alerts use healthPresentation below.
+			// Browser responses and outbound alerts use healthPresentation.
 			log.Printf("engine: health probe account=%q status=%s err=%v", h.UUID, h.Status, h.internalErr)
 		}
-		g.evalAlert(h)
+		healthy[h.UUID] = h.Status == healthStatusOK
 	}
+	g.evalAlerts(ctx, rows)
+	g.reconcileProjection(ctx, healthy)
 	g.purgeAudit(ctx)
 }
 
@@ -1219,39 +1400,120 @@ func (g *Gateway) purgeAudit(ctx context.Context) {
 	}
 }
 
-// evalAlert fires only on a state change, so a sustained outage alerts once.
-func (g *Gateway) evalAlert(h AccountHealth) {
-	status, detail, recovery := healthPresentation(h.Status)
-	g.mu.Lock()
+// evalAlerts turns one health sweep into down/recovered alerts; each fires
+// only on a state change, so a sustained outage alerts once. Managed Engines
+// boot on throttled CPU, where probes time out en masse, so:
+//   - a transient failure (timeout/unreachable) alerts only on its second
+//     consecutive failed probe;
+//   - a sweep in which every probed account timed out says nothing about the
+//     providers, so its timeouts are ignored;
+//   - outstanding alerts persist through a HealthAlertStore, so a restart does
+//     not re-announce a known-down account (e.g. one never authorized).
+func (g *Gateway) evalAlerts(ctx context.Context, rows []AccountHealth) {
+	g.alertMu.Lock()
+	defer g.alertMu.Unlock()
 	if g.alertState == nil {
-		g.alertState = map[string]bool{}
+		state := map[string]string{}
+		if s, ok := g.store.(HealthAlertStore); ok {
+			loaded, err := s.HealthAlerts(ctx)
+			if err != nil {
+				// Without the prior state every known-down account would
+				// re-alert; skip this sweep and retry on the next one.
+				log.Printf("engine: load health alert state: %v", err)
+				return
+			}
+			for account, status := range loaded {
+				state[account] = status
+			}
+		}
+		g.alertState, g.failStreak = state, map[string]int{}
 	}
-	was := g.alertState[h.UUID]
-	now := status != healthStatusOK
-	g.alertState[h.UUID] = now
-	g.mu.Unlock()
-	switch {
-	case now && !was:
-		// Do not interpolate h.Detail here. AccountHealth is public and may be
-		// assembled by callers/tests; outbound alerts must remain safe even if a
-		// future caller accidentally supplies an upstream error string.
-		message := fmt.Sprintf("⚠️ Synaxis: account %q needs attention (%s). %s", h.UUID, status, detail)
-		if recovery != "" {
-			message += fmt.Sprintf(" Recommended recovery: %s.", recovery)
+	probed, timedOut := 0, 0
+	for _, h := range rows {
+		status, _, _ := healthPresentation(h.Status)
+		if status == healthStatusNeedsAuth { // decided from stored credentials, never probed
+			continue
 		}
-		summary := fmt.Sprintf("A probe failed and the account is marked down (%s). %s", status, detail)
-		if recovery != "" {
-			summary += fmt.Sprintf(" Recommended recovery: %s.", recovery)
+		probed++
+		if status == healthStatusTimeout {
+			timedOut++
 		}
-		g.fireEvent(WebhookEvent{
-			Event: EventUpstreamDown, ID: h.UUID, Account: accountDisplay(g.store, h.UUID),
-			Summary: summary, Text: message, Content: message,
-		})
-	case !now && was:
-		message := fmt.Sprintf("✅ Synaxis: account %q recovered", h.UUID)
-		g.fireEvent(WebhookEvent{
-			Event: EventUpstreamRecovered, ID: h.UUID, Account: accountDisplay(g.store, h.UUID),
-			Summary: "The probe succeeded again.", Text: message, Content: message,
-		})
+	}
+	// ponytail: one probed account cannot tell an Engine stall from a provider
+	// outage, so it falls back to the two-probe rule alone.
+	stalled := probed >= 2 && timedOut == probed
+	if stalled {
+		log.Printf("engine: every probed account (%d) timed out; treating the sweep as an Engine stall, not alerting", probed)
+	}
+	seen := make(map[string]bool, len(rows))
+	for _, h := range rows {
+		seen[h.UUID] = true
+		if status, _, _ := healthPresentation(h.Status); !(stalled && status == healthStatusTimeout) {
+			g.evalAlertLocked(ctx, h)
+		}
+	}
+	for account := range g.failStreak {
+		if !seen[account] {
+			delete(g.failStreak, account)
+		}
+	}
+	for account := range g.alertState {
+		if !seen[account] { // deleted account: drop its state so a re-created one starts clean
+			g.setAlertStateLocked(ctx, account, "")
+		}
+	}
+}
+
+func (g *Gateway) evalAlertLocked(ctx context.Context, h AccountHealth) {
+	status, detail, recovery := healthPresentation(h.Status)
+	was := g.alertState[h.UUID] != ""
+	if status == healthStatusOK {
+		delete(g.failStreak, h.UUID)
+		if was {
+			message := fmt.Sprintf("✅ Synaxis: account %q recovered", h.UUID)
+			g.fireEvent(WebhookEvent{
+				Event: EventUpstreamRecovered, ID: h.UUID, Account: accountDisplay(g.store, h.UUID),
+				Summary: "The probe succeeded again.", Text: message, Content: message,
+			})
+			g.setAlertStateLocked(ctx, h.UUID, "")
+		}
+		return
+	}
+	g.failStreak[h.UUID]++
+	transient := status == healthStatusTimeout || status == healthStatusUnreachable
+	if was || (transient && g.failStreak[h.UUID] < 2) {
+		return
+	}
+	// Do not interpolate h.Detail here. AccountHealth is public and may be
+	// assembled by callers/tests; outbound alerts must remain safe even if a
+	// future caller accidentally supplies an upstream error string.
+	message := fmt.Sprintf("⚠️ Synaxis: account %q needs attention (%s). %s", h.UUID, status, detail)
+	if recovery != "" {
+		message += fmt.Sprintf(" Recommended recovery: %s.", recovery)
+	}
+	summary := fmt.Sprintf("A probe failed and the account is marked down (%s). %s", status, detail)
+	if recovery != "" {
+		summary += fmt.Sprintf(" Recommended recovery: %s.", recovery)
+	}
+	g.fireEvent(WebhookEvent{
+		Event: EventUpstreamDown, ID: h.UUID, Account: accountDisplay(g.store, h.UUID),
+		Summary: summary, Text: message, Content: message,
+	})
+	g.setAlertStateLocked(ctx, h.UUID, status)
+}
+
+// setAlertStateLocked records an alert transition ("" = no outstanding alert).
+// It runs after fireEvent: a failed write costs at most one duplicate alert
+// after a restart, never a lost one.
+func (g *Gateway) setAlertStateLocked(ctx context.Context, account, status string) {
+	if status == "" {
+		delete(g.alertState, account)
+	} else {
+		g.alertState[account] = status
+	}
+	if s, ok := g.store.(HealthAlertStore); ok {
+		if err := s.SetHealthAlert(ctx, account, status); err != nil {
+			log.Printf("engine: persist health alert state account=%q: %v", account, err)
+		}
 	}
 }

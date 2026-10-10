@@ -3,13 +3,19 @@ package engine
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"sort"
+	"sync/atomic"
 	"time"
 
+	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
 
@@ -22,13 +28,20 @@ const (
 // connectorServer is one virtual connector's live MCP endpoint: its own
 // MCPServer (mcp-go answers tools/list from the registered set, so a curated
 // subset needs its own instance) plus the Streamable HTTP transport for it.
-// The MCPServer instance is stable across rebuilds — toolset changes mutate it
-// via AddTool/DeleteTools so in-flight sessions survive.
+// The MCPServer instance is stable across rebuilds — toolset changes go
+// through setTools so in-flight sessions survive.
 type connectorServer struct {
 	mcp     *server.MCPServer
 	handler http.Handler // StreamableHTTPServer for /mcp/{slug}
 	names   []string     // currently registered (prefixed) tool names
-	epoch   string       // endpoint token generation; read by the OAuth AS
+	// dispatch maps each advertised tool to its current handler closure. The
+	// MCPServer only ever holds a stable per-name dispatcher, so a rebuild that
+	// changes closures (epoch, revision, guards) but not definitions is
+	// invisible to connected clients.
+	dispatch atomic.Pointer[map[string]server.ToolHandlerFunc]
+	// definitions fingerprints the advertised tool list (see setTools).
+	definitions string
+	epoch       string // endpoint token generation; read by the OAuth AS
 	// revision is used by subject-bound client endpoints. It lets the request
 	// wrapper fail closed when a CAS mutation has committed but this replica has
 	// not yet rebuilt its static MCPServer projection.
@@ -46,6 +59,75 @@ type connectorServer struct {
 	// connector/namespace endpoints (those rebuild only on mutation, via
 	// RefreshConnectors, never per-request). Accessed under Gateway.mu.
 	refreshedAt time.Time
+}
+
+// setTools publishes tools as the endpoint's complete tool set. Handler
+// closures are swapped atomically on every call; the advertised list is
+// replaced with one SetTools — one tools/list_changed — only when a definition
+// actually changed. Rebuilding an unchanged endpoint is therefore silent, and a
+// real change never exposes a partial or empty list in between, unlike the
+// per-tool DeleteTools/AddTool sequence it replaces (one notification per tool,
+// on every rebuild). Callers hold Gateway.mu.
+func (cs *connectorServer) setTools(tools []server.ServerTool) {
+	dispatch := make(map[string]server.ToolHandlerFunc, len(tools))
+	names := make([]string, 0, len(tools))
+	for _, t := range tools {
+		dispatch[t.Tool.Name] = t.Handler
+		names = append(names, t.Tool.Name)
+	}
+	cs.dispatch.Store(&dispatch)
+	cs.names = names
+	definitions := toolDefinitionsFingerprint(tools)
+	if definitions != "" && definitions == cs.definitions {
+		return
+	}
+	advertised := make([]server.ServerTool, 0, len(tools))
+	for _, t := range tools {
+		advertised = append(advertised, server.ServerTool{Tool: t.Tool, Handler: cs.dispatcher(t.Tool.Name)})
+	}
+	cs.mcp.SetTools(advertised...)
+	cs.definitions = definitions
+}
+
+// dispatcher resolves a tool's current closure at call time.
+func (cs *connectorServer) dispatcher(name string) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		var handler server.ToolHandlerFunc
+		if dispatch := cs.dispatch.Load(); dispatch != nil {
+			handler = (*dispatch)[name]
+		}
+		if handler == nil {
+			return mcp.NewToolResultError("this tool is no longer available; refresh the MCP tool list"), nil
+		}
+		return handler(ctx, req)
+	}
+}
+
+// toolDefinitionsFingerprint digests the client-visible tool definitions in
+// name order. An encoding failure yields "", which setTools treats as changed.
+func toolDefinitionsFingerprint(tools []server.ServerTool) string {
+	sorted := make([]server.ServerTool, len(tools))
+	copy(sorted, tools)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Tool.Name < sorted[j].Tool.Name })
+	h := sha256.New()
+	for _, t := range sorted {
+		encoded, err := json.Marshal(t.Tool)
+		if err != nil {
+			return ""
+		}
+		_, _ = h.Write(encoded)
+		_, _ = h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// serverTools adapts cached account tools to setTools.
+func serverTools(tools []cachedTool) []server.ServerTool {
+	out := make([]server.ServerTool, 0, len(tools))
+	for _, t := range tools {
+		out = append(out, server.ServerTool{Tool: t.tool, Handler: t.handler})
+	}
+	return out
 }
 
 // connectorStore returns the store's ConnectorStore facet, if it has one.
@@ -94,7 +176,7 @@ func (g *Gateway) buildConnector(vc VirtualConnector) error {
 		m := newSynaxisMCPServer("narthex-"+vc.Slug, mcpBootstrapSurfaceConnector, mcpBootstrapFeatures{})
 		cs = &connectorServer{
 			mcp:     m,
-			handler: server.NewStreamableHTTPServer(m, server.WithEndpointPath("/mcp/"+vc.Slug)),
+			handler: NewStreamableMCPHandler(m, "/mcp/"+vc.Slug),
 			kind:    endpointKindConnector,
 		}
 		g.connectors[vc.Slug] = cs
@@ -108,7 +190,6 @@ func (g *Gateway) buildConnector(vc VirtualConnector) error {
 	cg := compileGuards(vc)
 	cs.guards = &cg
 	cs.epoch = vc.Epoch
-	var names []string
 	var add []cachedTool
 	for acct, allow := range vc.Tools {
 		account, exists := accounts[acct]
@@ -159,17 +240,10 @@ func (g *Gateway) buildConnector(vc VirtualConnector) error {
 				ct.handler,
 			)
 			add = append(add, ct)
-			names = append(names, ct.tool.Name)
 		}
 	}
 	// Mutate the stable MCPServer instance in place.
-	if len(cs.names) > 0 {
-		cs.mcp.DeleteTools(cs.names...)
-	}
-	for _, ct := range add {
-		cs.mcp.AddTool(ct.tool, ct.handler)
-	}
-	cs.names = names
+	cs.setTools(serverTools(add))
 	return nil
 }
 
@@ -200,14 +274,13 @@ func (g *Gateway) buildNamespace(ns Namespace) error {
 		m := newSynaxisMCPServer("narthex-"+ns.Slug, mcpBootstrapSurfaceBundle, mcpBootstrapFeatures{})
 		cs = &connectorServer{
 			mcp:     m,
-			handler: server.NewStreamableHTTPServer(m, server.WithEndpointPath("/mcp/"+ns.Slug)),
+			handler: NewStreamableMCPHandler(m, "/mcp/"+ns.Slug),
 			kind:    endpointKindNamespace,
 		}
 		g.connectors[ns.Slug] = cs
 	}
 	cs.epoch = ns.Epoch
 	cs.guards = nil
-	var names []string
 	var add []cachedTool
 	for _, account := range ns.Accounts {
 		stored, exists := accounts[account]
@@ -231,16 +304,9 @@ func (g *Gateway) buildNamespace(ns Namespace) error {
 				ct.handler,
 			)
 			add = append(add, ct)
-			names = append(names, ct.tool.Name)
 		}
 	}
-	if len(cs.names) > 0 {
-		cs.mcp.DeleteTools(cs.names...)
-	}
-	for _, ct := range add {
-		cs.mcp.AddTool(ct.tool, ct.handler)
-	}
-	cs.names = names
+	cs.setTools(serverTools(add))
 	return nil
 }
 
@@ -249,7 +315,24 @@ func (g *Gateway) buildNamespace(ns Namespace) error {
 // track the live tool cache). Existing legacy connectors win if corrupted
 // storage somehow contains a cross-kind slug collision; all mutation paths
 // reject such collisions before persistence.
-func (g *Gateway) RefreshConnectors(ctx context.Context) {
+//
+// A failed durable read keeps the previous projection and is returned (and
+// remembered, so reconcileProjection retries it): connector, bundle and client
+// endpoints that are missing from memory have no epoch, and the OAuth server
+// would answer every token for them with 401 and every refresh with
+// invalid_grant until something rebuilt them.
+func (g *Gateway) RefreshConnectors(ctx context.Context) error {
+	err := g.refreshConnectors(ctx)
+	g.projectionFailed.Store(err != nil)
+	if err != nil {
+		log.Printf("engine: refresh endpoint projection: %v", err)
+	} else {
+		g.projected.Store(true)
+	}
+	return err
+}
+
+func (g *Gateway) refreshConnectors(ctx context.Context) error {
 	g.endpointMu.Lock()
 	defer g.endpointMu.Unlock()
 	// A scope change can arrive through durable store APIs before a live
@@ -257,7 +340,10 @@ func (g *Gateway) RefreshConnectors(ctx context.Context) {
 	// a move to personal, while retaining its cached tools for the owner's
 	// subject-bound client endpoint. Then rebuild every shared endpoint from
 	// the current store state below.
-	accounts := g.store.Accounts()
+	accounts, err := g.listAccounts(ctx)
+	if err != nil {
+		return fmt.Errorf("list accounts: %w", err)
+	}
 	live := make(map[string]bool, len(accounts))
 	for _, account := range accounts {
 		live[account.Name] = true
@@ -285,12 +371,23 @@ func (g *Gateway) RefreshConnectors(ctx context.Context) {
 	if len(accounts) > 0 {
 		g.pruneOrphanedAccounts(live)
 	}
+	sharedErr := g.refreshSharedEndpointsLocked(ctx)
+	// Subject-bound client endpoints are projected from the same cache, but
+	// live in a separate path namespace. Refreshing them alongside the shared
+	// surfaces makes ownership/scope moves take effect immediately, and they
+	// do not depend on the connector/bundle listing above succeeding.
+	return errors.Join(sharedErr, g.refreshMCPClientsLocked(ctx, accounts))
+}
+
+// refreshSharedEndpointsLocked rebuilds legacy connectors and endpoint
+// bundles. On a listing failure it keeps every existing shared endpoint
+// rather than dropping them as unseen. Callers hold endpointMu.
+func (g *Gateway) refreshSharedEndpointsLocked(ctx context.Context) error {
 	var connectors []VirtualConnector
 	if cs, ok := g.connectorStore(); ok {
 		list, err := cs.Connectors(ctx)
 		if err != nil {
-			log.Printf("engine: refresh connectors: %v", err)
-			return
+			return fmt.Errorf("list connectors: %w", err)
 		}
 		connectors = list
 	}
@@ -298,8 +395,7 @@ func (g *Gateway) RefreshConnectors(ctx context.Context) {
 	if ns, ok := g.namespaceStore(); ok {
 		list, err := ns.Namespaces(ctx)
 		if err != nil {
-			log.Printf("engine: refresh namespaces: %v", err)
-			return
+			return fmt.Errorf("list namespaces: %w", err)
 		}
 		namespaces = list
 	}
@@ -329,10 +425,7 @@ func (g *Gateway) RefreshConnectors(ctx context.Context) {
 		}
 	}
 	g.mu.Unlock()
-	// Subject-bound client endpoints are projected from the same cache, but
-	// live in a separate path namespace. Refreshing them alongside the shared
-	// surfaces makes ownership/scope moves take effect immediately.
-	g.refreshMCPClientsLocked(ctx)
+	return nil
 }
 
 // pruneOrphanedAccounts removes every root-registered and cached tool

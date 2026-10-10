@@ -29,6 +29,7 @@ type fileOAuthRefreshGrant struct {
 	ResourceEpoch string    `json:"resource_epoch,omitempty"`
 	Generation    string    `json:"generation"`
 	ExpiresAt     time.Time `json:"expires_at"`
+	IssuedAt      time.Time `json:"issued_at,omitzero"`
 }
 
 type fileOAuthHostedConsentReplay struct {
@@ -39,6 +40,7 @@ type fileOAuthHostedConsentReplay struct {
 
 var _ oauthas.OAuthGrantStore = (*FileStore)(nil)
 var _ oauthas.OAuthGrantEpochStore = (*FileStore)(nil)
+var _ oauthas.OAuthGrantRenewalStore = (*FileStore)(nil)
 
 func fileAuthorizationCodeFromDurable(grant oauthas.DurableAuthorizationCode) fileOAuthAuthorizationCode {
 	return fileOAuthAuthorizationCode{
@@ -59,7 +61,7 @@ func durableAuthorizationCodeFromFile(tokenHash string, grant fileOAuthAuthoriza
 func fileRefreshGrantFromDurable(grant oauthas.DurableRefreshGrant) fileOAuthRefreshGrant {
 	return fileOAuthRefreshGrant{
 		ClientID: grant.ClientID, Resource: grant.Resource, ResourceEpoch: grant.ResourceEpoch,
-		Generation: grant.Generation, ExpiresAt: grant.ExpiresAt,
+		Generation: grant.Generation, ExpiresAt: grant.ExpiresAt, IssuedAt: grant.IssuedAt,
 	}
 }
 
@@ -67,6 +69,7 @@ func durableRefreshGrantFromFile(tokenHash string, grant fileOAuthRefreshGrant) 
 	return oauthas.DurableRefreshGrant{
 		TokenHash: tokenHash, ClientID: grant.ClientID, Resource: grant.Resource,
 		ResourceEpoch: grant.ResourceEpoch, Generation: grant.Generation, ExpiresAt: grant.ExpiresAt,
+		IssuedAt: grant.IssuedAt,
 	}
 }
 
@@ -173,6 +176,28 @@ func (s *FileStore) LoadRefreshGrant(ctx context.Context, tokenHash string, now 
 		return oauthas.DurableRefreshGrant{}, false, nil
 	}
 	return durableRefreshGrantFromFile(tokenHash, grant), true, nil
+}
+
+// RenewRefreshGrant extends a live grant's expiry; it never revives an
+// expired grant or shortens one.
+func (s *FileStore) RenewRefreshGrant(ctx context.Context, tokenHash string, expiresAt, now time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	grant, found := s.oauthRefreshGrants[tokenHash]
+	if !found || !now.Before(grant.ExpiresAt) || !grant.ExpiresAt.Before(expiresAt) {
+		return nil
+	}
+	renewed := grant
+	renewed.ExpiresAt = expiresAt
+	s.oauthRefreshGrants[tokenHash] = renewed
+	if err := s.saveLocked(); err != nil {
+		s.oauthRefreshGrants[tokenHash] = grant
+		return fmt.Errorf("persist refresh grant renewal: %w", err)
+	}
+	return nil
 }
 
 func (s *FileStore) RevokeOAuthGrantsForResource(ctx context.Context, resource string) error {

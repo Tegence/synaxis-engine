@@ -102,6 +102,14 @@ func (c *ConsoleAPI) canDeleteConnectionNamespace(actor PlatformActor, _ Connect
 }
 
 func (c *ConsoleAPI) canManageAccount(ctx context.Context, actor PlatformActor, a Account) bool {
+	// Decide everything the actor alone decides before reading the store: an
+	// administrator manages every account and a non-operator none.
+	if connectionNamespaceAdministrator(actor) {
+		return true
+	}
+	if actor.Role != "operator" {
+		return false
+	}
 	return canManageAccountPreloaded(actor, a, c.namespacesForAccount(ctx, a))
 }
 
@@ -141,33 +149,80 @@ func (c *ConsoleAPI) namespacesForAccount(ctx context.Context, a Account) map[st
 	return namespacesByID
 }
 
-// callVisibilityData preloads every account once plus each connection
-// namespace referenced by the given call records, so the activity list can
-// evaluate the operator visibility boundary with a bounded number of store
-// reads instead of one account+namespace pair per record. Namespace lookups
-// use the request context so a client disconnect cancels them.
-func (c *ConsoleAPI) callVisibilityData(ctx context.Context, calls []CallRecord) (map[string]Account, map[string]ConnectionNamespace) {
-	accounts := c.store.Accounts()
-	accountsByName := make(map[string]Account, len(accounts))
+// namespaceCache memoizes one request's ownership-namespace reads, so an
+// account boundary evaluated across many rows (or activity pages) reads each
+// distinct namespace once. A namespace the store lacks is remembered too.
+type namespaceCache struct {
+	byID    map[string]ConnectionNamespace
+	checked map[string]bool
+}
+
+func newNamespaceCache() *namespaceCache {
+	return &namespaceCache{byID: map[string]ConnectionNamespace{}, checked: map[string]bool{}}
+}
+
+// loadOwnershipNamespaces reads into cache, once each, the ownership
+// namespaces of accounts. Personal and namespace-less accounts need none.
+// Lookups use the request context so a client disconnect cancels them.
+func (c *ConsoleAPI) loadOwnershipNamespaces(ctx context.Context, cache *namespaceCache, accounts []Account) {
+	store, ok := c.connectionNamespaceStore()
+	if !ok {
+		return
+	}
 	for _, a := range accounts {
-		accountsByName[a.Name] = a
+		id := a.ConnectionNamespaceID
+		if a.IsPersonal() || id == "" || cache.checked[id] {
+			continue
+		}
+		cache.checked[id] = true
+		if ns, found := store.ConnectionNamespace(ctx, id); found {
+			cache.byID[id] = ns
+		}
 	}
-	namespaceIDs := make(map[string]struct{})
+}
+
+// readableAccounts filters accounts to those actor may read (canReadAccount),
+// with one lookup per distinct ownership namespace instead of one per
+// account — and none at all for an administrator.
+func (c *ConsoleAPI) readableAccounts(ctx context.Context, actor PlatformActor, accounts []Account) []Account {
+	if connectionNamespaceAdministrator(actor) {
+		return accounts
+	}
+	if actor.Role != "operator" {
+		return []Account{}
+	}
+	namespaces := newNamespaceCache()
+	c.loadOwnershipNamespaces(ctx, namespaces, accounts)
+	out := make([]Account, 0, len(accounts))
+	for _, a := range accounts {
+		if canManageAccountPreloaded(actor, a, namespaces.byID) {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// accountsByName indexes one account listing, for boundaries evaluated over
+// many records.
+func (c *ConsoleAPI) accountsByName() map[string]Account {
+	accounts := c.store.Accounts()
+	byName := make(map[string]Account, len(accounts))
+	for _, a := range accounts {
+		byName[a.Name] = a
+	}
+	return byName
+}
+
+// loadCallNamespaces reads the ownership namespaces of the accounts calls
+// reference that earlier pages have not already read.
+func (c *ConsoleAPI) loadCallNamespaces(ctx context.Context, cache *namespaceCache, accountsByName map[string]Account, calls []CallRecord) {
+	referenced := make([]Account, 0, len(calls))
 	for _, call := range calls {
-		a, found := accountsByName[call.Account]
-		if found && !a.IsPersonal() && a.ConnectionNamespaceID != "" {
-			namespaceIDs[a.ConnectionNamespaceID] = struct{}{}
+		if a, found := accountsByName[call.Account]; found {
+			referenced = append(referenced, a)
 		}
 	}
-	namespacesByID := make(map[string]ConnectionNamespace, len(namespaceIDs))
-	if store, ok := c.connectionNamespaceStore(); ok {
-		for id := range namespaceIDs {
-			if ns, found := store.ConnectionNamespace(ctx, id); found {
-				namespacesByID[id] = ns
-			}
-		}
-	}
-	return accountsByName, namespacesByID
+	c.loadOwnershipNamespaces(ctx, cache, referenced)
 }
 
 // canReadAccount is intentionally the same boundary as management for now.

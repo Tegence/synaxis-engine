@@ -17,6 +17,8 @@ import (
 // /mcp/clients/{slug} endpoint. Keep them in the endpoint's names list so a
 // refresh removes every previous built-in before rebuilding the projection.
 var mcpClientLibraryToolNames = []string{
+	"library_collaboration_list",
+	"library_collaboration",
 	"library_skill_create",
 	"library_skill_authoring_list",
 	"library_skill_update",
@@ -782,6 +784,9 @@ func registerMCPClientLibraryTools(s *server.MCPServer, store LibraryStore, sink
 
 	if memoryStore, supported := store.(LibraryMemoryStore); supported {
 		registerMCPClientMemoryTools(s, memoryStore, sink, client, live)
+	}
+	if collaboration, ok := store.(LibraryCollaborationStore); ok {
+		registerCollaborationTools(s, collaboration, client, live)
 	}
 	return append([]string(nil), mcpClientLibraryToolNames...)
 }

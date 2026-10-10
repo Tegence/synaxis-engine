@@ -104,3 +104,76 @@ func TestFileStoreOAuthGrantsAndConsentReplaysSurviveRestart(t *testing.T) {
 		t.Fatalf("RevokeAllOAuthGrants: %v", err)
 	}
 }
+
+// assertRefreshGrantRenewalContract pins what oauthas relies on from every
+// grant store: the issue time round-trips (zero for legacy grants), renewal
+// only ever extends a live grant, and the result survives a restart.
+func assertRefreshGrantRenewalContract(t *testing.T, store oauthas.OAuthGrantRenewalStore, reopen func() oauthas.OAuthGrantStore, suffix string) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Date(2026, time.October, 10, 12, 0, 0, 0, time.UTC)
+	live := oauthas.DurableRefreshGrant{
+		TokenHash: "renewal-live-hash-long-enough-to-be-opaque-" + suffix,
+		ClientID:  "client-1", Resource: "/mcp/clients/codex", ResourceEpoch: "epoch-1",
+		Generation: "workspace-v1", ExpiresAt: now.Add(time.Hour), IssuedAt: now.Add(-time.Hour),
+	}
+	legacy := live
+	legacy.TokenHash = "renewal-legacy-hash-long-enough-to-be-opaque-" + suffix
+	legacy.IssuedAt = time.Time{}
+	expired := live
+	expired.TokenHash = "renewal-expired-hash-long-enough-to-be-opaque-" + suffix
+	expired.ExpiresAt = now.Add(-time.Minute)
+	for _, grant := range []oauthas.DurableRefreshGrant{live, legacy, expired} {
+		if err := store.StoreRefreshGrant(ctx, grant); err != nil {
+			t.Fatalf("StoreRefreshGrant %s: %v", grant.TokenHash, err)
+		}
+	}
+	load := func(store oauthas.OAuthGrantStore, tokenHash string) (oauthas.DurableRefreshGrant, bool) {
+		t.Helper()
+		grant, found, err := store.LoadRefreshGrant(ctx, tokenHash, now)
+		if err != nil {
+			t.Fatalf("LoadRefreshGrant: %v", err)
+		}
+		return grant, found
+	}
+
+	if got, _ := load(store, live.TokenHash); !got.IssuedAt.Equal(live.IssuedAt) {
+		t.Fatalf("issued at = %v, want %v", got.IssuedAt, live.IssuedAt)
+	}
+	if got, _ := load(store, legacy.TokenHash); !got.IssuedAt.IsZero() {
+		t.Fatalf("legacy issued at = %v, want zero", got.IssuedAt)
+	}
+
+	renewed := now.Add(30 * 24 * time.Hour)
+	if err := store.RenewRefreshGrant(ctx, live.TokenHash, renewed, now); err != nil {
+		t.Fatalf("RenewRefreshGrant: %v", err)
+	}
+	if err := store.RenewRefreshGrant(ctx, live.TokenHash, now.Add(2*time.Hour), now); err != nil {
+		t.Fatalf("RenewRefreshGrant shorter: %v", err)
+	}
+	if err := store.RenewRefreshGrant(ctx, expired.TokenHash, renewed, now); err != nil {
+		t.Fatalf("RenewRefreshGrant expired: %v", err)
+	}
+	restarted := reopen()
+	if got, found := load(restarted, live.TokenHash); !found || !got.ExpiresAt.Equal(renewed) {
+		t.Fatalf("renewed grant after restart = %v (found %v), want expiry %v", got.ExpiresAt, found, renewed)
+	}
+	if _, found := load(restarted, expired.TokenHash); found {
+		t.Fatal("renewal revived an expired grant")
+	}
+}
+
+func TestFileStoreRefreshGrantRenewal(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "accounts.json")
+	store, err := LoadFileStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRefreshGrantRenewalContract(t, store, func() oauthas.OAuthGrantStore {
+		reopened, err := LoadFileStore(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return reopened
+	}, "file")
+}

@@ -46,7 +46,7 @@ func (c *ConsoleAPI) handleToolPolicy(w http.ResponseWriter, r *http.Request) {
 	}
 	tools, err := c.gw.ListAccountTools(r.Context(), accountID)
 	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		writeToolListingError(w, accountID, err, "")
 		return
 	}
 	var current ToolInfo
@@ -144,13 +144,13 @@ func (c *ConsoleAPI) handleToolPolicy(w http.ResponseWriter, r *http.Request) {
 		writeAccountPolicyMutationError(w, err, "could not update connection policy")
 		return
 	}
-	if _, err := c.gw.ReplaceAccount(r.Context(), accountID); err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "policy saved, but live tool refresh failed: " + err.Error()})
+	if err := c.gw.refreshAccountTools(r.Context(), accountID); err != nil {
+		writeToolListingError(w, accountID, err, toolPolicySavedNotLive)
 		return
 	}
 	updated, err := c.gw.ListAccountTools(r.Context(), accountID)
 	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		writeToolListingError(w, accountID, err, toolPolicySavedNotLive)
 		return
 	}
 	for _, tool := range updated {

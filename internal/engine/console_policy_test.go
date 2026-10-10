@@ -3,9 +3,11 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -57,6 +59,43 @@ func TestToolPolicyPersistsAliasDescriptionAndEnabledState(t *testing.T) {
 	}
 	if got := connectorNames(t, g, "research"); len(got) != 0 {
 		t.Fatalf("disabled tool still exposed by connector: %v", got)
+	}
+}
+
+// TestToolPolicyRouteAnswersListingFailuresWithoutProviderText: the policy
+// route lists tools before and after saving; either failure answers with the
+// listing contract and never with the provider's error text (it used to echo
+// both).
+func TestToolPolicyRouteAnswersListingFailuresWithoutProviderText(t *testing.T) {
+	const secret = "provider-secret-do-not-return"
+	mux, tok, g := newConnectorConsole(t, map[string][]string{"linear": {"get_issue"}})
+	working := g.listTools
+
+	// The listing that finds the tool fails: nothing is saved.
+	g.listTools = func(context.Context, Account) ([]mcp.Tool, error) {
+		return nil, errors.New(`linear: refresh failed: refresh -> 400: {"error":"invalid_grant","error_description":"` + secret + `"}`)
+	}
+	rec, got := doJSON(t, mux, tok, http.MethodPut, "/api/servers/linear/tools/get_issue", `{"description":"Fetch one issue."}`)
+	expectToolListingError(t, rec, got, http.StatusConflict, healthStatusAuthExpired, healthRecoveryReauthorize, secret, "invalid_grant")
+	if account, _ := g.store.Account("linear"); len(account.ToolOverrides) != 0 {
+		t.Fatalf("policy was saved although its tool could not be listed: %+v", account.ToolOverrides)
+	}
+
+	// The policy saves, but the live refresh after it fails.
+	var calls atomic.Int32
+	g.listTools = func(ctx context.Context, a Account) ([]mcp.Tool, error) {
+		if calls.Add(1) == 1 {
+			return working(ctx, a)
+		}
+		return nil, errors.New("provider host failed: " + secret)
+	}
+	rec, got = doJSON(t, mux, tok, http.MethodPut, "/api/servers/linear/tools/get_issue", `{"description":"Fetch one issue."}`)
+	expectToolListingError(t, rec, got, http.StatusBadGateway, healthStatusUnreachable, healthRecoveryRetry, secret)
+	if message, _ := got["error"].(string); !strings.HasPrefix(message, toolPolicySavedNotLive) {
+		t.Fatalf("error = %q, want it to say the policy was saved", message)
+	}
+	if account, _ := g.store.Account("linear"); account.ToolOverrides["get_issue"].Description != "Fetch one issue." {
+		t.Fatalf("policy was not saved: %+v", account.ToolOverrides)
 	}
 }
 

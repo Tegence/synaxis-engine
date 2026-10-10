@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -371,6 +372,7 @@ func (c *ConsoleAPI) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/control/v1/library/artifacts/{id}/versions/{version}", c.controlV1(c.handleControlLibraryArtifactVersion))
 	mux.HandleFunc("/control/v1/library/artifacts/{id}/grants", c.controlV1(c.handleControlLibraryArtifactGrants))
 	mux.HandleFunc("/control/v1/library/artifacts/{id}/grants/{grant}/revoke", c.controlV1(c.handleControlLibraryArtifactGrantRevoke))
+	mux.HandleFunc("/control/v1/library/collaboration", c.controlV1Credential(c.handleControlLibraryCollaboration))
 	mux.HandleFunc("/control/v1/library/recipients", c.controlV1(c.handleControlLibraryRecipients))
 	// Any other shape or method under the group reaches the same auth
 	// chain rather than Go's plain-text 404, so a wrong method, a bare
@@ -448,6 +450,9 @@ func (c *ConsoleAPI) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/library/skill-drafts/platform-import", sec(c.handleLibraryPlatformSkillDraftImport))
 	mux.HandleFunc("/api/library/artifact-drafts", sec(c.handleLibraryArtifactDrafts))
 	mux.HandleFunc("/api/library/artifact-drafts/platform-import", sec(c.handleLibraryPlatformArtifactDraftImport))
+	mux.HandleFunc("/api/library/artifacts/{id}/collaboration", sec(c.handleLibraryCollaboration))
+	mux.HandleFunc("/api/public/artifacts/mcp/{artifact}/{grant}", pub(c.handleCollaborationMCP))
+	mux.HandleFunc("/api/public/artifacts/collaborate", pub(c.handlePublicLibraryCollaboration))
 	mux.HandleFunc("/api/library/artifacts", sec(c.handleLibraryArtifacts))
 	mux.HandleFunc("/api/library/artifacts/{id}", sec(c.handleLibraryArtifactByID))
 	mux.HandleFunc("/api/library/artifacts/{id}/versions", sec(c.handleLibraryArtifactVersions))
@@ -573,7 +578,9 @@ type connectorDTO struct {
 	TotalBytes           int      `json:"totalBytes"`
 }
 
-func (c *ConsoleAPI) connectorDTO(ctx context.Context, vc VirtualConnector) connectorDTO {
+// connectorDTO renders vc with its stats from stats, the request's one
+// snapshot of the shared tool surface (see endpointStatsSnapshot).
+func (c *ConsoleAPI) connectorDTO(vc VirtualConnector, stats *endpointStatsSnapshot) connectorDTO {
 	d := connectorDTO{Slug: vc.Slug, Label: vc.Label, URL: c.selfURL + "/mcp/" + vc.Slug, Tools: vc.Tools, Approval: vc.Approval, Record: vc.Record,
 		MaxResultBytes: vc.MaxResultBytes, Redact: vc.Redact, DisableInjectionScan: vc.DisableInjectionScan}
 	if d.Tools == nil {
@@ -585,10 +592,9 @@ func (c *ConsoleAPI) connectorDTO(ctx context.Context, vc VirtualConnector) conn
 	if d.Redact == nil {
 		d.Redact = []string{}
 	}
-	if st, err := c.gw.ConnectorStats(ctx, vc.Slug); err == nil {
-		d.ExposedTools, d.TotalTools = st.ExposedTools, st.TotalTools
-		d.ExposedBytes, d.TotalBytes = st.ExposedBytes, st.TotalBytes
-	}
+	st := stats.connector(vc)
+	d.ExposedTools, d.TotalTools = st.ExposedTools, st.TotalTools
+	d.ExposedBytes, d.TotalBytes = st.ExposedBytes, st.TotalBytes
 	return d
 }
 
@@ -695,9 +701,10 @@ func (c *ConsoleAPI) handleConnectors(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 			return
 		}
+		stats := c.gw.endpointStats()
 		out := make([]connectorDTO, len(list))
 		for i, vc := range list {
-			out[i] = c.connectorDTO(r.Context(), vc)
+			out[i] = c.connectorDTO(vc, stats)
 		}
 		writeJSON(w, http.StatusOK, out)
 	case http.MethodPost:
@@ -771,7 +778,7 @@ func (c *ConsoleAPI) handleConnectors(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 			return
 		}
-		writeJSON(w, http.StatusCreated, c.connectorDTO(r.Context(), vc))
+		writeJSON(w, http.StatusCreated, c.connectorDTO(vc, c.gw.endpointStats()))
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
@@ -862,7 +869,7 @@ func (c *ConsoleAPI) handleConnectorBySlug(w http.ResponseWriter, r *http.Reques
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 			return
 		}
-		writeJSON(w, http.StatusOK, c.connectorDTO(r.Context(), vc))
+		writeJSON(w, http.StatusOK, c.connectorDTO(vc, c.gw.endpointStats()))
 	case http.MethodDelete:
 		if _, ok := c.connStore.VirtualConnector(r.Context(), slug); !ok {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
@@ -896,7 +903,10 @@ type namespaceDTO struct {
 	TotalTools   int      `json:"totalTools"`
 }
 
-func (c *ConsoleAPI) namespaceDTO(ctx context.Context, ns Namespace) namespaceDTO {
+// namespaceDTO renders ns with its tool counts from stats, the request's one
+// snapshot of the shared tool surface. The DTO shows no byte stats, so none
+// are measured.
+func (c *ConsoleAPI) namespaceDTO(ns Namespace, stats *endpointStatsSnapshot) namespaceDTO {
 	members := append([]string(nil), ns.Accounts...)
 	if members == nil {
 		members = []string{}
@@ -905,9 +915,7 @@ func (c *ConsoleAPI) namespaceDTO(ctx context.Context, ns Namespace) namespaceDT
 		Slug: ns.Slug, Label: ns.Label, URL: c.selfURL + "/mcp/" + ns.Slug,
 		Members: members, Generation: ns.Epoch, Revision: ns.Revision,
 	}
-	if stats, err := c.gw.NamespaceStats(ctx, ns.Slug); err == nil {
-		dto.ExposedTools, dto.TotalTools = stats.ExposedTools, stats.TotalTools
-	}
+	dto.ExposedTools, dto.TotalTools = stats.namespaceCounts(ns)
 	return dto
 }
 
@@ -967,9 +975,10 @@ func (c *ConsoleAPI) handleNamespaces(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 			return
 		}
+		stats := c.gw.endpointStats()
 		out := make([]namespaceDTO, len(list))
 		for i, ns := range list {
-			out[i] = c.namespaceDTO(r.Context(), ns)
+			out[i] = c.namespaceDTO(ns, stats)
 		}
 		writeJSON(w, http.StatusOK, out)
 	case http.MethodPost:
@@ -1010,7 +1019,7 @@ func (c *ConsoleAPI) handleNamespaces(w http.ResponseWriter, r *http.Request) {
 			writeNamespaceMutationError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusCreated, c.namespaceDTO(r.Context(), ns))
+		writeJSON(w, http.StatusCreated, c.namespaceDTO(ns, c.gw.endpointStats()))
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
@@ -1031,7 +1040,7 @@ func (c *ConsoleAPI) handleNamespaceBySlug(w http.ResponseWriter, r *http.Reques
 	}
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, http.StatusOK, c.namespaceDTO(r.Context(), current))
+		writeJSON(w, http.StatusOK, c.namespaceDTO(current, c.gw.endpointStats()))
 	case http.MethodPut:
 		var req struct {
 			Label      *string   `json:"label"`
@@ -1078,7 +1087,7 @@ func (c *ConsoleAPI) handleNamespaceBySlug(w http.ResponseWriter, r *http.Reques
 			writeNamespaceMutationError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, c.namespaceDTO(r.Context(), updated))
+		writeJSON(w, http.StatusOK, c.namespaceDTO(updated, c.gw.endpointStats()))
 	case http.MethodDelete:
 		var req NamespacePrecondition
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
@@ -1159,7 +1168,7 @@ func (c *ConsoleAPI) handleNamespaceAccount(w http.ResponseWriter, r *http.Reque
 		writeNamespaceMutationError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, c.namespaceDTO(r.Context(), ns))
+	writeJSON(w, http.StatusOK, c.namespaceDTO(ns, c.gw.endpointStats()))
 }
 
 // --- approvals: pending (approval-gated) tool calls awaiting a decision ---
@@ -1276,6 +1285,7 @@ func (c *ConsoleAPI) handleApprovalDecision(w http.ResponseWriter, r *http.Reque
 
 // handleTools: GET lists an account's tools with enabled/disabled + hints;
 // PUT { "disabled": [...] } sets the disabled set and re-aggregates live.
+// A listing failure answers with writeToolListingError's contract.
 func (c *ConsoleAPI) handleTools(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	account, _, ok := c.managedAccount(w, r, id)
@@ -1286,7 +1296,7 @@ func (c *ConsoleAPI) handleTools(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		tools, err := c.gw.ListAccountTools(r.Context(), id)
 		if err != nil {
-			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+			writeToolListingError(w, id, err, "")
 			return
 		}
 		writeJSON(w, http.StatusOK, tools)
@@ -1305,11 +1315,68 @@ func (c *ConsoleAPI) handleTools(w http.ResponseWriter, r *http.Request) {
 			writeAccountPolicyMutationError(w, err, "could not update connection policy")
 			return
 		}
-		c.gw.ReplaceAccount(r.Context(), id) // re-aggregate so /mcp reflects the curation immediately
-		tools, _ := c.gw.ListAccountTools(r.Context(), id)
+		// Re-aggregate so /mcp reflects the curation immediately. Until that
+		// succeeds the curation is saved but not live, so say so rather than
+		// answer with a listing (or, as before, 200 null).
+		if err := c.gw.refreshAccountTools(r.Context(), id); err != nil {
+			writeToolListingError(w, id, err, toolPolicySavedNotLive)
+			return
+		}
+		tools, err := c.gw.ListAccountTools(r.Context(), id)
+		if err != nil {
+			writeToolListingError(w, id, err, toolPolicySavedNotLive)
+			return
+		}
 		writeJSON(w, http.StatusOK, tools)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+// toolPolicySavedNotLive leads a listing error that follows a successful
+// policy write, so the console knows not to resubmit it.
+const toolPolicySavedNotLive = "The tool policy was saved, but the live tool list could not be refreshed. "
+
+// writeToolListingError answers a failed live tool listing with the console's
+// recovery contract — {"error": safe sentence, "code", "recovery"}:
+//
+//	409 needs_auth/connect, auth_expired/reauthorize: an authorization problem
+//	504 timeout/retry: the provider did not answer in time
+//	502 unreachable/retry: the provider failed; error/retry: the Engine did
+//
+// A connection deleted meanwhile is the usual 404. The raw cause can carry a
+// provider's own response (an OAuth error body, say), so it is logged here
+// and never returned. prefix, possibly empty, leads the sentence.
+func writeToolListingError(w http.ResponseWriter, account string, err error, prefix string) {
+	if errors.Is(err, ErrAccountNotFound) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "connection not found"})
+		return
+	}
+	status := toolListingStatusError
+	var listing *toolListingError
+	if errors.As(err, &listing) {
+		status = listing.status
+	}
+	log.Printf("engine: list tools account=%q status=%s: %v", account, status, err)
+	httpStatus, code, sentence, recovery := toolListingPresentation(status)
+	writeJSON(w, httpStatus, map[string]string{"error": prefix + sentence, "code": code, "recovery": recovery})
+}
+
+// toolListingPresentation is the public half of writeToolListingError: the
+// health presentation of a listing status, with a sentence fit for a tool
+// listing where the health wording would not be.
+func toolListingPresentation(status string) (httpStatus int, code, sentence, recovery string) {
+	if status == toolListingStatusError {
+		return http.StatusBadGateway, toolListingStatusError, "Synaxis could not load this connection's tools. Try again.", healthRecoveryRetry
+	}
+	code, sentence, recovery = healthPresentation(status)
+	switch code {
+	case healthStatusNeedsAuth, healthStatusAuthExpired:
+		return http.StatusConflict, code, sentence, recovery
+	case healthStatusTimeout:
+		return http.StatusGatewayTimeout, code, "The provider did not respond before the tool list request timed out.", recovery
+	default:
+		return http.StatusBadGateway, code, sentence, recovery
 	}
 }
 
@@ -1325,12 +1392,12 @@ func (c *ConsoleAPI) cors(w http.ResponseWriter, r *http.Request) bool {
 		}
 	}
 	w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
-	// Keyset cursors for Activity and Library lists use headers rather than
-	// query strings deliberately: a hosted Platform-to-Engine actor assertion
-	// binds and accepts only a bare path with no query string. These headers
-	// therefore cross both the browser and Platform proxy without changing the
-	// signed actor path.
-	w.Header().Set("Access-Control-Allow-Headers", "Authorization,Content-Type,X-Synaxis-Logs-Before-Ts,X-Synaxis-Logs-Before-Id,X-Synaxis-Library-Cursor,X-Synaxis-Library-Limit")
+	// Keyset cursors for Activity and Library lists, and the health "probe
+	// now" flag, use headers rather than query strings deliberately: a hosted
+	// Platform-to-Engine actor assertion binds and accepts only a bare path
+	// with no query string. These headers therefore cross both the browser and
+	// Platform proxy without changing the signed actor path.
+	w.Header().Set("Access-Control-Allow-Headers", "Authorization,Content-Type,X-Synaxis-Logs-Before-Ts,X-Synaxis-Logs-Before-Id,X-Synaxis-Library-Cursor,X-Synaxis-Library-Limit,"+healthRefreshHeader)
 	w.Header().Set("Access-Control-Expose-Headers", "X-Synaxis-Library-Next-Cursor")
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
@@ -1533,18 +1600,30 @@ func (c *ConsoleAPI) handleGateway(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// healthRefreshHeader asks /api/health for live probes instead of recorded
+// rows: the console's "probe now". It is a header, not Cache-Control (which
+// browsers send on every no-store fetch) and not a query string (which the
+// hosted actor assertion rejects).
+const healthRefreshHeader = "X-Synaxis-Health-Refresh"
+
+// handleHealth reports the accounts this actor can read, and probes only
+// those: an operator never waits on, or dials, a provider in another folder.
 func (c *ConsoleAPI) handleHealth(w http.ResponseWriter, r *http.Request) {
 	actor, ok := c.requireConnectionNamespaceActor(w, r)
 	if !ok {
 		return
 	}
-	health := c.gw.Health(r.Context())
+	accounts := c.readableAccounts(r.Context(), actor, c.store.Accounts())
+	var health []AccountHealth
+	switch strings.ToLower(strings.TrimSpace(r.Header.Get(healthRefreshHeader))) {
+	case "1", "true":
+		health = c.gw.ProbeHealthFor(r.Context(), accounts)
+	default:
+		health = c.gw.HealthFor(r.Context(), accounts)
+	}
 	out := make([]AccountHealth, 0, len(health))
 	for _, item := range health {
-		account, found := c.store.Account(item.UUID)
-		if found && c.canReadAccount(r.Context(), actor, account) {
-			out = append(out, publicAccountHealth(item))
-		}
+		out = append(out, publicAccountHealth(item))
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -1663,6 +1742,14 @@ func (c *ConsoleAPI) handleLogs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	admin := connectionNamespaceAdministrator(actor)
+	// Operators pay one account listing per request plus one lookup per
+	// distinct namespace across every page scanned — not one account and
+	// namespace pair per record, nor a fresh listing per page.
+	var accountsByName map[string]Account
+	namespaces := newNamespaceCache()
+	if !admin {
+		accountsByName = c.accountsByName()
+	}
 	out := make([]CallRecord, 0, logsPageSize)
 	for attempt := 0; attempt < maxLogsFetchAttempts && len(out) < logsPageSize; attempt++ {
 		var raw []CallRecord
@@ -1683,11 +1770,9 @@ func (c *ConsoleAPI) handleLogs(w http.ResponseWriter, r *http.Request) {
 		if admin {
 			out = append(out, raw...)
 		} else {
-			// Operators pay one account list plus one lookup per distinct
-			// namespace, not one account+namespace pair per record.
-			accountsByName, namespacesByID := c.callVisibilityData(r.Context(), raw)
+			c.loadCallNamespaces(r.Context(), namespaces, accountsByName, raw)
 			for _, call := range raw {
-				if visibleCallPreloaded(actor, call, accountsByName, namespacesByID) {
+				if visibleCallPreloaded(actor, call, accountsByName, namespaces.byID) {
 					out = append(out, call)
 				}
 			}
@@ -1794,12 +1879,10 @@ func (c *ConsoleAPI) handleServers(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet:
-		accts := c.store.Accounts()
+		accts := c.readableAccounts(r.Context(), actor, c.store.Accounts())
 		out := make([]serverDTO, 0, len(accts))
 		for _, a := range accts {
-			if c.canReadAccount(r.Context(), actor, a) {
-				out = append(out, toDTO(a))
-			}
+			out = append(out, toDTO(a))
 		}
 		writeJSON(w, http.StatusOK, out)
 	case http.MethodPost:
@@ -2260,6 +2343,10 @@ func (c *ConsoleAPI) handleConnect(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	if a.AuthMode == "token" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "this connection uses an access token; update its token instead of starting OAuth"})
+		return
+	}
 	// Optional body selects the connect path. A no-body request reuses a static
 	// client that was safely saved with the account, if one exists; otherwise it
 	// takes the legacy RFC 7591 DCR path. If any static field or provider
@@ -2356,6 +2443,14 @@ func oauthConnectReturnState(err error) string {
 }
 
 func (c *ConsoleAPI) handleToken(w http.ResponseWriter, r *http.Request) {
+	// Older console clients used POST; PUT is the documented update method.
+	// Reject safe methods before reading a body so a GET can never rotate a
+	// credential without the normal mutation checks.
+	if r.Method != http.MethodPut && r.Method != http.MethodPost {
+		w.Header().Set("Allow", "PUT, POST")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
 	id := r.PathValue("id")
 	a, _, ok := c.managedAccount(w, r, id)
 	if !ok {

@@ -37,8 +37,11 @@ CREATE TABLE IF NOT EXISTS narthex_oauth_refresh_grants (
     resource       TEXT NOT NULL,
     resource_epoch TEXT NOT NULL DEFAULT '',
     generation     TEXT NOT NULL,
-    expires_at     TIMESTAMPTZ NOT NULL
+    expires_at     TIMESTAMPTZ NOT NULL,
+    issued_at      TIMESTAMPTZ
 );
+-- NULL for grants issued before renewal; oauthas infers expires_at - 30d.
+ALTER TABLE narthex_oauth_refresh_grants ADD COLUMN IF NOT EXISTS issued_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS narthex_oauth_refresh_grants_resource_idx
     ON narthex_oauth_refresh_grants (resource);
 CREATE INDEX IF NOT EXISTS narthex_oauth_refresh_grants_expiry_idx
@@ -62,6 +65,7 @@ func (s *PgStore) ensureOAuthGrantSchema(ctx context.Context) error {
 
 var _ oauthas.OAuthGrantStore = (*PgStore)(nil)
 var _ oauthas.OAuthGrantEpochStore = (*PgStore)(nil)
+var _ oauthas.OAuthGrantRenewalStore = (*PgStore)(nil)
 
 func validateOAuthGrantFields(tokenHash, clientID, resource, generation string, expiresAt time.Time) error {
 	if len(tokenHash) < 32 || len(tokenHash) > 256 ||
@@ -127,10 +131,11 @@ func (s *PgStore) StoreRefreshGrant(ctx context.Context, grant oauthas.DurableRe
 	}
 	tag, err := s.pool.Exec(ctx, `
 INSERT INTO narthex_oauth_refresh_grants (
-  token_hash,client_id,resource,resource_epoch,generation,expires_at
-) VALUES ($1,$2,$3,$4,$5,$6)
+  token_hash,client_id,resource,resource_epoch,generation,expires_at,issued_at
+) VALUES ($1,$2,$3,$4,$5,$6,$7)
 ON CONFLICT (token_hash) DO NOTHING`,
-		grant.TokenHash, grant.ClientID, grant.Resource, grant.ResourceEpoch, grant.Generation, grant.ExpiresAt)
+		grant.TokenHash, grant.ClientID, grant.Resource, grant.ResourceEpoch, grant.Generation, grant.ExpiresAt,
+		nullableTime(grant.IssuedAt))
 	if err != nil {
 		return fmt.Errorf("store refresh grant: %w", err)
 	}
@@ -145,12 +150,13 @@ func (s *PgStore) LoadRefreshGrant(ctx context.Context, tokenHash string, now ti
 		return oauthas.DurableRefreshGrant{}, false, errors.New("invalid refresh grant lookup")
 	}
 	var grant oauthas.DurableRefreshGrant
+	var issuedAt *time.Time
 	err := s.pool.QueryRow(ctx, `
-SELECT token_hash,client_id,resource,resource_epoch,generation,expires_at
+SELECT token_hash,client_id,resource,resource_epoch,generation,expires_at,issued_at
 FROM narthex_oauth_refresh_grants
 WHERE token_hash=$1 AND expires_at > $2`, tokenHash, now).Scan(
 		&grant.TokenHash, &grant.ClientID, &grant.Resource,
-		&grant.ResourceEpoch, &grant.Generation, &grant.ExpiresAt,
+		&grant.ResourceEpoch, &grant.Generation, &grant.ExpiresAt, &issuedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return oauthas.DurableRefreshGrant{}, false, nil
@@ -158,7 +164,31 @@ WHERE token_hash=$1 AND expires_at > $2`, tokenHash, now).Scan(
 	if err != nil {
 		return oauthas.DurableRefreshGrant{}, false, fmt.Errorf("load refresh grant: %w", err)
 	}
+	if issuedAt != nil {
+		grant.IssuedAt = *issuedAt
+	}
 	return grant, true, nil
+}
+
+// RenewRefreshGrant extends a live grant's expiry; it never revives an
+// expired grant or shortens one.
+func (s *PgStore) RenewRefreshGrant(ctx context.Context, tokenHash string, expiresAt, now time.Time) error {
+	if len(tokenHash) < 32 || len(tokenHash) > 256 || expiresAt.IsZero() || now.IsZero() {
+		return errors.New("invalid refresh grant renewal")
+	}
+	if _, err := s.pool.Exec(ctx, `
+UPDATE narthex_oauth_refresh_grants SET expires_at=$2
+WHERE token_hash=$1 AND expires_at > $3 AND expires_at < $2`, tokenHash, expiresAt, now); err != nil {
+		return fmt.Errorf("renew refresh grant: %w", err)
+	}
+	return nil
+}
+
+func nullableTime(t time.Time) *time.Time {
+	if t.IsZero() {
+		return nil
+	}
+	return &t
 }
 
 func (s *PgStore) RevokeOAuthGrantsForResource(ctx context.Context, resource string) error {

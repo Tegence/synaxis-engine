@@ -143,6 +143,11 @@ type MCPClientStore interface {
 	// with this subject-bound registration. Replacing a DCR identity requires
 	// an explicit reset first; there is never an implicit rebind.
 	BindMCPClientOAuthClient(ctx context.Context, id, oauthClientID string, precondition MCPClientPrecondition, actor PlatformActor) (MCPClient, error)
+	// ReplaceMCPClientOAuthClient is that explicit replacement in one
+	// revision-checked write: the endpoint's own member moves an existing
+	// binding to a new DCR identity ("Replace sign-in" on consent). The epoch
+	// rotates, so the previous app's tokens fail closed.
+	ReplaceMCPClientOAuthClient(ctx context.Context, id, oauthClientID string, precondition MCPClientPrecondition, actor PlatformActor) (MCPClient, error)
 	// ResetMCPClientOAuthClient clears a stale DCR identity but keeps the
 	// stable endpoint slug and namespace grants. It always rotates Epoch so
 	// previously issued path tokens fail closed before a later explicit bind.
@@ -848,6 +853,14 @@ func (s *FileStore) ActiveMCPClient(ctx context.Context, endpointIdentifier stri
 	return client, true
 }
 
+func (s *FileStore) LookupActiveMCPClient(ctx context.Context, slug string) (MCPClient, bool, error) {
+	client, ok := s.MCPClientBySlug(ctx, slug)
+	if !ok || client.Status != MCPClientStatusActive {
+		return MCPClient{}, false, nil
+	}
+	return client, true, nil
+}
+
 func (s *FileStore) ActiveMCPClientByOAuthClientID(_ context.Context, oauthClientID string) (MCPClient, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1011,6 +1024,14 @@ func (s *FileStore) SetMCPClientNamespaces(_ context.Context, id string, namespa
 }
 
 func (s *FileStore) BindMCPClientOAuthClient(_ context.Context, id, oauthClientID string, precondition MCPClientPrecondition, actor PlatformActor) (MCPClient, error) {
+	return s.bindMCPClientOAuthClient(id, oauthClientID, precondition, actor, false)
+}
+
+func (s *FileStore) ReplaceMCPClientOAuthClient(_ context.Context, id, oauthClientID string, precondition MCPClientPrecondition, actor PlatformActor) (MCPClient, error) {
+	return s.bindMCPClientOAuthClient(id, oauthClientID, precondition, actor, true)
+}
+
+func (s *FileStore) bindMCPClientOAuthClient(id, oauthClientID string, precondition MCPClientPrecondition, actor PlatformActor, replace bool) (MCPClient, error) {
 	oauthClientID = strings.TrimSpace(oauthClientID)
 	if !validMCPClientOAuthClientID(oauthClientID) {
 		return MCPClient{}, fmt.Errorf("%w: OAuth client ID is invalid", ErrInvalidMCPClient)
@@ -1038,7 +1059,7 @@ func (s *FileStore) BindMCPClientOAuthClient(_ context.Context, id, oauthClientI
 	if client.OAuthClientID == oauthClientID {
 		return copyMCPClient(*client), nil
 	}
-	if client.OAuthClientID != "" {
+	if client.OAuthClientID != "" && !replace {
 		return MCPClient{}, ErrMCPClientOAuthBinding
 	}
 	if existing, exists := s.mcpClientByOAuthIDLocked(oauthClientID); exists && existing.ID != client.ID {

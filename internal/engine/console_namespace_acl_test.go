@@ -9,9 +9,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sort"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/mark3labs/mcp-go/mcp"
 )
 
 // hostedNamespaceConsole assembles two credential folders and a hosted Engine
@@ -389,16 +393,164 @@ func TestSetBearerTokenUsesOwnershipRevisionCAS(t *testing.T) {
 	}
 }
 
-// accountQueryCountingStore counts per-row Account lookups so the activity
-// list test can prove the visibility check is batched.
+// accountQueryCountingStore counts per-row Account and ConnectionNamespace
+// lookups, and whole account listings, so list tests can prove their
+// visibility checks are batched.
 type accountQueryCountingStore struct {
 	*FileStore
-	accountQueries atomic.Int32
+	accountQueries   atomic.Int32
+	accountListings  atomic.Int32
+	namespaceQueries atomic.Int32
 }
 
 func (s *accountQueryCountingStore) Account(name string) (Account, bool) {
 	s.accountQueries.Add(1)
 	return s.FileStore.Account(name)
+}
+
+func (s *accountQueryCountingStore) Accounts() []Account {
+	s.accountListings.Add(1)
+	return s.FileStore.Accounts()
+}
+
+func (s *accountQueryCountingStore) ConnectionNamespace(ctx context.Context, id string) (ConnectionNamespace, bool) {
+	s.namespaceQueries.Add(1)
+	return s.FileStore.ConnectionNamespace(ctx, id)
+}
+
+func (s *accountQueryCountingStore) resetCounts() {
+	s.accountQueries.Store(0)
+	s.accountListings.Store(0)
+	s.namespaceQueries.Store(0)
+}
+
+// countingNamespaceConsole is hostedNamespaceConsole over a counting store,
+// with a third account in the delegated Team folder and a provider seam that
+// records every account it lists tools for.
+func countingNamespaceConsole(t *testing.T) (*http.ServeMux, *accountQueryCountingStore, ed25519.PrivateKey, time.Time, func() []string) {
+	t.Helper()
+	ctx := context.Background()
+	base, err := LoadFileStore(filepath.Join(t.TempDir(), "accounts.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &accountQueryCountingStore{FileStore: base}
+	team, err := store.CreateConnectionNamespace(ctx, ConnectionNamespace{
+		Label: "Team", CreatedBy: "usr_owner",
+		ManagerGrants: []ConnectionNamespaceManagerGrant{{Subject: "usr_operator"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	private, err := store.CreateConnectionNamespace(ctx, ConnectionNamespace{Label: "Private", CreatedBy: "usr_owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, account := range []Account{
+		{Name: "team_notion", ConnectionNamespaceID: team.ID, ConnectionScope: ConnectionScopeShared, URL: "https://team.example/mcp", AuthMode: "token", BearerToken: "t"},
+		{Name: "team_linear", ConnectionNamespaceID: team.ID, ConnectionScope: ConnectionScopeShared, URL: "https://linear.example/mcp", AuthMode: "token", BearerToken: "t"},
+		{Name: "private_notion", ConnectionNamespaceID: private.ID, ConnectionScope: ConnectionScopeShared, URL: "https://private.example/mcp", AuthMode: "token", BearerToken: "t"},
+	} {
+		if err := store.Create(ctx, account); err != nil {
+			t.Fatal(err)
+		}
+	}
+	verifier, key, now := newActorVerifier(t)
+	gateway := NewGateway(store, nil)
+	gateway.SetAudit(store)
+	var mu sync.Mutex
+	var listed []string
+	gateway.listTools = func(_ context.Context, a Account) ([]mcp.Tool, error) {
+		mu.Lock()
+		listed = append(listed, a.Name)
+		mu.Unlock()
+		return []mcp.Tool{mcp.NewTool(a.Name + "__search")}, nil
+	}
+	api := NewConsoleAPI(store, gateway, nil, "local-password", "local-secret", "https://engine.example", "https://app.example", "",
+		WithAdminToken("machine-token"), WithLocalAdminAuth(false), WithPlatformActorVerifier(verifier))
+	mux := http.NewServeMux()
+	api.Routes(mux)
+	return mux, store, key, now, func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		out := append([]string(nil), listed...)
+		sort.Strings(out)
+		return out
+	}
+}
+
+// TestOwnerConsoleListsReadNothingPerAccount: an administrator sees every
+// account, so the list routes decide visibility without any per-account
+// store read (the account check used to look the namespace up first).
+func TestOwnerConsoleListsReadNothingPerAccount(t *testing.T) {
+	mux, store, key, now, _ := countingNamespaceConsole(t)
+	store.LogCall(CallRecord{Account: "team_notion", Tool: "search"})
+	store.LogCall(CallRecord{Account: "private_notion", Tool: "search"})
+	for _, path := range []string{"/api/servers", "/api/health", "/api/logs"} {
+		store.resetCounts()
+		response := hostedNamespaceRequest(t, mux, key, now, "usr_owner", "owner", http.MethodGet, path, "")
+		if response.Code != http.StatusOK {
+			t.Fatalf("owner GET %s = %d: %s", path, response.Code, response.Body)
+		}
+		if accounts, namespaces := store.accountQueries.Load(), store.namespaceQueries.Load(); accounts != 0 || namespaces != 0 {
+			t.Fatalf("owner GET %s made %d account and %d namespace reads, want none", path, accounts, namespaces)
+		}
+	}
+}
+
+// TestOperatorHealthProbesOnlyAccountsItCanSee: an operator's health request
+// is answered for, and probes, only the accounts in its delegated folder,
+// with one lookup per namespace rather than one per account.
+func TestOperatorHealthProbesOnlyAccountsItCanSee(t *testing.T) {
+	mux, store, key, now, listed := countingNamespaceConsole(t)
+	store.resetCounts()
+	response := hostedNamespaceRequest(t, mux, key, now, "usr_operator", "operator", http.MethodGet, "/api/health", "")
+	if response.Code != http.StatusOK {
+		t.Fatalf("operator GET /api/health = %d: %s", response.Code, response.Body)
+	}
+	var rows []AccountHealth
+	if err := json.Unmarshal(response.Body.Bytes(), &rows); err != nil || len(rows) != 2 {
+		t.Fatalf("operator health = %s (err %v), want the two Team accounts", response.Body, err)
+	}
+	if got := listed(); len(got) != 2 || got[0] != "team_linear" || got[1] != "team_notion" {
+		t.Fatalf("operator health listed tools for %v, want only the Team accounts", got)
+	}
+	if accounts, namespaces := store.accountQueries.Load(), store.namespaceQueries.Load(); accounts != 0 || namespaces != 2 {
+		t.Fatalf("operator health made %d account and %d namespace reads, want 0 and one per namespace (2)", accounts, namespaces)
+	}
+
+	store.resetCounts()
+	response = hostedNamespaceRequest(t, mux, key, now, "usr_operator", "operator", http.MethodGet, "/api/servers", "")
+	var servers []serverDTO
+	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &servers) != nil || len(servers) != 2 {
+		t.Fatalf("operator GET /api/servers = %d: %s", response.Code, response.Body)
+	}
+	if accounts, namespaces := store.accountQueries.Load(), store.namespaceQueries.Load(); accounts != 0 || namespaces != 2 {
+		t.Fatalf("operator servers made %d account and %d namespace reads, want 0 and 2", accounts, namespaces)
+	}
+}
+
+// TestOperatorActivityPagingListsAccountsOnce: when visible rows are sparse,
+// the activity list pages through several raw store pages; it lists the
+// accounts once per request, not once per page.
+func TestOperatorActivityPagingListsAccountsOnce(t *testing.T) {
+	mux, store, key, now, _ := countingNamespaceConsole(t)
+	for i := 0; i < 250; i++ {
+		account := "private_notion"
+		if i%5 == 0 {
+			account = "team_notion"
+		}
+		store.LogCall(CallRecord{Account: account, Tool: "search"})
+	}
+	store.resetCounts()
+	response := hostedNamespaceRequest(t, mux, key, now, "usr_operator", "operator", http.MethodGet, "/api/logs", "")
+	var calls []CallRecord
+	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &calls) != nil || len(calls) != 50 {
+		t.Fatalf("operator GET /api/logs = %d with %d rows, want the 50 Team rows", response.Code, len(calls))
+	}
+	if listings, accounts, namespaces := store.accountListings.Load(), store.accountQueries.Load(), store.namespaceQueries.Load(); listings != 1 || accounts != 0 || namespaces > 2 {
+		t.Fatalf("three raw pages made %d account listings, %d account reads and %d namespace reads; want 1, 0 and at most 2", listings, accounts, namespaces)
+	}
 }
 
 func TestHostedOperatorActivityListBatchesVisibilityChecks(t *testing.T) {

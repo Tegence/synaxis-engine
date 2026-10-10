@@ -325,3 +325,61 @@ func TestFileStoreMCPClientBackfillRevokesUnsafePersonalGrant(t *testing.T) {
 		t.Fatal("unsafe legacy client remained an active endpoint")
 	}
 }
+
+// assertMCPClientReplaceContract pins "Replace sign-in" on every store: only
+// the endpoint's own member may move an existing binding, only from the
+// current revision, never onto a DCR identity another endpoint holds, and the
+// epoch always rotates so the previous app's tokens die.
+func assertMCPClientReplaceContract(t *testing.T, store MCPClientStore, suffix string) []string {
+	t.Helper()
+	ctx := context.Background()
+	alice := PlatformActor{UserID: "usr_replace_alice_" + suffix, Role: "operator"}
+	create := func(name string) MCPClient {
+		t.Helper()
+		client, err := store.CreateMCPClient(ctx, MCPClient{Name: name + " " + suffix, Subject: alice.UserID, CreatedBy: alice.UserID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return client
+	}
+	bind := func(client MCPClient, oauthClientID string) MCPClient {
+		t.Helper()
+		bound, err := store.BindMCPClientOAuthClient(ctx, client.ID, oauthClientID, MCPClientPrecondition{ID: client.ID, Revision: client.Revision}, alice)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return bound
+	}
+	client := bind(create("Replace Codex"), "dcr-replace-first-"+suffix)
+	other := bind(create("Replace Other"), "dcr-replace-other-"+suffix)
+	current := MCPClientPrecondition{ID: client.ID, Revision: client.Revision}
+
+	if _, err := store.ReplaceMCPClientOAuthClient(ctx, client.ID, "dcr-replace-second-"+suffix, current, PlatformActor{UserID: "usr_replace_bob_" + suffix, Role: "owner"}); err == nil {
+		t.Fatal("another member replaced the sign-in")
+	}
+	if _, err := store.ReplaceMCPClientOAuthClient(ctx, client.ID, "dcr-replace-second-"+suffix, MCPClientPrecondition{ID: client.ID, Revision: client.Revision - 1}, alice); !errors.Is(err, ErrMCPClientRevision) {
+		t.Fatalf("replace from a stale revision = %v, want revision conflict", err)
+	}
+	if _, err := store.ReplaceMCPClientOAuthClient(ctx, client.ID, other.OAuthClientID, current, alice); !errors.Is(err, ErrMCPClientOAuthBinding) {
+		t.Fatalf("replace onto another endpoint's identity = %v, want binding conflict", err)
+	}
+	replaced, err := store.ReplaceMCPClientOAuthClient(ctx, client.ID, "dcr-replace-second-"+suffix, current, alice)
+	if err != nil {
+		t.Fatalf("replace by the endpoint's member: %v", err)
+	}
+	if replaced.OAuthClientID != "dcr-replace-second-"+suffix || replaced.Revision != client.Revision+1 || replaced.Epoch == client.Epoch {
+		t.Fatalf("replaced client = %+v; before = %+v", replaced, client)
+	}
+	if active, ok := store.ActiveMCPClient(ctx, client.ID); !ok || active.OAuthClientID != replaced.OAuthClientID || active.Epoch != replaced.Epoch {
+		t.Fatalf("stored client after replace = %+v", active)
+	}
+	return []string{client.ID, other.ID}
+}
+
+func TestFileStoreMCPClientReplaceSignIn(t *testing.T) {
+	store, err := LoadFileStore(filepath.Join(t.TempDir(), "accounts.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertMCPClientReplaceContract(t, store, "file")
+}

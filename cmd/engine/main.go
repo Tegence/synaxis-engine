@@ -103,9 +103,11 @@ func runEngine(rootCtx context.Context) error {
 			log.Printf("engine: WARNING token encryption DISABLED for self-hosted development (set ENGINE_ENCRYPTION_KEY before storing real credentials)")
 		}
 		// Recover according to the persisted lifecycle. Calls whose deadline
-		// genuinely elapsed are expired; still-live rows are explicitly cancelled
-		// because their original MCP request died with the previous process and
-		// generic tool calls must never be replayed from stored arguments.
+		// genuinely elapsed are expired; still-live rows whose owning process
+		// stopped heartbeating are explicitly cancelled because their original
+		// MCP request died with that process and generic tool calls must never
+		// be replayed from stored arguments. Rows a live process (such as the
+		// revision still serving during a rollout) heartbeats stay parked.
 		if recovery, err := pg.RecoverPendingApprovals(runCtx, time.Now()); err != nil {
 			log.Printf("engine: recover interrupted pending approvals: %v", err)
 		} else if recovery.Expired > 0 || recovery.Cancelled > 0 {

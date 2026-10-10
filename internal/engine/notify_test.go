@@ -203,13 +203,15 @@ func TestUpstreamHealthEmitsStructuredEvents(t *testing.T) {
 	defer webhook.Close()
 	g.SetAlertWebhook(webhook.URL)
 
-	g.evalAlert(AccountHealth{UUID: "notion", Status: healthStatusUnreachable})
+	unreachable := []AccountHealth{{UUID: "notion", Status: healthStatusUnreachable}}
+	g.evalAlerts(context.Background(), unreachable)
+	g.evalAlerts(context.Background(), unreachable) // transient: alerts on the second failed probe
 	down := awaitEvent(t, events, EventUpstreamDown)
 	if down.ID != "notion" || down.Account != "notion" {
 		t.Fatalf("down event = %+v", down)
 	}
 
-	g.evalAlert(AccountHealth{UUID: "notion", Status: healthStatusOK})
+	g.evalAlerts(context.Background(), []AccountHealth{{UUID: "notion", Status: healthStatusOK}})
 	recovered := awaitEvent(t, events, EventUpstreamRecovered)
 	if recovered.ID != "notion" {
 		t.Fatalf("recovered event = %+v", recovered)

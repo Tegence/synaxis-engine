@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"sort"
 	"strings"
@@ -690,6 +691,14 @@ type PortableAccountConfigStore interface {
 	UpdatePortableAccountConfig(ctx context.Context, name string, update PortableAccountConfig) (Account, error)
 }
 
+// HealthAlertStore persists the watch loop's outstanding "needs attention"
+// alerts (account -> status) so an Engine restart does not re-announce an
+// account that is still down. Stores without it alert again after a restart.
+type HealthAlertStore interface {
+	HealthAlerts(ctx context.Context) (map[string]string, error)
+	SetHealthAlert(ctx context.Context, account, status string) error // "" clears
+}
+
 // ErrAccountExists is returned by AccountStore.Create when the account name is
 // already present. Explicit update and reconnect paths continue to use Upsert.
 var ErrAccountExists = errors.New("account already exists")
@@ -782,6 +791,7 @@ type FileStore struct {
 	// version. It is deliberately per-version rather than content-deduplicated.
 	libraryArtifactMediaBlobs []*libraryArtifactMediaBlob
 	libraryArtifactGrants     []*LibraryArtifactGrant
+	libraryCollaborations     map[string]*libraryCollaborationState
 	libraryRuns               []*LibraryRun
 	// Memories are a separate Library facet: logical lifecycle records,
 	// immutable authored versions, and exact-version surface grants.
@@ -802,6 +812,7 @@ type FileStore struct {
 	libraryMCPClientSkillAuthoringRequests    []*libraryMCPClientSkillAuthoringRequestRecord
 	libraryMCPClientSkillAuthoringAuditEvents []*LibraryMCPClientSkillAuthoringAuditEvent
 	oauthTokenGeneration                      string
+	healthAlerts                              map[string]string // HealthAlertStore
 	// OAuth grants live beside the durable generation so local Engines do not
 	// accept a code on one process and forget it after a restart. Hosted
 	// replicas use PgStore's transactional implementation instead.
@@ -822,6 +833,7 @@ var _ ConnectionNamespaceStore = (*FileStore)(nil)
 var _ StaticOAuthConfigStore = (*FileStore)(nil)
 var _ LibraryRuntimeAttestationStore = (*FileStore)(nil)
 var _ LibraryMemoryStore = (*FileStore)(nil)
+var _ HealthAlertStore = (*FileStore)(nil)
 
 // fileStoreData is the on-disk shape. Older files were a bare JSON array of
 // accounts; LoadFileStore still accepts that, and a missing "connectors"
@@ -854,6 +866,7 @@ type fileStoreData struct {
 	LibraryArtifactVersions                   []*LibraryArtifactVersion                      `json:"library_artifact_versions,omitempty"`
 	LibraryArtifactMediaBlobs                 []*libraryArtifactMediaBlob                    `json:"library_artifact_media_blobs,omitempty"`
 	LibraryArtifactGrants                     []*LibraryArtifactGrant                        `json:"library_artifact_grants,omitempty"`
+	LibraryCollaborations                     map[string]*libraryCollaborationState          `json:"library_collaborations,omitempty"`
 	LibraryRuns                               []*LibraryRun                                  `json:"library_runs,omitempty"`
 	LibraryMemories                           []*LibraryMemory                               `json:"library_memories,omitempty"`
 	LibraryMemoryVersions                     []*LibraryMemoryVersion                        `json:"library_memory_versions,omitempty"`
@@ -870,6 +883,7 @@ type fileStoreData struct {
 	// provenance boundary.
 	LibraryArtifactSurfaceIDs map[string]string                       `json:"library_artifact_surface_ids,omitempty"`
 	OAuthTokenGeneration      string                                  `json:"oauth_token_generation,omitempty"`
+	HealthAlerts              map[string]string                       `json:"health_alerts,omitempty"`
 	OAuthAuthorizationCodes   map[string]fileOAuthAuthorizationCode   `json:"oauth_authorization_codes,omitempty"`
 	OAuthRefreshGrants        map[string]fileOAuthRefreshGrant        `json:"oauth_refresh_grants,omitempty"`
 	OAuthHostedConsentReplays map[string]fileOAuthHostedConsentReplay `json:"oauth_hosted_consent_replays,omitempty"`
@@ -936,6 +950,7 @@ func LoadFileStore(path string) (*FileStore, error) {
 		return nil, fmt.Errorf("parse account store: %w", err)
 	}
 	s.accounts, s.connectors, s.namespaces, s.connectionNamespaces, s.mcpClients, s.oauthTokenGeneration = d.Accounts, d.Connectors, d.Namespaces, d.ConnectionNamespaces, d.MCPClients, d.OAuthTokenGeneration
+	s.healthAlerts = d.HealthAlerts
 	s.skillSources, s.skills, s.skillVersions, s.skillCarriers, s.skillDrift = d.SkillSources, d.Skills, d.SkillVersions, d.SkillCarriers, d.SkillDrift
 	s.skillChecks = d.SkillChecks
 	s.librarySkills, s.librarySkillVersions, s.librarySkillDrafts = d.LibrarySkills, d.LibrarySkillVersions, d.LibrarySkillDrafts
@@ -952,6 +967,7 @@ func LoadFileStore(path string) (*FileStore, error) {
 	s.libraryMemories, s.libraryMemoryVersions, s.libraryMemoryGrants = d.LibraryMemories, d.LibraryMemoryVersions, d.LibraryMemoryGrants
 	s.libraryRuntimeAttestations = d.LibraryRuntimeAttestations
 	s.libraryRunCorrelations = d.LibraryRunCorrelations
+	s.libraryCollaborations = d.LibraryCollaborations
 	s.controlIdempotencyRecords = d.ControlIdempotencyRecords
 	s.libraryMCPClientArtifactVersionRequests = d.LibraryMCPClientArtifactVersionRequests
 	s.libraryMCPClientSkillAuthoringLeases = d.LibraryMCPClientSkillAuthoringLeases
@@ -1104,6 +1120,7 @@ func (s *FileStore) saveLocked() error {
 		LibraryArtifactVersions:                   s.libraryArtifactVersions,
 		LibraryArtifactMediaBlobs:                 s.libraryArtifactMediaBlobs,
 		LibraryArtifactGrants:                     s.libraryArtifactGrants,
+		LibraryCollaborations:                     s.libraryCollaborations,
 		LibraryRuns:                               s.libraryRuns,
 		LibraryMemories:                           s.libraryMemories,
 		LibraryMemoryVersions:                     s.libraryMemoryVersions,
@@ -1116,6 +1133,7 @@ func (s *FileStore) saveLocked() error {
 		LibraryMCPClientSkillAuthoringAuditEvents: s.libraryMCPClientSkillAuthoringAuditEvents,
 		LibraryArtifactSurfaceIDs:                 s.libraryArtifactSurfaceIDsLocked(),
 		OAuthTokenGeneration:                      s.oauthTokenGeneration,
+		HealthAlerts:                              s.healthAlerts,
 		OAuthAuthorizationCodes:                   s.oauthAuthorizationCodes,
 		OAuthRefreshGrants:                        s.oauthRefreshGrants,
 		OAuthHostedConsentReplays:                 s.oauthHostedConsentReplays,
@@ -1155,6 +1173,31 @@ func (s *FileStore) LoadOrCreateTokenGeneration(ctx context.Context, candidate s
 		return "", fmt.Errorf("persist token generation: %w", err)
 	}
 	return s.oauthTokenGeneration, nil
+}
+
+func (s *FileStore) HealthAlerts(context.Context) (map[string]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return maps.Clone(s.healthAlerts), nil
+}
+
+func (s *FileStore) SetHealthAlert(_ context.Context, account, status string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.healthAlerts[account] == status {
+		return nil
+	}
+	if status == "" {
+		delete(s.healthAlerts, account)
+	} else {
+		if s.healthAlerts == nil {
+			s.healthAlerts = map[string]string{}
+		}
+		s.healthAlerts[account] = status
+	}
+	// ponytail: no rollback on a failed save; the next successful save of
+	// any state persists this alert state too.
+	return s.saveLocked()
 }
 
 func (s *FileStore) CurrentTokenGeneration(ctx context.Context) (string, error) {

@@ -46,6 +46,49 @@ func TestEnginePostgresPoolConfigIsCapacityBounded(t *testing.T) {
 	}
 }
 
+func TestPgStoreHealthAlertsPersistAcrossRestart(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("set TEST_DATABASE_URL to run the Postgres integration test")
+	}
+	ctx := context.Background()
+	first, err := NewPgStore(ctx, dsn)
+	if err != nil {
+		t.Fatalf("NewPgStore: %v", err)
+	}
+	defer first.Close()
+	account := "health-alert-" + newPgFixtureSuffix()
+	defer first.SetHealthAlert(ctx, account, "")
+
+	if err := first.SetHealthAlert(ctx, account, healthStatusTimeout); err != nil {
+		t.Fatalf("SetHealthAlert: %v", err)
+	}
+	if err := first.SetHealthAlert(ctx, account, healthStatusNeedsAuth); err != nil {
+		t.Fatalf("SetHealthAlert overwrite: %v", err)
+	}
+	second, err := NewPgStore(ctx, dsn)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer second.Close()
+	alerts, err := second.HealthAlerts(ctx)
+	if err != nil {
+		t.Fatalf("HealthAlerts: %v", err)
+	}
+	if alerts[account] != healthStatusNeedsAuth {
+		t.Fatalf("health alert after restart = %q, want %q", alerts[account], healthStatusNeedsAuth)
+	}
+	if _, leaked := alerts["oauth_token_generation"]; leaked {
+		t.Fatal("HealthAlerts returned an unrelated engine-state key")
+	}
+	if err := second.SetHealthAlert(ctx, account, ""); err != nil {
+		t.Fatalf("clear health alert: %v", err)
+	}
+	if alerts, err = first.HealthAlerts(ctx); err != nil || alerts[account] != "" {
+		t.Fatalf("cleared health alert = %q, %v; want none", alerts[account], err)
+	}
+}
+
 func TestPgStoreTokenGenerationPersistsAndUsesCASRotation(t *testing.T) {
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
@@ -1271,9 +1314,10 @@ func TestPgStorePendingCalls(t *testing.T) {
 }
 
 // TestPgStoreApprovalRecovery keeps the post-restart lifecycle honest: only
-// truly overdue calls become expired. A non-expired call had its MCP request
-// interrupted, so it is cancelled rather than implicitly replayed or called a
-// timeout.
+// truly overdue calls become expired. A non-expired call whose owner stopped
+// heartbeating had its MCP request interrupted, so it is cancelled rather than
+// implicitly replayed or called a timeout. A call another live process still
+// heartbeats (the old revision during a rollout) stays parked.
 func TestPgStoreApprovalRecovery(t *testing.T) {
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
@@ -1285,12 +1329,13 @@ func TestPgStoreApprovalRecovery(t *testing.T) {
 		t.Fatalf("NewPgStore: %v", err)
 	}
 	defer s.Close()
-	defer s.pool.Exec(ctx, `DELETE FROM pending_calls WHERE id IN ('recovery-expired','recovery-cancelled','recovery-approved')`)
+	defer s.pool.Exec(ctx, `DELETE FROM pending_calls WHERE id IN ('recovery-expired','recovery-cancelled','recovery-live','recovery-approved')`)
 
 	now := time.Now().Truncate(time.Millisecond)
 	for _, p := range []PendingCall{
 		{ID: "recovery-expired", TS: now.Add(-2 * time.Minute), ExpiresAt: ptrTime(now.Add(-time.Second)), Connector: "work", Account: "linear", Tool: "save", Status: ApprovalPending},
 		{ID: "recovery-cancelled", TS: now, ExpiresAt: ptrTime(now.Add(time.Minute)), Connector: "work", Account: "linear", Tool: "save", Status: ApprovalPending},
+		{ID: "recovery-live", TS: now, ExpiresAt: ptrTime(now.Add(time.Minute)), Connector: "work", Account: "linear", Tool: "save", Status: ApprovalPending},
 		{ID: "recovery-approved", TS: now, ExpiresAt: ptrTime(now.Add(time.Minute)), Connector: "work", Account: "linear", Tool: "save", Status: ApprovalPending},
 	} {
 		if err := s.LogPending(ctx, p); err != nil {
@@ -1300,8 +1345,29 @@ func TestPgStoreApprovalRecovery(t *testing.T) {
 	if _, err := s.DecidePending(ctx, "recovery-approved", ApprovalDecision{Status: ApprovalApproved, Actor: "platform:test"}); err != nil {
 		t.Fatalf("approve pre-existing decision: %v", err)
 	}
+	// Both parked calls missed their beats; then the owner's waiter beats
+	// for recovery-live only.
+	if _, err := s.pool.Exec(ctx, `UPDATE pending_calls SET heartbeat_at=now() - interval '5 minutes' WHERE id IN ('recovery-cancelled','recovery-live')`); err != nil {
+		t.Fatalf("age heartbeats: %v", err)
+	}
+	if err := s.HeartbeatPending(ctx, "recovery-live"); err != nil {
+		t.Fatalf("HeartbeatPending: %v", err)
+	}
+	var owner string
+	if err := s.pool.QueryRow(ctx, `SELECT owner_boot_id FROM pending_calls WHERE id='recovery-live'`).Scan(&owner); err != nil || owner != s.bootID {
+		t.Fatalf("owner_boot_id = %q, %v; want %q", owner, err, s.bootID)
+	}
 
-	recovery, err := s.RecoverPendingApprovals(ctx, now)
+	// A second process (the next revision) boots while s still serves.
+	next, err := NewPgStore(ctx, dsn)
+	if err != nil {
+		t.Fatalf("NewPgStore (next revision): %v", err)
+	}
+	defer next.Close()
+	if next.bootID == s.bootID {
+		t.Fatal("two store instances share a boot id")
+	}
+	recovery, err := next.RecoverPendingApprovals(ctx, now)
 	if err != nil {
 		t.Fatalf("RecoverPendingApprovals: %v", err)
 	}
@@ -1311,12 +1377,52 @@ func TestPgStoreApprovalRecovery(t *testing.T) {
 	for wantID, wantStatus := range map[string]string{
 		"recovery-expired":   ApprovalExpired,
 		"recovery-cancelled": ApprovalCancelled,
+		"recovery-live":      ApprovalPending,
 		"recovery-approved":  ApprovalApproved,
 	} {
 		p, found, err := s.ApprovalCall(ctx, wantID)
 		if err != nil || !found || p.Status != wantStatus {
 			t.Fatalf("%s = found=%v err=%v row=%+v, want %s", wantID, found, err, p, wantStatus)
 		}
+	}
+}
+
+// TestPgStoreDecideCancelsAbandonedPending: an Approve that arrives after the
+// owning process stopped heartbeating must not record a call that will never
+// run. Rows parked before heartbeats existed have no owner and stay decidable.
+func TestPgStoreDecideCancelsAbandonedPending(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("set TEST_DATABASE_URL to run the Postgres integration test")
+	}
+	ctx := context.Background()
+	s, err := NewPgStore(ctx, dsn)
+	if err != nil {
+		t.Fatalf("NewPgStore: %v", err)
+	}
+	defer s.Close()
+	defer s.pool.Exec(ctx, `DELETE FROM pending_calls WHERE id IN ('abandoned-owned','abandoned-legacy')`)
+
+	now := time.Now()
+	for _, id := range []string{"abandoned-owned", "abandoned-legacy"} {
+		if err := s.LogPending(ctx, PendingCall{ID: id, TS: now, ExpiresAt: ptrTime(now.Add(time.Minute)),
+			Connector: "work", Account: "linear", Tool: "save", Status: ApprovalPending}); err != nil {
+			t.Fatalf("LogPending %s: %v", id, err)
+		}
+	}
+	if _, err := s.pool.Exec(ctx, `UPDATE pending_calls SET heartbeat_at=now() - interval '5 minutes' WHERE id IN ('abandoned-owned','abandoned-legacy')`); err != nil {
+		t.Fatalf("age heartbeats: %v", err)
+	}
+	if _, err := s.pool.Exec(ctx, `UPDATE pending_calls SET owner_boot_id='' WHERE id='abandoned-legacy'`); err != nil {
+		t.Fatalf("clear legacy owner: %v", err)
+	}
+
+	p, err := s.DecidePending(ctx, "abandoned-owned", ApprovalDecision{Status: ApprovalApproved, Actor: "platform:test"})
+	if !errors.Is(err, ErrApprovalNotPending) || p.Status != ApprovalCancelled {
+		t.Fatalf("abandoned approve = %+v, %v; want cancelled, ErrApprovalNotPending", p, err)
+	}
+	if p, err := s.DecidePending(ctx, "abandoned-legacy", ApprovalDecision{Status: ApprovalApproved, Actor: "platform:test"}); err != nil || p.Status != ApprovalApproved {
+		t.Fatalf("legacy approve = %+v, %v; want approved", p, err)
 	}
 }
 

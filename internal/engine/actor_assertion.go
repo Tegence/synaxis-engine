@@ -270,6 +270,8 @@ func platformServiceControlV1Route(method, requestPath string) bool {
 		return true
 	case method == http.MethodGet && requestPath == controlV1PathPrefix+"library/artifacts":
 		return true
+	case method == http.MethodPost && requestPath == controlV1PathPrefix+"library/collaboration":
+		return true
 	case method == http.MethodGet && requestPath == controlV1PathPrefix+"library/recipients":
 		return true
 	case method == http.MethodGet && platformServiceControlLibraryArtifactRoute(requestPath):

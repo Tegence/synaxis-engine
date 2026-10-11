@@ -416,3 +416,66 @@ func mustActiveMCPClients(t *testing.T, store MCPClientStore, ctx context.Contex
 	}
 	return clients
 }
+
+// The error-reporting reads must distinguish "no such client" from "the read
+// failed": the OAuth path answers only the first with a refusal.
+func TestPgStoreErrorReportingReadsDistinguishMissingFromFailed(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("set TEST_DATABASE_URL to run the Postgres MCP client integration test")
+	}
+	ctx := context.Background()
+	store, err := NewPgStore(ctx, dsn)
+	if err != nil {
+		t.Fatalf("NewPgStore: %v", err)
+	}
+	suffix := newPgFixtureSuffix()
+	client, err := store.CreateMCPClient(ctx, MCPClient{Name: "PG lookup " + suffix, Subject: "usr_pg_lookup", CreatedBy: "usr_pg_lookup"})
+	if err != nil {
+		store.Close()
+		t.Fatalf("create client: %v", err)
+	}
+	defer func() {
+		cleanup, _ := NewPgStore(ctx, dsn)
+		if cleanup != nil {
+			_, _ = cleanup.pool.Exec(ctx, `DELETE FROM narthex_mcp_clients WHERE id=$1`, client.ID)
+			cleanup.Close()
+		}
+	}()
+
+	found, ok, err := store.LookupActiveMCPClient(ctx, client.Slug)
+	if err != nil || !ok || found.ID != client.ID {
+		t.Fatalf("lookup live client = %+v, %v, %v", found, ok, err)
+	}
+	if _, ok, err := store.LookupActiveMCPClient(ctx, "pg-missing-"+suffix); ok || err != nil {
+		t.Fatalf("lookup missing client = %v, %v; want not found without error", ok, err)
+	}
+	if _, err := store.ListAccounts(ctx); err != nil {
+		t.Fatalf("list accounts: %v", err)
+	}
+
+	store.Close()
+	if _, ok, err := store.LookupActiveMCPClient(ctx, client.Slug); ok || err == nil {
+		t.Fatalf("lookup on a closed pool = %v, %v; want an error, not not-found", ok, err)
+	}
+	if _, err := store.ListAccounts(ctx); err == nil {
+		t.Fatal("list accounts on a closed pool reported success")
+	}
+}
+
+func TestPgStoreMCPClientReplaceSignIn(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("set TEST_DATABASE_URL to run the Postgres MCP client integration test")
+	}
+	ctx := context.Background()
+	store, err := NewPgStore(ctx, dsn)
+	if err != nil {
+		t.Fatalf("NewPgStore: %v", err)
+	}
+	defer store.Close()
+	ids := assertMCPClientReplaceContract(t, store, newPgFixtureSuffix())
+	for _, id := range ids {
+		_, _ = store.pool.Exec(ctx, `DELETE FROM narthex_mcp_clients WHERE id=$1`, id)
+	}
+}

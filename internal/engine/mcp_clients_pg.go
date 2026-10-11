@@ -582,6 +582,23 @@ WHERE c.slug=$1`+mcpClientGroupBy, normalizeMCPClientSlug(slug)))
 	return client, true
 }
 
+// LookupActiveMCPClient resolves an endpoint slug in one query and, unlike
+// ActiveMCPClient, reports a failed read as an error instead of "not found".
+func (s *PgStore) LookupActiveMCPClient(ctx context.Context, slug string) (MCPClient, bool, error) {
+	client, err := scanMCPClient(s.pool.QueryRow(ctx, mcpClientSelect+`
+WHERE c.slug=$1`+mcpClientGroupBy, normalizeMCPClientSlug(slug)))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return MCPClient{}, false, nil
+	}
+	if err != nil {
+		return MCPClient{}, false, err
+	}
+	if client.Status != MCPClientStatusActive {
+		return MCPClient{}, false, nil
+	}
+	return client, true, nil
+}
+
 func (s *PgStore) ActiveMCPClient(ctx context.Context, endpointIdentifier string) (MCPClient, bool) {
 	if client, ok := s.MCPClient(ctx, endpointIdentifier); ok && client.Status == MCPClientStatusActive {
 		return client, true
@@ -830,6 +847,14 @@ RETURNING epoch,revision,updated_at`, client.ID, newEpoch()).Scan(&client.Epoch,
 }
 
 func (s *PgStore) BindMCPClientOAuthClient(ctx context.Context, id, oauthClientID string, precondition MCPClientPrecondition, actor PlatformActor) (MCPClient, error) {
+	return s.bindMCPClientOAuthClient(ctx, id, oauthClientID, precondition, actor, false)
+}
+
+func (s *PgStore) ReplaceMCPClientOAuthClient(ctx context.Context, id, oauthClientID string, precondition MCPClientPrecondition, actor PlatformActor) (MCPClient, error) {
+	return s.bindMCPClientOAuthClient(ctx, id, oauthClientID, precondition, actor, true)
+}
+
+func (s *PgStore) bindMCPClientOAuthClient(ctx context.Context, id, oauthClientID string, precondition MCPClientPrecondition, actor PlatformActor, replace bool) (MCPClient, error) {
 	oauthClientID = strings.TrimSpace(oauthClientID)
 	if !validMCPClientOAuthClientID(oauthClientID) {
 		return MCPClient{}, fmt.Errorf("%w: OAuth client ID is invalid", ErrInvalidMCPClient)
@@ -866,7 +891,7 @@ func (s *PgStore) BindMCPClientOAuthClient(ctx context.Context, id, oauthClientI
 		}
 		return client, nil
 	}
-	if client.OAuthClientID != "" {
+	if client.OAuthClientID != "" && !replace {
 		return MCPClient{}, ErrMCPClientOAuthBinding
 	}
 	var exists bool

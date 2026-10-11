@@ -222,6 +222,10 @@ func (g *Gateway) Replay(ctx context.Context, id int64, force bool) (CallRecord,
 	if !ok {
 		return CallRecord{}, fmt.Errorf("account %q not found", orig.Account)
 	}
+	if a.MemberCredentials {
+		// A replay has no member to act as, and must not act as the account.
+		return CallRecord{}, fmt.Errorf("account %q uses each member's own account; replays are not available", orig.Account)
+	}
 
 	start := time.Now()
 	execution := g.executeUpstream(

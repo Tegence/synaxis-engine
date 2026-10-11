@@ -155,15 +155,15 @@ authentication.
 
 | Methods | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/gateway`, `/api/health` | MCP endpoint metadata and per-connection health |
+| `GET` | `/api/gateway`, `/api/health` | MCP endpoint metadata and per-connection health (recorded rows, revalidated in the background; `X-Synaxis-Health-Refresh: 1` probes live) |
 | `GET` | `/api/logs`, `/api/logs/{id}` | Summary audit rows and one recorded call |
 | `POST` | `/api/logs/{id}/replay`, `/api/logs/{id}/triage` | Replay a recorded call or persist a triage decision |
 | `GET, POST` | `/api/servers` | List or create credential-bearing connections |
 | `PATCH, DELETE` | `/api/servers/{id}` | Update policy/ownership metadata or delete a connection |
 | `POST` | `/api/servers/{id}/connect` | Start upstream OAuth |
 | `PUT` | `/api/servers/{id}/token` | Store a bearer token for a token-auth connection |
-| `GET, PUT` | `/api/servers/{id}/tools` | Read or replace the connection's enabled-tool set |
-| `PUT` | `/api/servers/{id}/tools/{tool}` | Update one tool's alias, description, or enabled policy |
+| `GET, PUT` | `/api/servers/{id}/tools` | Read or replace the connection's enabled-tool set; a listing failure answers `{"error","code","recovery"}`: `409` `needs_auth`/`connect` or `auth_expired`/`reauthorize`, `504` `timeout`/`retry`, `502` `unreachable` or `error`/`retry` |
+| `PUT` | `/api/servers/{id}/tools/{tool}` | Update one tool's alias, description, or enabled policy (listing failures as above) |
 | `GET, POST` | `/api/connection-namespaces` | List visible credential folders or create a shared folder |
 | `GET, PATCH, DELETE` | `/api/connection-namespaces/{id}` | Read, rename, or delete a credential folder |
 | `GET, PUT` | `/api/connection-namespaces/{id}/managers` | Read or replace delegated manager subjects |
@@ -459,6 +459,26 @@ IDs, and compare-and-swap revisions. A stale tab or delayed OAuth callback
 therefore cannot write policy or credentials across a move, delete/recreate,
 or concurrent manager revocation.
 
+### Each member's own account
+
+A manager can switch a shared connection to `memberCredentials`. Its account's
+own credential still lists the tools, but every tool call through a
+subject-bound MCP client uses the calling member's own upstream credential.
+Each member's actions upstream then show as that member, not as the account.
+
+- Members connect their own account under `/api/member-credentials`: OAuth
+  through `POST /api/member-credentials/{account}/connect`, which reuses the
+  account's OAuth client, or a token through `PUT .../token`. `DELETE
+  /api/member-credentials/{account}` disconnects it. A member sees only
+  connections that their own MCP clients may use or that they manage, and
+  only their own credential.
+- A call fails closed with an instruction when the member has not connected,
+  when it arrives on an endpoint without a subject (root `/mcp`, endpoint
+  bundles, connectors), or when it comes from a workload client. It never
+  falls back to the account's credential.
+- Member tokens refresh through `refreshAccount` under a per-member lock.
+  They are encrypted like the account's own and are deleted with the account.
+
 ## Subject-bound MCP client endpoints
 
 `/mcp/clients/{slug}` is a separate path namespace from shared
@@ -586,6 +606,26 @@ digest, rechecks the current client/epoch/direct-run ownership atomically, and
 appends a new immutable pending version; it never overwrites content, follows a
 grant, mutates a handoff, or changes authority. Exact retry replays the prior
 result, while changed request-ID reuse or a stale head conflicts.
+Separate collaboration grants let people and agents review or edit the latest
+text/Markdown version. Owners/admins grant `view`, `comment`, or `edit`, with
+optional expiry and immediate revocation. Local clients use
+`library_collaboration_list` and `library_collaboration`; the grant pins their
+registration epoch. Comments retain their version and optional quotation.
+Edits require a request ID, expected version and digest, and create immutable
+pending versions. Existing exact-version handoffs and public snapshots remain
+unchanged. Collaboration grants do not confer publication or tool authority.
+
+An external guest or agent can receive a named bearer capability. The Engine
+stores only its hash and checks it on every operation. The public REST endpoint
+is `POST /api/public/artifacts/collaborate` (token in its JSON body); a restricted
+Streamable HTTP MCP endpoint is `/api/public/artifacts/mcp/{artifact}/{grant}`
+with `Authorization: Bearer <token>`. Its sole `artifact_collaborate` tool is
+pinned to that output. Treat output/comment text as untrusted context. The
+Console manages grants at `/api/library/artifacts/{id}/collaboration`; hosted
+control planes use the actor-asserted `/control/v1/library/collaboration` route.
+Neither endpoint returns engine credentials or makes a bearer label a verified
+human identity. FileStore and encrypted PgStore implement the same contract.
+
 `library_skill_resolve` (and the protected `POST /api/library/resolve`)
 selects an explicit binding or, per skill, the most-specific matching binding
 in the order `folder > repository > namespace > workspace`. It returns

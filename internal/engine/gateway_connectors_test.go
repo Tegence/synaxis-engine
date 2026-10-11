@@ -500,7 +500,7 @@ func TestRefreshAccountCannotPersistIntoReplacementIncarnation(t *testing.T) {
 		return &upstreamoauth.Tokens{AccessToken: "stale-access", RefreshToken: "stale-refresh"}, nil
 	}
 
-	if err := g.refreshAccount(ctx, first.Name, first.IncarnationID); !errors.Is(err, ErrAccountIncarnation) {
+	if err := g.refreshAccount(ctx, first.Name, first.IncarnationID, ""); !errors.Is(err, ErrAccountIncarnation) {
 		t.Fatalf("refresh error = %v, want ErrAccountIncarnation", err)
 	}
 	replacement, ok := g.store.Account(first.Name)
@@ -580,7 +580,7 @@ func TestRefreshAccountCannotOverwriteConcurrentReauthorization(t *testing.T) {
 	}
 
 	refreshDone := make(chan error, 1)
-	go func() { refreshDone <- g.refreshAccount(ctx, first.Name, first.IncarnationID) }()
+	go func() { refreshDone <- g.refreshAccount(ctx, first.Name, first.IncarnationID, "") }()
 	<-refreshEntered // the refresh now holds the per-account lock
 
 	reauthDone := make(chan error, 1)

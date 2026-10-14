@@ -21,6 +21,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -103,9 +104,11 @@ func runEngine(rootCtx context.Context) error {
 			log.Printf("engine: WARNING token encryption DISABLED for self-hosted development (set ENGINE_ENCRYPTION_KEY before storing real credentials)")
 		}
 		// Recover according to the persisted lifecycle. Calls whose deadline
-		// genuinely elapsed are expired; still-live rows are explicitly cancelled
-		// because their original MCP request died with the previous process and
-		// generic tool calls must never be replayed from stored arguments.
+		// genuinely elapsed are expired; still-live rows whose owning process
+		// stopped heartbeating are explicitly cancelled because their original
+		// MCP request died with that process and generic tool calls must never
+		// be replayed from stored arguments. Rows a live process (such as the
+		// revision still serving during a rollout) heartbeats stay parked.
 		if recovery, err := pg.RecoverPendingApprovals(runCtx, time.Now()); err != nil {
 			log.Printf("engine: recover interrupted pending approvals: %v", err)
 		} else if recovery.Expired > 0 || recovery.Cancelled > 0 {
@@ -122,6 +125,7 @@ func runEngine(rootCtx context.Context) error {
 		log.Printf("engine: using file account store (%s)", accountsPath)
 	}
 	var watchDone <-chan struct{}
+	budget := &shutdownBudget{}
 	// A future durable dependency (for example, the audit writer) can expose
 	// Shutdown(context.Context) and be drained here without changing the
 	// process lifecycle. PgStore currently exposes Close(), which remains the
@@ -130,7 +134,7 @@ func runEngine(rootCtx context.Context) error {
 		// A listener failure is also a terminal Engine condition. Cancel the
 		// watcher before closing its store, not only when the OS sends SIGTERM.
 		cancelRun()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), engineShutdownTimeout)
+		shutdownCtx, cancel := budget.context()
 		defer cancel()
 		if watchDone != nil {
 			select {
@@ -271,7 +275,9 @@ func runEngine(rootCtx context.Context) error {
 		return "", false
 	})
 	as.SetClientResourceAuthorizer(gw.MCPClientAllowsOAuthClient)
+	as.SetResourceProjectionReady(gw.ProjectionReady)
 	as.SetHostedConsentAuthorizer(gw.AuthorizeMCPConsent)
+	as.SetHostedConsentReplacer(gw.ReplaceMCPConsent)
 	// Self-hosted Engines have the same subject-bound delivery model, with their
 	// established local administrator as the single durable identity. This keeps
 	// a personal connection private even when Claude or Codex connects directly
@@ -282,9 +288,7 @@ func runEngine(rootCtx context.Context) error {
 	// callback avoids sweeping a newly recreated endpoint's grants.
 	gw.SetTokenRevoker(as.RevokeResource)
 	gw.SetTokenEpochRevoker(as.RevokeResourceAtEpoch)
-	mcpHandler := engine.LimitMCPRequestBody(
-		server.NewStreamableHTTPServer(s, server.WithEndpointPath("/mcp")),
-	)
+	mcpHandler := engine.LimitMCPRequestBody(engine.NewStreamableMCPHandler(s, "/mcp"))
 
 	mux := http.NewServeMux()
 	as.Routes(mux)
@@ -396,10 +400,30 @@ func runEngine(rootCtx context.Context) error {
 		return fmt.Errorf("listen on %s: %w", httpServer.Addr, err)
 	}
 	log.Printf("synaxis engine on :%s — issuer %s legacy_admin=%v", port, issuer, legacyAdmin)
-	return serveEngineHTTP(runCtx, httpServer, listener)
+	return serveEngineHTTP(runCtx, httpServer, listener, budget)
 }
 
-const engineShutdownTimeout = 25 * time.Second
+// engineShutdownTimeout is everything after SIGTERM: Cloud Run sends SIGKILL
+// 10s later. The HTTP drain and the watcher/store shutdown share this one
+// deadline, so an idle instance (the usual case) leaves it all to cleanup.
+const engineShutdownTimeout = 9 * time.Second
+
+// engineRequestDrainGrace is how long in-flight requests may finish on their
+// own after SIGTERM. Anything still running then — an MCP GET listening
+// stream never finishes on its own — has its context cancelled so it ends
+// cleanly instead of being cut by SIGKILL. A var so tests can shorten it.
+var engineRequestDrainGrace = 6 * time.Second
+
+// shutdownBudget starts the shared post-SIGTERM deadline on first use.
+type shutdownBudget struct {
+	once     sync.Once
+	deadline time.Time
+}
+
+func (b *shutdownBudget) context() (context.Context, context.CancelFunc) {
+	b.once.Do(func() { b.deadline = time.Now().Add(engineShutdownTimeout) })
+	return context.WithDeadline(context.Background(), b.deadline)
+}
 
 // newEngineHTTPServer intentionally leaves WriteTimeout unset. MCP Streamable
 // HTTP responses may remain open while a model consumes a result, so a generic
@@ -416,10 +440,18 @@ func newEngineHTTPServer(port string, handler http.Handler) *http.Server {
 // testable and to keep listener ownership explicit. On termination it first
 // stops accepting new requests, then lets active MCP streams drain within the
 // platform-safe shutdown budget.
-func serveEngineHTTP(ctx context.Context, httpServer *http.Server, listener net.Listener) error {
+func serveEngineHTTP(ctx context.Context, httpServer *http.Server, listener net.Listener, budget *shutdownBudget) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if budget == nil {
+		budget = &shutdownBudget{}
+	}
+	// Request contexts derive from requestsCtx so the drain below can end
+	// handlers that never return on their own.
+	requestsCtx, cancelRequests := context.WithCancel(context.Background())
+	defer cancelRequests()
+	httpServer.BaseContext = func(net.Listener) context.Context { return requestsCtx }
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- httpServer.Serve(listener)
@@ -433,8 +465,10 @@ func serveEngineHTTP(ctx context.Context, httpServer *http.Server, listener net.
 		return fmt.Errorf("serve HTTP: %w", err)
 	case <-ctx.Done():
 		log.Printf("engine: shutdown requested; draining active HTTP requests")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), engineShutdownTimeout)
+		shutdownCtx, cancel := budget.context()
 		defer cancel()
+		stopRequests := time.AfterFunc(engineRequestDrainGrace, cancelRequests)
+		defer stopRequests.Stop()
 		if err := httpServer.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			// Shutdown timed out or encountered a listener failure. Force close so
 			// the serving goroutine cannot outlive process teardown, but retain the

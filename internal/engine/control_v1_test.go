@@ -110,7 +110,7 @@ func TestControlV1MetaReportsContractVersionAndCapabilities(t *testing.T) {
 			t.Fatal(err)
 		}
 		if meta.ControlContract != "v1" || meta.EngineVersion != "2026.09.1" || meta.ProvisionGeneration != 7 ||
-			strings.Join(meta.Capabilities, ",") != "mcp-clients,profile-binding,activation-snapshot,run-correlations,library-artifacts,connection-evidence" {
+			strings.Join(meta.Capabilities, ",") != "mcp-clients,profile-binding,activation-snapshot,run-correlations,library-artifacts,connection-evidence,mcp-client-connections" {
 			t.Fatalf("%s meta=%+v", actor.role, meta)
 		}
 	}

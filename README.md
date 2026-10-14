@@ -155,22 +155,22 @@ authentication.
 
 | Methods | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/gateway`, `/api/health` | MCP endpoint metadata and per-connection health |
+| `GET` | `/api/gateway`, `/api/health` | MCP endpoint metadata and per-connection health (recorded rows, revalidated in the background; `X-Synaxis-Health-Refresh: 1` probes live) |
 | `GET` | `/api/logs`, `/api/logs/{id}` | Summary audit rows and one recorded call |
 | `POST` | `/api/logs/{id}/replay`, `/api/logs/{id}/triage` | Replay a recorded call or persist a triage decision |
 | `GET, POST` | `/api/servers` | List or create credential-bearing connections |
 | `PATCH, DELETE` | `/api/servers/{id}` | Update policy/ownership metadata or delete a connection |
 | `POST` | `/api/servers/{id}/connect` | Start upstream OAuth |
 | `PUT` | `/api/servers/{id}/token` | Store a bearer token for a token-auth connection |
-| `GET, PUT` | `/api/servers/{id}/tools` | Read or replace the connection's enabled-tool set |
-| `PUT` | `/api/servers/{id}/tools/{tool}` | Update one tool's alias, description, or enabled policy |
+| `GET, PUT` | `/api/servers/{id}/tools` | Read or replace the connection's enabled-tool set; a listing failure answers `{"error","code","recovery"}`: `409` `needs_auth`/`connect` or `auth_expired`/`reauthorize`, `504` `timeout`/`retry`, `502` `unreachable` or `error`/`retry` |
+| `PUT` | `/api/servers/{id}/tools/{tool}` | Update one tool's alias, description, or enabled policy (listing failures as above) |
 | `GET, POST` | `/api/connection-namespaces` | List visible credential folders or create a shared folder |
 | `GET, PATCH, DELETE` | `/api/connection-namespaces/{id}` | Read, rename, or delete a credential folder |
 | `GET, PUT` | `/api/connection-namespaces/{id}/managers` | Read or replace delegated manager subjects |
 | `PUT, DELETE` | `/api/connection-namespaces/{id}/managers/{subject}` | Grant or revoke one manager subject |
 | `GET, POST` | `/api/mcp-clients` | List or register subject-bound MCP clients |
 | `GET, PATCH` | `/api/mcp-clients/{id}` | Read or rename an MCP client registration |
-| `PUT` | `/api/mcp-clients/{id}/namespaces` | Replace an MCP client's connection-namespace grants |
+| `PUT` | `/api/mcp-clients/{id}/namespaces` | Replace an MCP client's folder and exact connection grants |
 | `POST` | `/api/mcp-clients/{id}/oauth-client/reset` | Clear a stale DCR binding and rotate the endpoint epoch |
 | `POST` | `/api/mcp-clients/{id}/revoke` | Revoke a scoped MCP client and its resource tokens |
 | `GET, POST` | `/api/connectors` | List or create curated virtual connectors |
@@ -459,22 +459,52 @@ IDs, and compare-and-swap revisions. A stale tab or delayed OAuth callback
 therefore cannot write policy or credentials across a move, delete/recreate,
 or concurrent manager revocation.
 
+### Each member's own account
+
+A manager can switch a shared connection to `memberCredentials`. Its account's
+own credential still lists the tools, but every tool call through a
+subject-bound MCP client uses the calling member's own upstream credential.
+Each member's actions upstream then show as that member, not as the account.
+
+- Members connect their own account under `/api/member-credentials`: OAuth
+  through `POST /api/member-credentials/{account}/connect`, which reuses the
+  account's OAuth client, or a token through `PUT .../token`. `DELETE
+  /api/member-credentials/{account}` disconnects it. A member sees only
+  connections that their own MCP clients may use or that they manage, and
+  only their own credential.
+- A call fails closed with an instruction when the member has not connected,
+  when it arrives on an endpoint without a subject (root `/mcp`, endpoint
+  bundles, connectors), or when it comes from a workload client. It never
+  falls back to the account's credential.
+- Member tokens refresh through `refreshAccount` under a per-member lock.
+  They are encrypted like the account's own and are deleted with the account.
+
 ## Subject-bound MCP client endpoints
 
 `/mcp/clients/{slug}` is a separate path namespace from shared
 `/mcp/{slug}` endpoints. An MCP client registration contains a stable endpoint
-slug, one Platform subject, and a set of connection-namespace IDs. It contains
+slug, one Platform subject, and folder or individual connection grants. It contains
 no bearer credential. The first approved OAuth consent binds the registration
 to one DCR client ID; replacing that binding requires an explicit reset.
 
 Owners and admins may authorize shared root and connector resources. Operators
 may authorize only a subject-bound MCP client registered to their exact
 subject. A scoped endpoint projects shared/service connections from its granted
-namespaces plus personal connections owned by the same subject. The Engine
+namespaces or individually selected connections, plus personal connections owned by the same subject. The Engine
 rechecks that boundary from durable state before listing tools and immediately
 before every tool call.
 
-Changing namespace grants, moving an account across an endpoint boundary,
+Engines advertising `mcp-client-connections` accept `connectionIds` beside
+`connectionNamespaceIds` during registration and atomic `PUT .../namespaces`
+updates. The scopes form a union. Selecting a connection grants no access to
+its siblings or future folder members. Exact grants pin the account incarnation;
+deleting and recreating the same name does not inherit access. Remove the old
+grant before explicitly selecting its replacement. Omitting `connectionIds` on
+an older namespace-only update preserves exact grants; an explicit empty array
+clears them. The management DTO contains names only, never incarnation bindings.
+The same subject and personal-credential restrictions apply to either scope.
+
+Changing folder or individual connection grants, moving an account across an endpoint boundary,
 resetting the OAuth binding, or revoking the client rotates its endpoint epoch.
 Tokens, authorization codes, and refresh grants minted for the prior epoch then
 fail closed. Slugs and tool prefixes remain stable.
@@ -586,6 +616,26 @@ digest, rechecks the current client/epoch/direct-run ownership atomically, and
 appends a new immutable pending version; it never overwrites content, follows a
 grant, mutates a handoff, or changes authority. Exact retry replays the prior
 result, while changed request-ID reuse or a stale head conflicts.
+Separate collaboration grants let people and agents review or edit the latest
+text/Markdown version. Owners/admins grant `view`, `comment`, or `edit`, with
+optional expiry and immediate revocation. Local clients use
+`library_collaboration_list` and `library_collaboration`; the grant pins their
+registration epoch. Comments retain their version and optional quotation.
+Edits require a request ID, expected version and digest, and create immutable
+pending versions. Existing exact-version handoffs and public snapshots remain
+unchanged. Collaboration grants do not confer publication or tool authority.
+
+An external guest or agent can receive a named bearer capability. The Engine
+stores only its hash and checks it on every operation. The public REST endpoint
+is `POST /api/public/artifacts/collaborate` (token in its JSON body); a restricted
+Streamable HTTP MCP endpoint is `/api/public/artifacts/mcp/{artifact}/{grant}`
+with `Authorization: Bearer <token>`. Its sole `artifact_collaborate` tool is
+pinned to that output. Treat output/comment text as untrusted context. The
+Console manages grants at `/api/library/artifacts/{id}/collaboration`; hosted
+control planes use the actor-asserted `/control/v1/library/collaboration` route.
+Neither endpoint returns engine credentials or makes a bearer label a verified
+human identity. FileStore and encrypted PgStore implement the same contract.
+
 `library_skill_resolve` (and the protected `POST /api/library/resolve`)
 selects an explicit binding or, per skill, the most-specific matching binding
 in the order `folder > repository > namespace > workspace`. It returns

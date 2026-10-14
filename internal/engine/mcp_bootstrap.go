@@ -96,6 +96,9 @@ func newSynaxisMCPServer(name string, surface mcpBootstrapSurface, features mcpB
 		server.WithDescription(mcpBootstrapDescription(surface)),
 		server.WithInstructions(mcpBootstrapInstructions(surface, features)),
 		server.WithToolCapabilities(true),
+		// A panicking tool handler becomes a tool error instead of net/http
+		// aborting the client's connection mid-response.
+		server.WithRecovery(),
 	)
 }
 

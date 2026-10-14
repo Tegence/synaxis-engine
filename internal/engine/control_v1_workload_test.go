@@ -477,7 +477,7 @@ func TestControlV1WorkloadTokenReportsForeignBindingsAndFailsClosed(t *testing.T
 	// reserved identity, even though the identity matches its binding.
 	interactive := decodeControlClient(t, h.control("usr_owner", "owner", http.MethodPost, "/control/v1/mcp-clients", `{"name":"Owner Codex","subject":"usr_owner"}`), http.StatusCreated)
 	corrupt(interactive.ID, "workload:"+interactive.ID)
-	if h.gateway.MCPClientAllowsOAuthClient("workload:"+interactive.ID, "/mcp/clients/"+interactive.Slug) {
+	if allowsOAuthClient(t, h.gateway, "workload:"+interactive.ID, "/mcp/clients/"+interactive.Slug) {
 		t.Fatal("an interactive client authorized a reserved workload identity")
 	}
 	if current, _ := h.store.MCPClient(ctx, interactive.ID); current.Kind != MCPClientKindInteractive {
@@ -493,7 +493,7 @@ func TestControlV1MetaAdvertisesWorkloadClientsOnlyWhenTokensCanBeMinted(t *test
 		if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &meta) != nil {
 			t.Fatalf("%s meta=%d body=%s", actor.role, response.Code, response.Body)
 		}
-		if got := strings.Join(meta.Capabilities, ","); got != "mcp-clients,profile-binding,activation-snapshot,run-correlations,library-artifacts,connection-evidence,workload-clients" {
+		if got := strings.Join(meta.Capabilities, ","); got != "mcp-clients,profile-binding,activation-snapshot,run-correlations,library-artifacts,connection-evidence,mcp-client-connections,workload-clients" {
 			t.Fatalf("%s capabilities=%s", actor.role, got)
 		}
 	}

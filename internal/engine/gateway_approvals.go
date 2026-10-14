@@ -22,6 +22,10 @@ const (
 	defaultApprovalTimeout       = 180 * time.Second
 	approvalDecisionPollInterval = 250 * time.Millisecond
 	approvalWriteTimeout         = 5 * time.Second
+	// A parked call's waiter heartbeats its durable row; boot recovery on
+	// another process cancels only rows that missed a few beats.
+	approvalHeartbeatInterval = 10 * time.Second
+	approvalOwnerStaleAfter   = 3 * approvalHeartbeatInterval
 )
 
 // approvalLog returns the store's ApprovalLog facet, if it has one (same
@@ -251,6 +255,8 @@ func (g *Gateway) WaitDecision(ctx context.Context, id string, timeout time.Dura
 	defer timer.Stop()
 	poll := time.NewTicker(approvalDecisionPollInterval)
 	defer poll.Stop()
+	heartbeat := time.NewTicker(approvalHeartbeatInterval)
+	defer heartbeat.Stop()
 
 	for {
 		select {
@@ -260,6 +266,8 @@ func (g *Gateway) WaitDecision(ctx context.Context, id string, timeout time.Dura
 			if resolved, approved, status := g.observeDurableDecision(ctx, id, ch); resolved {
 				return approved, status
 			}
+		case <-heartbeat.C:
+			g.heartbeatPending(ctx, id)
 		case <-timer.C:
 			return g.finishWait(ctx, id, ch, ApprovalExpired)
 		case <-ctx.Done():
@@ -290,6 +298,22 @@ func (g *Gateway) observeDurableDecision(ctx context.Context, id string, ch chan
 	default:
 		return false, false, ""
 	}
+}
+
+// heartbeatPending keeps another Engine process's boot recovery (for example
+// the next revision starting during a rollout) from cancelling a call this
+// process is still waiting on. FileStore is single-process and has no such
+// recovery. A failed beat is harmless until approvalOwnerStaleAfter elapses.
+func (g *Gateway) heartbeatPending(ctx context.Context, id string) {
+	hb, ok := g.store.(interface {
+		HeartbeatPending(ctx context.Context, id string) error
+	})
+	if !ok {
+		return
+	}
+	writeCtx, cancel := approvalWriteContext(ctx)
+	defer cancel()
+	_ = hb.HeartbeatPending(writeCtx, id)
 }
 
 // finishWait reaches the terminal state through the store's conditional

@@ -343,6 +343,10 @@ type hostedApprovalClaims struct {
 	JTI           string `json:"jti"`
 	ExpiresAt     int64  `json:"exp"`
 	Approved      bool   `json:"approved"`
+	// Replace is the member's explicit choice, on Platform's consent page, to
+	// move a subject-bound endpoint's binding to this OAuth client (see
+	// SetHostedConsentReplacer). It means nothing for shared resources.
+	Replace bool `json:"replace,omitempty"`
 }
 
 func (s *Server) verifyHostedApproval(assertion, requestToken string) (hostedApprovalClaims, error) {
@@ -582,9 +586,23 @@ func (s *Server) handleHostedConsentComplete(w http.ResponseWriter, r *http.Requ
 			oauthErr(w, http.StatusForbidden, "access_denied", "the resource owner is not permitted to authorize this client")
 			return
 		}
-		if err := s.hostedConsentAuthorizer(r.Context(), claims.Subject, claims.Role, request.clientID, request.resourcePath); err != nil {
+		authorize := s.hostedConsentAuthorizer
+		if claims.Replace && clientBoundResource(request.resourcePath) && s.hostedConsentReplacer != nil {
+			authorize = s.hostedConsentReplacer
+		}
+		if err := authorize(r.Context(), claims.Subject, claims.Role, request.clientID, request.resourcePath); err != nil {
 			releaseReservation()
-			oauthErr(w, http.StatusForbidden, "access_denied", "the resource owner is not permitted to authorize this client")
+			switch {
+			case errors.Is(err, ErrAuthorizationStateUnavailable):
+				unavailable(w)
+			case errors.Is(err, ErrClientBoundToOtherApp):
+				// Platform reads this header to tell the member what to do
+				// (reset the agent's connection) instead of "unavailable".
+				w.Header().Set(ConsentReasonHeader, ConsentReasonClientBound)
+				oauthErr(w, http.StatusForbidden, "access_denied", "this agent endpoint is already connected to another app")
+			default:
+				oauthErr(w, http.StatusForbidden, "access_denied", "the resource owner is not permitted to authorize this client")
+			}
 			return
 		}
 	} else if claims.Approved && clientBoundResource(request.resourcePath) {

@@ -64,7 +64,7 @@ const (
 // controlCapabilities advertises the v1 resource groups this Engine build
 // serves. Absence of a route is still the downgrade signal; this list lets a
 // control plane confirm positively before it relies on a group.
-var controlCapabilities = []string{"mcp-clients", "profile-binding", "activation-snapshot", "run-correlations", "library-artifacts", "connection-evidence"}
+var controlCapabilities = []string{"mcp-clients", "profile-binding", "activation-snapshot", "run-correlations", "library-artifacts", "connection-evidence", "mcp-client-connections"}
 
 // controlCapabilityWorkloadClients is advertised only when this Engine can
 // actually mint workload tokens (see ConsoleAPI.workloadTokensAvailable): a

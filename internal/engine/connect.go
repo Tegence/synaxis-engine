@@ -38,6 +38,9 @@ type pendingConnect struct {
 	accountExisted                   bool
 	accountPrecondition              OAuthCompletionPrecondition
 	staticClient                     bool
+	// memberSubject is set when a member connects their own account to an
+	// account in member-credential mode; incarnationID pins that account.
+	memberSubject, incarnationID string
 }
 
 func (p *pendingConnect) persistedScope() string {
@@ -194,6 +197,46 @@ func (c *Connector) StartConnect(ctx context.Context, name, label, group, url, r
 	return upstreamoauth.AuthorizeURL(meta, ci.ClientID, redirectURI, pkce.Challenge, state, scope, authorizationExtras), nil
 }
 
+// StartMemberConnect begins one member's own authorization of an account in
+// member-credential mode. It reuses the account's OAuth client, because the
+// member's tokens are later refreshed with that client.
+func (c *Connector) StartMemberConnect(ctx context.Context, account Account, subject, redirectURI string) (string, error) {
+	if account.AuthMode != "oauth" || account.ClientID == "" || account.IncarnationID == "" {
+		return "", errors.New("connect this account once before members connect their own")
+	}
+	meta, err := upstreamoauth.Discover(ctx, account.URL)
+	if err != nil {
+		return "", fmt.Errorf("discover: %w", err)
+	}
+	ci, err := upstreamoauth.StaticClient(account.ClientID, account.ClientSecret)
+	if err != nil {
+		return "", fmt.Errorf("client: %w", err)
+	}
+	scope := meta.Scope
+	var extras map[string]string
+	if sc := effectiveStaticCreds(nil, account, true, account.URL); sc != nil {
+		scope, extras = sc.Scope, sc.AuthorizationExtras
+	}
+	pkce, state, err := upstreamoauth.NewPKCE()
+	if err != nil {
+		return "", err
+	}
+	c.mu.Lock()
+	for k, v := range c.pend {
+		if time.Since(v.created) > pendingConnectTTL {
+			delete(c.pend, k)
+		}
+	}
+	c.pend[state] = &pendingConnect{
+		name: account.Name, url: account.URL,
+		clientID: ci.ClientID, clientSecret: ci.ClientSecret, verifier: pkce.Verifier,
+		scope: scope, meta: meta, redirectURI: redirectURI, created: time.Now(),
+		memberSubject: subject, incarnationID: account.IncarnationID,
+	}
+	c.mu.Unlock()
+	return upstreamoauth.AuthorizeURL(meta, ci.ClientID, redirectURI, pkce.Challenge, state, scope, extras), nil
+}
+
 // FinishConnect: the OAuth callback — exchange the code, persist the account,
 // and register its tools live (no restart needed).
 func (c *Connector) FinishConnect(ctx context.Context, state, code string) (string, int, error) {
@@ -214,6 +257,16 @@ func (c *Connector) FinishConnect(ctx context.Context, state, code string) (stri
 	tokens, err := exchange(ctx, p.meta, code, p.redirectURI, p.clientID, p.clientSecret, p.verifier)
 	if err != nil {
 		return "", 0, fmt.Errorf("exchange: %w", err)
+	}
+	if p.memberSubject != "" {
+		// A member's own credential changes no tools: nothing to re-aggregate.
+		if err := c.gw.PutMemberCredentialLocked(ctx, MemberCredential{
+			Account: p.name, IncarnationID: p.incarnationID, Subject: p.memberSubject,
+			AccessToken: tokens.AccessToken, RefreshToken: tokens.RefreshToken,
+		}); err != nil {
+			return "", 0, fmt.Errorf("store: %w", err)
+		}
+		return p.name, 0, nil
 	}
 	completion := Account{
 		Name: p.name, URL: p.url, AuthMode: "oauth",

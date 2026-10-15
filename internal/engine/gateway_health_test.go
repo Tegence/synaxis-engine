@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -319,8 +320,14 @@ func TestWatchTickProgressesPastHungProvider(t *testing.T) {
 	if got := hungCalls.Load(); got != 1 {
 		t.Fatalf("hung provider probes across two watch ticks = %d, want one", got)
 	}
-	if got := healthyCalls.Load(); got != 2 {
-		t.Fatalf("healthy provider probes across two watch ticks = %d, want two", got)
+	// Two probes, plus one aggregation in the first tick: the healthy account
+	// was never projected, and its successful probe lets the reconcile restore
+	// it. The hung account's failed probe keeps the reconcile away from it.
+	if got := healthyCalls.Load(); got != 3 {
+		t.Fatalf("healthy provider calls across two watch ticks = %d, want two probes and one restore", got)
+	}
+	if g.mcp.GetTool("healthy__search") == nil {
+		t.Fatal("watch tick did not restore the healthy account's tools")
 	}
 }
 
@@ -336,12 +343,14 @@ func TestHealthAlertNeverIncludesProviderDetail(t *testing.T) {
 	g := newConnectorTestGateway(t, nil)
 	g.SetAlertWebhook(webhook.URL)
 	const secret = "provider-secret-do-not-alert"
-	g.evalAlert(AccountHealth{
+	row := AccountHealth{
 		UUID:     "notion",
 		Status:   healthStatusUnreachable,
 		Detail:   secret,
 		Recovery: secret,
-	})
+	}
+	g.evalAlerts(context.Background(), []AccountHealth{row})
+	g.evalAlerts(context.Background(), []AccountHealth{row}) // transient: alerts on the second failed probe
 
 	select {
 	case body := <-received:
@@ -356,12 +365,94 @@ func TestHealthAlertNeverIncludesProviderDetail(t *testing.T) {
 	}
 }
 
+func countAlerts(logs *syncLogBuffer, kind string) int {
+	return strings.Count(logs.String(), kind)
+}
+
+func TestHealthAlertWaitsForSecondConsecutiveTransientFailure(t *testing.T) {
+	g := newConnectorTestGateway(t, nil)
+	logs := captureEngineLog(t)
+	sweep := func(slow string) {
+		g.evalAlerts(context.Background(), []AccountHealth{
+			{UUID: "healthy", Status: healthStatusOK},
+			{UUID: "slow", Status: slow},
+		})
+	}
+
+	sweep(healthStatusTimeout)
+	sweep(healthStatusOK) // a one-off blip recovers silently
+	sweep(healthStatusTimeout)
+	if n := countAlerts(logs, "needs attention"); n != 0 {
+		t.Fatalf("single failed probes raised %d alert(s), want none:\n%s", n, logs)
+	}
+	sweep(healthStatusUnreachable)
+	if n := countAlerts(logs, `account "slow" needs attention (unreachable)`); n != 1 {
+		t.Fatalf("second consecutive failure raised %d alert(s), want one:\n%s", n, logs)
+	}
+	sweep(healthStatusTimeout)
+	sweep(healthStatusOK)
+	if countAlerts(logs, "needs attention") != 1 || countAlerts(logs, `account "slow" recovered`) != 1 {
+		t.Fatalf("sustained outage should alert once then recover once:\n%s", logs)
+	}
+}
+
+func TestHealthAlertIgnoresSweepWhereEveryProbeTimedOut(t *testing.T) {
+	g := newConnectorTestGateway(t, nil)
+	logs := captureEngineLog(t)
+	for i := 0; i < 3; i++ { // a throttled cold-start Engine, woken repeatedly
+		g.evalAlerts(context.Background(), []AccountHealth{
+			{UUID: "linear", Status: healthStatusTimeout},
+			{UUID: "notion", Status: healthStatusTimeout},
+			{UUID: "figma", Status: healthStatusNeedsAuth}, // not probed: still alerts
+		})
+	}
+	if n := countAlerts(logs, "needs attention"); n != 1 || countAlerts(logs, `account "figma" needs attention (needs_auth)`) != 1 {
+		t.Fatalf("Engine-wide timeout sweeps raised %d alert(s), want only figma's:\n%s", n, logs)
+	}
+}
+
+func TestHealthAlertIsNotRepeatedAfterEngineRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "accounts.json")
+	logs := captureEngineLog(t)
+	// Each sweep runs on a freshly booted Engine over the same store, as a
+	// scale-to-zero Engine does when the Platform wakes it.
+	sweepAfterRestart := func(rows ...AccountHealth) {
+		fs, err := LoadFileStore(path)
+		if err != nil {
+			t.Fatalf("file store: %v", err)
+		}
+		NewGateway(fs, server.NewMCPServer("test", "0.0.0")).evalAlerts(context.Background(), rows)
+	}
+	figma := AccountHealth{UUID: "figma", Status: healthStatusNeedsAuth}
+
+	sweepAfterRestart(figma)
+	sweepAfterRestart(figma)
+	if n := countAlerts(logs, "needs attention"); n != 1 {
+		t.Fatalf("persistent needs_auth alerted %d time(s) across a restart, want once:\n%s", n, logs)
+	}
+	sweepAfterRestart(AccountHealth{UUID: "figma", Status: healthStatusOK})
+	if n := countAlerts(logs, `account "figma" recovered`); n != 1 {
+		t.Fatalf("recovery after restart alerted %d time(s), want once:\n%s", n, logs)
+	}
+	sweepAfterRestart(figma)
+	sweepAfterRestart() // account deleted: its alert state goes with it
+	sweepAfterRestart(figma)
+	if n := countAlerts(logs, "needs attention"); n != 3 {
+		t.Fatalf("re-broken and re-created account alerts = %d, want 3 total:\n%s", n, logs)
+	}
+}
+
 func TestConsoleHealthDefensivelyNormalizesProviderDetail(t *testing.T) {
 	mux, token, g := newConnectorConsole(t, map[string][]string{"linear": nil})
 	const secret = "provider-secret-do-not-return"
 	g.listTools = func(_ context.Context, _ Account) ([]mcp.Tool, error) {
 		return nil, errors.New("upstream request failed: " + secret)
 	}
+	// Setup's aggregation recorded its successful listing as the account's
+	// health; forget it so this poll probes the now-failing provider.
+	g.healthCacheMu.Lock()
+	g.healthCache = map[string]cachedAccountHealth{}
+	g.healthCacheMu.Unlock()
 
 	rec, _ := doJSON(t, mux, token, http.MethodGet, "/api/health", "")
 	if rec.Code != http.StatusOK {
@@ -478,15 +569,35 @@ func TestHealthReprobesAfterCacheExpiry(t *testing.T) {
 		probeCalls.Add(1)
 		return []mcp.Tool{mcp.NewTool(a.Name + "__search")}, nil
 	}
+	notion, _ := g.store.Account("notion")
 
 	g.Health(context.Background())
+	first, _ := g.cachedHealth(notion)
 	time.Sleep(100 * time.Millisecond)
+	// Past the TTL the recorded row is still answered at once; the re-probe
+	// runs in the background and lands in the cache.
 	row := healthRowsByAccount(g.Health(context.Background()))["notion"]
+	if row.Status != healthStatusOK {
+		t.Fatalf("health after TTL expiry = %+v, want the recorded ok row", row)
+	}
+	waitFor(t, "background re-probe after TTL expiry", func() bool {
+		entry, ok := g.cachedHealth(notion)
+		return ok && entry.probedAt.After(first.probedAt)
+	})
 	if got := probeCalls.Load(); got != 2 {
 		t.Fatalf("poll after TTL expiry started %d upstream probes total, want two", got)
 	}
-	if row.Status != healthStatusOK {
-		t.Fatalf("health after re-probe = %+v, want ok", row)
+}
+
+// waitFor polls cond until it holds, failing the test after a second.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
@@ -648,5 +759,355 @@ func TestHealthAbandonedSharerNeverPoisonsCache(t *testing.T) {
 	row, ok := g.cachedHealthRow(notion, g.healthCacheTTL)
 	if !ok || row.Status != healthStatusOK {
 		t.Fatalf("final cached row = %+v (ok=%v), want a cached healthy outcome", row, ok)
+	}
+}
+
+// TestHealthServesStaleRowWhileOneBackgroundProbeRevalidates: past the TTL a
+// poll answers at once from the recorded row, with its real CheckedAt, while
+// a single background probe — shared by every poll meanwhile — refreshes it.
+func TestHealthServesStaleRowWhileOneBackgroundProbeRevalidates(t *testing.T) {
+	g := newConnectorTestGateway(t, map[string][]string{"notion": nil})
+	g.healthCacheTTL = 20 * time.Millisecond
+	release := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	var probeCalls atomic.Int32
+	g.listTools = func(_ context.Context, a Account) ([]mcp.Tool, error) {
+		if probeCalls.Add(1) == 1 {
+			return []mcp.Tool{mcp.NewTool(a.Name + "__search")}, nil
+		}
+		<-release // the revalidating provider is slow
+		return []mcp.Tool{mcp.NewTool(a.Name + "__search"), mcp.NewTool(a.Name + "__fetch")}, nil
+	}
+	notion, _ := g.store.Account("notion")
+
+	first := healthRowsByAccount(g.Health(context.Background()))["notion"]
+	time.Sleep(40 * time.Millisecond)
+	for range 5 {
+		started := time.Now()
+		row := healthRowsByAccount(g.Health(context.Background()))["notion"]
+		if elapsed := time.Since(started); elapsed > 200*time.Millisecond {
+			t.Fatalf("a stale row waited %s for the provider", elapsed)
+		}
+		if row.ToolCount != 1 || row.CheckedAt != first.CheckedAt {
+			t.Fatalf("stale poll = %+v, want the recorded row %+v", row, first)
+		}
+	}
+	waitFor(t, "the background revalidation", func() bool { return probeCalls.Load() == 2 })
+	time.Sleep(20 * time.Millisecond)
+	if got := probeCalls.Load(); got != 2 {
+		t.Fatalf("five stale polls started %d probes, want one shared revalidation", got-1)
+	}
+
+	close(release)
+	waitFor(t, "the revalidated row", func() bool {
+		entry, ok := g.cachedHealth(notion)
+		return ok && entry.row.ToolCount == 2
+	})
+	if row := healthRowsByAccount(g.Health(context.Background()))["notion"]; row.ToolCount != 2 {
+		t.Fatalf("poll after revalidation = %+v, want the refreshed row", row)
+	}
+}
+
+// TestHealthOwnerCancellationNeverPoisonsOtherViewers: the request that
+// starts a shared probe (a browser reload, a proxy timeout) must not cancel
+// it, nor have its own cancellation recorded as the account's health. This
+// used to cache context.Canceled as "unreachable" for every other viewer.
+func TestHealthOwnerCancellationNeverPoisonsOtherViewers(t *testing.T) {
+	g := newConnectorTestGateway(t, map[string][]string{"notion": nil})
+	g.healthCacheTTL = time.Minute
+	release := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	started := make(chan struct{})
+	var startedOnce sync.Once
+	var probeCalls atomic.Int32
+	g.listTools = func(ctx context.Context, a Account) ([]mcp.Tool, error) {
+		probeCalls.Add(1)
+		startedOnce.Do(func() { close(started) })
+		select {
+		case <-release:
+			return []mcp.Tool{mcp.NewTool(a.Name + "__search")}, nil
+		case <-ctx.Done(): // a well-behaved transport honours cancellation
+			return nil, ctx.Err()
+		}
+	}
+	notion, _ := g.store.Account("notion")
+
+	ownerCtx, cancelOwner := context.WithCancel(context.Background())
+	ownerDone := make(chan []AccountHealth, 1)
+	go func() { ownerDone <- g.Health(ownerCtx) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("owner probe did not start")
+	}
+	cancelOwner()
+	select {
+	case rows := <-ownerDone:
+		if got := healthRowsByAccount(rows)["notion"]; got.Status == "" {
+			t.Fatalf("cancelled owner got an empty row: %+v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancelled owner did not return")
+	}
+	if row, ok := g.cachedHealthRow(notion, g.healthCacheTTL); ok {
+		t.Fatalf("owner cancellation was recorded as the account's health: %+v", row)
+	}
+
+	// Another viewer shares the probe the owner started, which runs on.
+	viewer := make(chan []AccountHealth, 1)
+	go func() { viewer <- g.Health(context.Background()) }()
+	time.Sleep(50 * time.Millisecond) // let it join, as the sharing tests above do
+	close(release)
+	select {
+	case rows := <-viewer:
+		if got := healthRowsByAccount(rows)["notion"]; got.Status != healthStatusOK || got.ToolCount != 1 {
+			t.Fatalf("other viewer = %+v, want the probe's real healthy outcome", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("other viewer did not complete")
+	}
+	if row, ok := g.cachedHealthRow(notion, g.healthCacheTTL); !ok || row.Status != healthStatusOK {
+		t.Fatalf("recorded row = %+v (ok=%v), want the healthy outcome", row, ok)
+	}
+	if got := probeCalls.Load(); got != 1 {
+		t.Fatalf("provider probed %d times, want the one shared probe", got)
+	}
+}
+
+// TestHealthWatchTickRecordsItsProbesForTheConsole: the watch loop keeps
+// alerting on fresh probes, and the console then reads what it observed
+// instead of dialing every provider again.
+func TestHealthWatchTickRecordsItsProbesForTheConsole(t *testing.T) {
+	g := newConnectorTestGateway(t, map[string][]string{"notion": nil, "linear": nil})
+	var probeCalls atomic.Int32
+	g.listTools = func(_ context.Context, a Account) ([]mcp.Tool, error) {
+		probeCalls.Add(1)
+		if a.Name == "linear" {
+			return nil, transport.ErrAuthorizationRequired
+		}
+		return []mcp.Tool{mcp.NewTool(a.Name + "__search")}, nil
+	}
+
+	g.tick(context.Background())
+	after := probeCalls.Load()
+	rows := healthRowsByAccount(g.Health(context.Background()))
+	if got := probeCalls.Load(); got != after {
+		t.Fatalf("console poll after a tick dialed %d providers, want none", got-after)
+	}
+	if rows["notion"].Status != healthStatusOK || rows["linear"].Status != healthStatusAuthExpired {
+		t.Fatalf("console rows after a tick = %+v", rows)
+	}
+}
+
+// TestHealthBackgroundTimeoutNeverReplacesAHealthyRow: on Cloud Run a probe
+// no request waits on runs CPU-throttled and times out spuriously, so its
+// timeout keeps the healthy row. A foreground timeout, or any definitive
+// failure, replaces it.
+func TestHealthBackgroundTimeoutNeverReplacesAHealthyRow(t *testing.T) {
+	g := newConnectorTestGateway(t, map[string][]string{"notion": nil})
+	g.healthProbeTimeout = 20 * time.Millisecond
+	var mode atomic.Value // "ok" | "slow" | "down"
+	mode.Store("ok")
+	g.listTools = func(ctx context.Context, a Account) ([]mcp.Tool, error) {
+		switch mode.Load() {
+		case "slow":
+			<-ctx.Done()
+			return nil, ctx.Err()
+		case "down":
+			return nil, errors.New("upstream returned 502")
+		}
+		return []mcp.Tool{mcp.NewTool(a.Name + "__search")}, nil
+	}
+	notion, _ := g.store.Account("notion")
+	recorded := func() AccountHealth {
+		t.Helper()
+		entry, ok := g.cachedHealth(notion)
+		if !ok {
+			t.Fatal("no recorded row")
+		}
+		return entry.row
+	}
+
+	if row := healthRowsByAccount(g.Health(context.Background()))["notion"]; row.Status != healthStatusOK {
+		t.Fatalf("seed health = %+v", row)
+	}
+	mode.Store("slow")
+	// The watch loop still sees the timeout for alerting...
+	if row := g.liveHealth(context.Background(), []Account{notion})[0]; row.Status != healthStatusTimeout {
+		t.Fatalf("background probe = %+v, want timeout", row)
+	}
+	// ...but the console keeps the healthy row.
+	if row := recorded(); row.Status != healthStatusOK {
+		t.Fatalf("background timeout replaced the healthy row: %+v", row)
+	}
+	// A request waiting on the probe makes its timeout real.
+	if row := g.ProbeHealthFor(context.Background(), []Account{notion})[0]; row.Status != healthStatusTimeout {
+		t.Fatalf("foreground probe = %+v, want timeout", row)
+	}
+	if row := recorded(); row.Status != healthStatusTimeout {
+		t.Fatalf("foreground timeout was not recorded: %+v", row)
+	}
+
+	mode.Store("ok")
+	g.ProbeHealthFor(context.Background(), []Account{notion})
+	mode.Store("down")
+	if row := g.liveHealth(context.Background(), []Account{notion})[0]; row.Status != healthStatusUnreachable {
+		t.Fatalf("background probe = %+v, want unreachable", row)
+	}
+	if row := recorded(); row.Status != healthStatusUnreachable {
+		t.Fatalf("a definitive background failure kept the healthy row: %+v", row)
+	}
+}
+
+// TestHealthFailedRowNeedsExactCredentials: refresh-ahead rotates OAuth
+// tokens on every tick, and a healthy row survives that. A failed row
+// describes only the credentials it failed with, so a reconnect gets a live
+// probe.
+func TestHealthFailedRowNeedsExactCredentials(t *testing.T) {
+	ctx := context.Background()
+	g := newConnectorTestGateway(t, nil)
+	if err := g.store.Upsert(ctx, Account{
+		Name: "notion", URL: "https://notion.example/mcp", AuthMode: "oauth",
+		AccessToken: "access-1", RefreshToken: "refresh-1", TokenEndpoint: "https://notion.example/token",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	notion, _ := g.store.Account("notion")
+	var failing atomic.Bool
+	var probeCalls atomic.Int32
+	g.listTools = func(_ context.Context, a Account) ([]mcp.Tool, error) {
+		probeCalls.Add(1)
+		if failing.Load() {
+			return nil, transport.ErrAuthorizationRequired
+		}
+		return []mcp.Tool{mcp.NewTool(a.Name + "__search")}, nil
+	}
+	rotate := func(access, refresh string) {
+		t.Helper()
+		if err := g.store.UpdateTokens(ctx, notion.Name, notion.IncarnationID, access, refresh); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	g.Health(ctx)
+	rotate("access-2", "refresh-2") // refresh-ahead
+	if row := healthRowsByAccount(g.Health(ctx))["notion"]; row.Status != healthStatusOK || probeCalls.Load() != 1 {
+		t.Fatalf("after a token rotation: row %+v, %d probes; want the healthy row without a probe", row, probeCalls.Load())
+	}
+
+	failing.Store(true)
+	rotated, _ := g.store.Account("notion")
+	g.ProbeHealthFor(ctx, []Account{rotated})
+	if row := healthRowsByAccount(g.Health(ctx))["notion"]; row.Status != healthStatusAuthExpired || probeCalls.Load() != 2 {
+		t.Fatalf("same credentials: row %+v, %d probes; want the recorded failure", row, probeCalls.Load())
+	}
+
+	failing.Store(false)
+	rotate("access-3", "refresh-3") // a reconnect
+	if row := healthRowsByAccount(g.Health(ctx))["notion"]; row.Status != healthStatusOK || probeCalls.Load() != 3 {
+		t.Fatalf("after reconnecting: row %+v, %d probes; want a live healthy probe", row, probeCalls.Load())
+	}
+}
+
+// TestHealthPastMaxStalenessWaitsForALiveProbe: a row older than the stale
+// limit is not served; the poll waits for a live probe instead.
+func TestHealthPastMaxStalenessWaitsForALiveProbe(t *testing.T) {
+	g := newConnectorTestGateway(t, map[string][]string{"notion": nil})
+	g.healthCacheTTL = 10 * time.Millisecond
+	g.healthMaxStaleness = 50 * time.Millisecond
+	var probeCalls atomic.Int32
+	g.listTools = func(_ context.Context, a Account) ([]mcp.Tool, error) {
+		tools := make([]mcp.Tool, probeCalls.Add(1))
+		for i := range tools {
+			tools[i] = mcp.NewTool(fmt.Sprintf("%s__tool%d", a.Name, i))
+		}
+		return tools, nil
+	}
+
+	g.Health(context.Background())
+	time.Sleep(80 * time.Millisecond)
+	row := healthRowsByAccount(g.Health(context.Background()))["notion"]
+	if row.ToolCount != 2 || probeCalls.Load() != 2 {
+		t.Fatalf("poll past the stale limit = %+v after %d probes, want the live second probe", row, probeCalls.Load())
+	}
+}
+
+// TestConsoleHealthRefreshHeaderProbesLive: the console's "probe now" sends
+// X-Synaxis-Health-Refresh: 1 and gets live probes — shared between
+// concurrent requests — even while a fresh row is recorded; a plain poll
+// keeps reading the recorded row.
+func TestConsoleHealthRefreshHeaderProbesLive(t *testing.T) {
+	mux, token, g := newConnectorConsole(t, map[string][]string{"linear": {"get_issue"}})
+	release := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	var probeCalls atomic.Int32
+	g.listTools = func(_ context.Context, a Account) ([]mcp.Tool, error) {
+		probeCalls.Add(1)
+		<-release
+		return []mcp.Tool{mcp.NewTool(a.Name + "__get_issue"), mcp.NewTool(a.Name + "__save_issue")}, nil
+	}
+	toolCount := func(rec *httptest.ResponseRecorder) int {
+		t.Helper()
+		var rows []AccountHealth
+		if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &rows) != nil || len(rows) != 1 {
+			t.Fatalf("GET /api/health = %d %s", rec.Code, rec.Body)
+		}
+		return rows[0].ToolCount
+	}
+
+	// Setup's aggregation recorded one tool: a plain poll answers from it.
+	if rec, _ := doJSON(t, mux, token, http.MethodGet, "/api/health", ""); toolCount(rec) != 1 || probeCalls.Load() != 0 {
+		t.Fatalf("plain poll probed %d times, want the recorded row", probeCalls.Load())
+	}
+
+	refresh := map[string]string{healthRefreshHeader: "1"}
+	results := make(chan *httptest.ResponseRecorder, 2)
+	for range 2 {
+		go func() {
+			rec, _ := doJSONWithHeaders(t, mux, token, http.MethodGet, "/api/health", "", refresh)
+			results <- rec
+		}()
+	}
+	waitFor(t, "the live probe", func() bool { return probeCalls.Load() == 1 })
+	// The same handoff margin TestHealthSharesInFlightProbeAcrossConcurrentCallers
+	// relies on: let the second request join the in-flight probe.
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	for range 2 {
+		if got := toolCount(<-results); got != 2 {
+			t.Fatalf("probe-now row has %d tools, want the live probe's 2", got)
+		}
+	}
+	if got := probeCalls.Load(); got != 1 {
+		t.Fatalf("two concurrent probe-now requests dialed %d times, want one shared probe", got)
+	}
+	// The live result was recorded for every later plain poll.
+	if rec, _ := doJSON(t, mux, token, http.MethodGet, "/api/health", ""); toolCount(rec) != 2 || probeCalls.Load() != 1 {
+		t.Fatalf("plain poll after probe-now dialed again or missed its result")
+	}
+
+	preflight := httptest.NewRequest(http.MethodOptions, "/api/health", nil)
+	recorder := httptest.NewRecorder()
+	mux.ServeHTTP(recorder, preflight)
+	if !strings.Contains(recorder.Header().Get("Access-Control-Allow-Headers"), healthRefreshHeader) {
+		t.Fatalf("CORS preflight does not allow %s: %q", healthRefreshHeader, recorder.Header().Get("Access-Control-Allow-Headers"))
 	}
 }

@@ -407,6 +407,7 @@ func TestPlatformServiceActorAllowsOnlyExactControlV1ServiceRoutes(t *testing.T)
 	}{
 		{name: "meta", method: http.MethodGet, path: "/control/v1/meta"},
 		{name: "run correlations", method: http.MethodGet, path: "/control/v1/run-correlations"},
+		{name: "lifecycle state", method: http.MethodGet, path: clientPath + "/lifecycle-state"},
 		{name: "activation snapshot", method: http.MethodGet, path: clientPath + "/activation-snapshot"},
 		{name: "bind profile", method: http.MethodPut, path: clientPath + "/profile-binding", body: bindingBody},
 		{name: "unbind profile", method: http.MethodDelete, path: clientPath + "/profile-binding", body: []byte(`{"revision":2}`)},
@@ -439,6 +440,9 @@ func TestPlatformServiceActorAllowsOnlyExactControlV1ServiceRoutes(t *testing.T)
 		{name: "revoke", method: http.MethodPost, path: clientPath + "/revoke"},
 		{name: "wrong binding method", method: http.MethodPost, path: clientPath + "/profile-binding"},
 		{name: "wrong snapshot method", method: http.MethodPost, path: clientPath + "/activation-snapshot"},
+		{name: "wrong lifecycle method", method: http.MethodPost, path: clientPath + "/lifecycle-state"},
+		{name: "unsafe lifecycle identifier", method: http.MethodGet, path: "/control/v1/mcp-clients/mcpcli~123/lifecycle-state"},
+		{name: "extra lifecycle segment", method: http.MethodGet, path: clientPath + "/lifecycle-state/extra"},
 		{name: "wrong meta method", method: http.MethodPost, path: "/control/v1/meta"},
 		{name: "wrong feed method", method: http.MethodPost, path: "/control/v1/run-correlations"},
 		{name: "feed sub-resource", method: http.MethodGet, path: "/control/v1/run-correlations/lrc_1"},

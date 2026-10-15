@@ -477,7 +477,7 @@ func TestControlV1WorkloadTokenReportsForeignBindingsAndFailsClosed(t *testing.T
 	// reserved identity, even though the identity matches its binding.
 	interactive := decodeControlClient(t, h.control("usr_owner", "owner", http.MethodPost, "/control/v1/mcp-clients", `{"name":"Owner Codex","subject":"usr_owner"}`), http.StatusCreated)
 	corrupt(interactive.ID, "workload:"+interactive.ID)
-	if h.gateway.MCPClientAllowsOAuthClient("workload:"+interactive.ID, "/mcp/clients/"+interactive.Slug) {
+	if allowsOAuthClient(t, h.gateway, "workload:"+interactive.ID, "/mcp/clients/"+interactive.Slug) {
 		t.Fatal("an interactive client authorized a reserved workload identity")
 	}
 	if current, _ := h.store.MCPClient(ctx, interactive.ID); current.Kind != MCPClientKindInteractive {
@@ -493,7 +493,7 @@ func TestControlV1MetaAdvertisesWorkloadClientsOnlyWhenTokensCanBeMinted(t *test
 		if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &meta) != nil {
 			t.Fatalf("%s meta=%d body=%s", actor.role, response.Code, response.Body)
 		}
-		if got := strings.Join(meta.Capabilities, ","); got != "mcp-clients,profile-binding,activation-snapshot,run-correlations,library-artifacts,connection-evidence,workload-clients" {
+		if got := strings.Join(meta.Capabilities, ","); got != "mcp-clients,profile-binding,activation-snapshot,run-correlations,library-artifacts,connection-evidence,mcp-client-connections,workload-clients,linked-workload-clients" {
 			t.Fatalf("%s capabilities=%s", actor.role, got)
 		}
 	}
@@ -555,5 +555,109 @@ func TestSelfHostedLocalAdminCreatesWorkloadClientsButCannotMintTokens(t *testin
 	expectControlProblem(t, request(http.MethodPost, workloadTokenPath(created.ID), "{}"), http.StatusForbidden, controlCodeForbidden)
 	if issued != 0 {
 		t.Fatalf("issuer called %d times for a non-service actor", issued)
+	}
+}
+
+// Exercise the hosted assertion boundary that a mocked Platform binder cannot
+// cover: reconciliation must use the closed lifecycle-state service route.
+func TestControlV1LinkedWorkloadServiceLifecycleRead(t *testing.T) {
+	h := newWorkloadConsole(t)
+	source := decodeControlClient(t, h.control("usr_owner", "owner", http.MethodPost, "/control/v1/mcp-clients",
+		`{"name":"Existing Codex","slug":"existing-codex","subject":"usr_operator","connectionNamespaceIds":["`+h.team.ID+`"]}`), http.StatusCreated)
+	path := "/control/v1/mcp-clients/" + source.ID
+	readState := func(want MCPClientStatus, revision int64) {
+		t.Helper()
+		response := h.control(platformServiceActorID, "service", http.MethodGet, path+"/lifecycle-state", "")
+		if response.Code != http.StatusOK {
+			t.Fatalf("source lifecycle read=%d body=%s", response.Code, response.Body)
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(response.Body.Bytes(), &fields); err != nil {
+			t.Fatal(err)
+		}
+		if len(fields) != 5 {
+			t.Fatalf("lifecycle read exposed extra client fields: %s", response.Body)
+		}
+		var state controlClientLifecycleStateDTO
+		if err := json.Unmarshal(response.Body.Bytes(), &state); err != nil {
+			t.Fatal(err)
+		}
+		if state.ID != source.ID || state.Kind != MCPClientKindInteractive || state.Subject != source.Subject || state.Status != want || state.Revision != revision {
+			t.Fatalf("lifecycle state=%+v", state)
+		}
+	}
+	readState(MCPClientStatusActive, source.Revision)
+	body, err := json.Marshal(map[string]any{
+		"name": "Codex jobs", "slug": "codex-jobs", "subject": "agt_codex", "kind": "workload",
+		"interactiveClientId": source.ID, "sourceRevision": source.Revision, "connectionNamespaceIds": []string{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	linked := decodeControlClient(t, h.control("usr_owner", "owner", http.MethodPost, "/control/v1/mcp-clients", string(body)), http.StatusCreated)
+	if linked.InteractiveClientID != source.ID {
+		t.Fatalf("link missing: %+v", linked)
+	}
+	h.mintToken(linked.ID)
+	readState(MCPClientStatusActive, source.Revision)
+
+	// No broad registry read or write is granted to the service principal.
+	expectControlProblem(t, h.control(platformServiceActorID, "service", http.MethodGet, path, ""), http.StatusUnauthorized, controlCodeActorAssertionInvalid)
+	expectControlProblem(t, h.control(platformServiceActorID, "service", http.MethodPost, path+"/lifecycle-state", "{}"), http.StatusUnauthorized, controlCodeActorAssertionInvalid)
+	for _, role := range []string{"operator", "viewer"} {
+		expectControlProblem(t, h.control("usr_operator", role, http.MethodGet, path+"/lifecycle-state", ""), http.StatusForbidden, controlCodeForbidden)
+	}
+	expectControlProblem(t, h.control(platformServiceActorID, "service", http.MethodGet, "/control/v1/mcp-clients/mcpcli_missing/lifecycle-state", ""), http.StatusNotFound, controlCodeNotFound)
+
+	revoked := decodeControlClient(t, h.control("usr_owner", "owner", http.MethodPost, path+"/revoke", `{"revision":`+strconv.FormatInt(source.Revision, 10)+`}`), http.StatusOK)
+	readState(MCPClientStatusRevoked, revoked.Revision)
+	expectControlProblem(t, h.mint(linked.ID), http.StatusConflict, controlCodeClientRevoked)
+}
+
+type lifecycleLookupFailureStore struct {
+	*FileStore
+	failure error
+}
+
+func (s *lifecycleLookupFailureStore) LookupMCPClient(ctx context.Context, id string) (MCPClient, bool, error) {
+	if s.failure != nil {
+		return MCPClient{}, false, s.failure
+	}
+	return s.FileStore.LookupMCPClient(ctx, id)
+}
+
+func TestControlV1LifecycleLookupFailureIsUnavailableNotMissing(t *testing.T) {
+	base, err := LoadFileStore(filepath.Join(t.TempDir(), "clients.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := base.CreateMCPClient(t.Context(), MCPClient{Name: "Existing agent", Subject: "usr_operator"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &lifecycleLookupFailureStore{FileStore: base}
+	verifier, key, now := newActorVerifier(t)
+	api := NewConsoleAPI(store, NewGateway(store, nil), nil, "local-password", "local-secret", "https://engine.example", "https://app.example", "",
+		WithAdminToken("machine-token"), WithLocalAdminAuth(false), WithPlatformActorVerifier(verifier))
+	mux := http.NewServeMux()
+	api.Routes(mux)
+	read := func(id string) *httptest.ResponseRecorder {
+		return controlRequest(t, mux, key, now, platformServiceActorID, "service", http.MethodGet, "/control/v1/mcp-clients/"+id+"/lifecycle-state", "")
+	}
+	if response := read(client.ID); response.Code != http.StatusOK {
+		t.Fatalf("live client read=%d body=%s", response.Code, response.Body)
+	}
+	store.failure = context.DeadlineExceeded
+	expectControlProblem(t, read(client.ID), http.StatusServiceUnavailable, controlCodeEngineUnavailable)
+	expectControlProblem(t, read("mcpcli_missing"), http.StatusServiceUnavailable, controlCodeEngineUnavailable)
+	store.failure = nil
+	if response := read(client.ID); response.Code != http.StatusOK {
+		t.Fatalf("client did not recover after transient read failure: %d %s", response.Code, response.Body)
+	}
+	expectControlProblem(t, read("mcpcli_missing"), http.StatusNotFound, controlCodeNotFound)
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, found, err := base.LookupMCPClient(cancelled, client.ID); found || err != context.Canceled {
+		t.Fatalf("cancelled FileStore lifecycle read=%v, %v", found, err)
 	}
 }

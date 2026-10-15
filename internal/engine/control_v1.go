@@ -64,7 +64,7 @@ const (
 // controlCapabilities advertises the v1 resource groups this Engine build
 // serves. Absence of a route is still the downgrade signal; this list lets a
 // control plane confirm positively before it relies on a group.
-var controlCapabilities = []string{"mcp-clients", "profile-binding", "activation-snapshot", "run-correlations", "library-artifacts", "connection-evidence"}
+var controlCapabilities = []string{"mcp-clients", "profile-binding", "activation-snapshot", "run-correlations", "library-artifacts", "connection-evidence", "mcp-client-connections"}
 
 // controlCapabilityWorkloadClients is advertised only when this Engine can
 // actually mint workload tokens (see ConsoleAPI.workloadTokensAvailable): a
@@ -75,6 +75,9 @@ func (c *ConsoleAPI) controlCapabilities() []string {
 	capabilities := append([]string(nil), controlCapabilities...)
 	if c.workloadTokensAvailable() {
 		capabilities = append(capabilities, controlCapabilityWorkloadClients)
+		if _, ok := c.store.(mcpClientLifecycleLookup); ok {
+			capabilities = append(capabilities, "linked-workload-clients")
+		}
 	}
 	return capabilities
 }
@@ -399,6 +402,47 @@ func (c *ConsoleAPI) handleControlMCPClientRevoke(w http.ResponseWriter, r *http
 
 func (c *ConsoleAPI) handleControlMCPClientProfileBinding(w http.ResponseWriter, r *http.Request) {
 	c.serveMCPClientProfileBinding(w, r, controlWire)
+}
+
+// controlClientLifecycleStateDTO is the minimum durable state needed to
+// reconcile a linked workload's source. The service actor does not receive the
+// general registry read, connection grants, OAuth metadata, or profile binding.
+type controlClientLifecycleStateDTO struct {
+	ID       string          `json:"id"`
+	Kind     MCPClientKind   `json:"kind"`
+	Subject  string          `json:"subject"`
+	Status   MCPClientStatus `json:"status"`
+	Revision int64           `json:"revision"`
+}
+
+func (c *ConsoleAPI) handleControlMCPClientLifecycleState(w http.ResponseWriter, r *http.Request) {
+	store, actor, failure := c.mcpClientAdministration(r)
+	if failure != nil {
+		controlWire.writeFailure(w, failure)
+		return
+	}
+	if r.Method != http.MethodGet {
+		controlWire.writeMethodNotAllowed(w, http.MethodGet)
+		return
+	}
+	lookup, ok := store.(mcpClientLifecycleLookup)
+	if !ok {
+		controlWire.writeFailure(w, newConsoleFailure(http.StatusNotImplemented, controlCodeCapabilityUnavailable, "client lifecycle lookup is not supported by this store"))
+		return
+	}
+	client, found, err := lookup.LookupMCPClient(r.Context(), r.PathValue("id"))
+	if err != nil {
+		controlWire.writeFailure(w, newConsoleFailure(http.StatusServiceUnavailable, controlCodeEngineUnavailable, "client lifecycle state is temporarily unavailable"))
+		return
+	}
+	if !found || !canReadMCPClient(actor, client) {
+		controlWire.writeFailure(w, newConsoleFailure(http.StatusNotFound, controlCodeNotFound, "MCP client was not found"))
+		return
+	}
+	writeJSON(w, http.StatusOK, controlClientLifecycleStateDTO{
+		ID: client.ID, Kind: mcpClientKind(client), Subject: client.Subject,
+		Status: client.Status, Revision: client.Revision,
+	})
 }
 
 // controlActivationSnapshotDTO is the metadata-only projection of a client's

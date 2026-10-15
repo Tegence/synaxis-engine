@@ -219,7 +219,7 @@ func TestMCPClientBootstrapMatchesAvailableStoreFacets(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			gateway := NewGateway(test.store, NewRootMCPServer())
-			if err := gateway.buildMCPClient(client); err != nil {
+			if err := gateway.buildMCPClient(client, test.store.Accounts()); err != nil {
 				t.Fatalf("build MCP client: %v", err)
 			}
 			gateway.mu.Lock()

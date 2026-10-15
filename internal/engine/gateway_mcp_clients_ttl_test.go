@@ -30,6 +30,13 @@ func (c *countingMCPClientStore) ActiveMCPClient(ctx context.Context, id string)
 	return c.FileStore.ActiveMCPClient(ctx, id)
 }
 
+func (c *countingMCPClientStore) LookupActiveMCPClient(ctx context.Context, slug string) (MCPClient, bool, error) {
+	c.mu.Lock()
+	c.reads++
+	c.mu.Unlock()
+	return c.FileStore.LookupActiveMCPClient(ctx, slug)
+}
+
 func (c *countingMCPClientStore) activeMCPClientReads() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()

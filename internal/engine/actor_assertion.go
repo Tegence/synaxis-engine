@@ -249,9 +249,9 @@ func platformServiceControlRoute(method, requestPath string) bool {
 
 // platformServiceControlV1Route is the /control/v1 counterpart of the closed
 // service allowlist above. The service principal receives version discovery,
-// the sanitized run-correlation feed, three per-client operations that a
-// hosted control plane performs from background jobs (reading a client's
-// activation snapshot, installing or clearing its opaque profile binding, and
+// the sanitized run-correlation feed, per-client operations that a hosted
+// control plane performs from background jobs (reading lifecycle state or an
+// activation snapshot, installing or clearing an opaque profile binding, and
 // minting a workload client's short-lived token), and the subject-scoped
 // Library group (member artifact reads and exact-version grant management,
 // each one exact operation per route). It still cannot list, register,
@@ -262,6 +262,8 @@ func platformServiceControlV1Route(method, requestPath string) bool {
 		return true
 	case method == http.MethodGet && requestPath == controlV1PathPrefix+"run-correlations":
 		return true
+	case method == http.MethodGet && platformServiceControlMCPClientRoute(requestPath, "lifecycle-state"):
+		return true
 	case method == http.MethodGet && platformServiceControlMCPClientRoute(requestPath, "activation-snapshot"):
 		return true
 	case (method == http.MethodPut || method == http.MethodDelete) && platformServiceControlMCPClientRoute(requestPath, "profile-binding"):
@@ -269,6 +271,8 @@ func platformServiceControlV1Route(method, requestPath string) bool {
 	case method == http.MethodPost && platformServiceControlMCPClientRoute(requestPath, "workload-token"):
 		return true
 	case method == http.MethodGet && requestPath == controlV1PathPrefix+"library/artifacts":
+		return true
+	case method == http.MethodPost && requestPath == controlV1PathPrefix+"library/collaboration":
 		return true
 	case method == http.MethodGet && requestPath == controlV1PathPrefix+"library/recipients":
 		return true

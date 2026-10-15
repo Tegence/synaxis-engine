@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 	"time"
@@ -28,6 +29,10 @@ type MCPClient struct {
 	Name          string `json:"name"`
 	Subject       string `json:"subject"`
 	OAuthClientID string `json:"oauth_client_id,omitempty"`
+	// InteractiveClientID links a workload to an existing interactive identity.
+	// It grants no shared tools, skills, artifacts, or OAuth authority.
+	InteractiveClientID string `json:"interactive_client_id,omitempty"`
+	SourceRevision      int64  `json:"-"` // create-only source revision fence
 	// RuntimeAttestorPublicKey is an optional, canonical raw-base64url
 	// Ed25519 public key. It authorizes only the separate host-attestation
 	// endpoint; it is neither an OAuth credential nor an MCP bearer token.
@@ -37,17 +42,20 @@ type MCPClient struct {
 	// interprets the policy behind it; it is not a grant, credential, or
 	// capability. Any change to the bound reference rotates Epoch because the
 	// external policy a client runs under is authorization-relevant.
-	AgentProfileBinding    *MCPClientProfileBinding `json:"agent_profile_binding,omitempty"`
-	ConnectionNamespaceIDs []string                 `json:"connection_namespace_ids"`
-	Kind                   MCPClientKind            `json:"kind"` // fixed at creation; empty means interactive
-	Status                 MCPClientStatus          `json:"status"`
-	Epoch                  string                   `json:"epoch"`
-	Revision               int64                    `json:"revision"`
-	CreatedBy              string                   `json:"created_by,omitempty"`
-	CreatedAt              time.Time                `json:"created_at,omitempty"`
-	UpdatedAt              time.Time                `json:"updated_at,omitempty"`
-	RevokedAt              *time.Time               `json:"revoked_at,omitempty"`
-	RevokedBy              string                   `json:"revoked_by,omitempty"`
+	AgentProfileBinding *MCPClientProfileBinding `json:"agent_profile_binding,omitempty"`
+	ConnectionIDs       []string                 `json:"connection_ids,omitempty"`
+	// Exact grants pin account incarnations so a recreated connection needs reauthorization.
+	ConnectionGrants       map[string]string `json:"connection_grants,omitempty"`
+	ConnectionNamespaceIDs []string          `json:"connection_namespace_ids"`
+	Kind                   MCPClientKind     `json:"kind"` // fixed at creation; empty means interactive
+	Status                 MCPClientStatus   `json:"status"`
+	Epoch                  string            `json:"epoch"`
+	Revision               int64             `json:"revision"`
+	CreatedBy              string            `json:"created_by,omitempty"`
+	CreatedAt              time.Time         `json:"created_at,omitempty"`
+	UpdatedAt              time.Time         `json:"updated_at,omitempty"`
+	RevokedAt              *time.Time        `json:"revoked_at,omitempty"`
+	RevokedBy              string            `json:"revoked_by,omitempty"`
 	// runtimeAttestorKeySet is an update-only presence bit. It is intentionally
 	// not persisted, so an empty public key can explicitly disable attestation.
 	runtimeAttestorKeySet bool `json:"-"`
@@ -120,6 +128,13 @@ type MCPClientPrecondition struct {
 	Revision int64  `json:"revision"`
 }
 
+// mcpClientLifecycleLookup distinguishes a missing registration from a failed
+// durable read. Lifecycle reconciliation may revoke dependent identities on
+// absence, so it must never fall back to the boolean-only registry lookup.
+type mcpClientLifecycleLookup interface {
+	LookupMCPClient(ctx context.Context, id string) (MCPClient, bool, error)
+}
+
 // MCPClientStore is a deliberately small registry facet. Gateway/Main uses
 // ActiveMCPClient and ActiveMCPClientByOAuthClientID to resolve a scoped
 // endpoint and its Platform subject without learning console authorization
@@ -143,6 +158,11 @@ type MCPClientStore interface {
 	// with this subject-bound registration. Replacing a DCR identity requires
 	// an explicit reset first; there is never an implicit rebind.
 	BindMCPClientOAuthClient(ctx context.Context, id, oauthClientID string, precondition MCPClientPrecondition, actor PlatformActor) (MCPClient, error)
+	// ReplaceMCPClientOAuthClient is that explicit replacement in one
+	// revision-checked write: the endpoint's own member moves an existing
+	// binding to a new DCR identity ("Replace sign-in" on consent). The epoch
+	// rotates, so the previous app's tokens fail closed.
+	ReplaceMCPClientOAuthClient(ctx context.Context, id, oauthClientID string, precondition MCPClientPrecondition, actor PlatformActor) (MCPClient, error)
 	// ResetMCPClientOAuthClient clears a stale DCR identity but keeps the
 	// stable endpoint slug and namespace grants. It always rotates Epoch so
 	// previously issued path tokens fail closed before a later explicit bind.
@@ -195,6 +215,8 @@ func newMCPClientID() string { return "mcpcli_" + newEpoch() }
 func copyMCPClient(client MCPClient) MCPClient {
 	cp := client
 	cp.ConnectionNamespaceIDs = append([]string(nil), client.ConnectionNamespaceIDs...)
+	cp.ConnectionIDs = append([]string(nil), client.ConnectionIDs...)
+	cp.ConnectionGrants = maps.Clone(client.ConnectionGrants)
 	if client.RevokedAt != nil {
 		revokedAt := *client.RevokedAt
 		cp.RevokedAt = &revokedAt
@@ -406,13 +428,13 @@ func mcpClientPreconditionMatches(client MCPClient, precondition MCPClientPrecon
 // move atomically rotate the affected client epochs before another Engine
 // replica can project the new namespace assignment.
 func mcpClientDeliversAccount(client MCPClient, account Account) bool {
-	if client.Status != MCPClientStatusActive || account.ConnectionNamespaceID == "" {
+	if client.Status != MCPClientStatusActive {
 		return false
 	}
-	if !toSet(client.ConnectionNamespaceIDs)[account.ConnectionNamespaceID] {
+	if !toSet(client.ConnectionNamespaceIDs)[account.ConnectionNamespaceID] && (account.IncarnationID == "" || client.ConnectionGrants[account.Name] != account.IncarnationID) {
 		return false
 	}
-	return !account.IsPersonal() || client.Subject == account.OwnerSubject
+	return !account.IsPersonal() || (client.InteractiveClientID == "" && client.Subject == account.OwnerSubject)
 }
 
 func mcpClientDeliveryChangesForAccountMove(client MCPClient, before, after Account) bool {
@@ -485,6 +507,9 @@ func prepareMCPClientForCreate(client *MCPClient) error {
 		return err
 	}
 	client.Kind = kind
+	if err := validateLinkedMCPClient(*client, true); err != nil {
+		return err
+	}
 	var keyErr error
 	client.RuntimeAttestorPublicKey, keyErr = normalizeMCPClientRuntimeAttestorPublicKey(client.RuntimeAttestorPublicKey)
 	if keyErr != nil {
@@ -516,6 +541,11 @@ func prepareMCPClientForCreate(client *MCPClient) error {
 	if namespaceErr != nil {
 		return namespaceErr
 	}
+	client.ConnectionIDs, namespaceErr = normalizeMCPClientConnectionIDs(client.ConnectionIDs)
+	if namespaceErr != nil {
+		return namespaceErr
+	}
+	client.ConnectionGrants = nil
 	// Callers never choose a credential generation or CAS version.
 	client.Epoch = newEpoch()
 	client.Revision = 1
@@ -575,6 +605,9 @@ func prepareLoadedMCPClient(client *MCPClient, existingIDs, existingSlugs, exist
 	if err != nil {
 		return false, fmt.Errorf("%w: stored kind is invalid", ErrInvalidMCPClient)
 	}
+	if err := validateLinkedMCPClient(*client, false); err != nil {
+		return false, err
+	}
 	client.RuntimeAttestorPublicKey, err = normalizeMCPClientRuntimeAttestorPublicKey(client.RuntimeAttestorPublicKey)
 	if err != nil {
 		return false, err
@@ -601,6 +634,7 @@ func prepareLoadedMCPClient(client *MCPClient, existingIDs, existingSlugs, exist
 	if err != nil {
 		return false, err
 	}
+	client.ConnectionIDs = mcpClientConnectionIDs(client.ConnectionGrants)
 	if client.AgentProfileBinding != nil {
 		binding, err := normalizeMCPClientProfileBinding(*client.AgentProfileBinding)
 		if err != nil {
@@ -654,11 +688,12 @@ func prepareLoadedMCPClient(client *MCPClient, existingIDs, existingSlugs, exist
 }
 
 func sameMCPClient(a, b MCPClient) bool {
-	if a.ID != b.ID || a.Slug != b.Slug || a.Name != b.Name || a.Subject != b.Subject || a.Kind != b.Kind ||
+	if a.ID != b.ID || a.Slug != b.Slug || a.Name != b.Name || a.Subject != b.Subject || a.Kind != b.Kind || a.InteractiveClientID != b.InteractiveClientID ||
 		a.OAuthClientID != b.OAuthClientID || a.RuntimeAttestorPublicKey != b.RuntimeAttestorPublicKey || a.Status != b.Status || a.Epoch != b.Epoch ||
 		a.Revision != b.Revision || a.CreatedBy != b.CreatedBy || !a.CreatedAt.Equal(b.CreatedAt) ||
 		!a.UpdatedAt.Equal(b.UpdatedAt) || a.RevokedBy != b.RevokedBy || !sameStrings(a.ConnectionNamespaceIDs, b.ConnectionNamespaceIDs) ||
-		!sameMCPClientProfileBinding(a.AgentProfileBinding, b.AgentProfileBinding) {
+		!sameMCPClientProfileBinding(a.AgentProfileBinding, b.AgentProfileBinding) ||
+		!sameStrings(a.ConnectionIDs, b.ConnectionIDs) || !maps.Equal(a.ConnectionGrants, b.ConnectionGrants) {
 		return false
 	}
 	if a.RevokedAt == nil || b.RevokedAt == nil {
@@ -681,7 +716,7 @@ func (s *FileStore) backfillMCPClientsLocked() (bool, error) {
 				return false
 			}
 			for _, account := range s.accounts {
-				if account != nil && account.ConnectionNamespaceID == id && account.IsPersonal() && account.OwnerSubject != subject {
+				if account != nil && account.ConnectionNamespaceID == id && account.IsPersonal() && (account.OwnerSubject != subject || client.InteractiveClientID != "") {
 					return false
 				}
 			}
@@ -741,7 +776,7 @@ func (s *FileStore) validateMCPClientNamespacesLocked(client MCPClient) error {
 			if account == nil || account.ConnectionNamespaceID != namespaceID || !account.IsPersonal() {
 				continue
 			}
-			if account.OwnerSubject != client.Subject {
+			if account.OwnerSubject != client.Subject || client.InteractiveClientID != "" {
 				return ErrMCPClientNamespaceSubject
 			}
 		}
@@ -754,8 +789,11 @@ func (s *FileStore) validatePersonalAccountMCPClientGrantsLocked(account Account
 		return nil
 	}
 	for _, client := range s.mcpClients {
-		if client == nil || client.Status != MCPClientStatusActive || client.Subject == account.OwnerSubject {
+		if client == nil || client.Status != MCPClientStatusActive || (client.Subject == account.OwnerSubject && client.InteractiveClientID == "") {
 			continue
+		}
+		if account.IncarnationID != "" && client.ConnectionGrants[account.Name] == account.IncarnationID {
+			return ErrMCPClientNamespaceSubject
 		}
 		for _, namespaceID := range client.ConnectionNamespaceIDs {
 			if namespaceID == account.ConnectionNamespaceID {
@@ -810,7 +848,7 @@ func (s *FileStore) ActiveMCPClients(ctx context.Context) ([]MCPClient, error) {
 	}
 	out := clients[:0]
 	for _, client := range clients {
-		if client.Status == MCPClientStatusActive {
+		if client.Status == MCPClientStatusActive && linkedMCPClientSourceActive(ctx, s, client) {
 			out = append(out, client)
 		}
 	}
@@ -827,6 +865,14 @@ func (s *FileStore) MCPClient(_ context.Context, id string) (MCPClient, bool) {
 	return copyMCPClient(*client), true
 }
 
+func (s *FileStore) LookupMCPClient(ctx context.Context, id string) (MCPClient, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return MCPClient{}, false, err
+	}
+	client, found := s.MCPClient(ctx, id)
+	return client, found, nil
+}
+
 func (s *FileStore) MCPClientBySlug(_ context.Context, slug string) (MCPClient, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -838,14 +884,22 @@ func (s *FileStore) MCPClientBySlug(_ context.Context, slug string) (MCPClient, 
 }
 
 func (s *FileStore) ActiveMCPClient(ctx context.Context, endpointIdentifier string) (MCPClient, bool) {
-	if client, ok := s.MCPClient(ctx, endpointIdentifier); ok && client.Status == MCPClientStatusActive {
+	if client, ok := s.MCPClient(ctx, endpointIdentifier); ok && client.Status == MCPClientStatusActive && linkedMCPClientSourceActive(ctx, s, client) {
 		return client, true
 	}
 	client, ok := s.MCPClientBySlug(ctx, endpointIdentifier)
-	if !ok || client.Status != MCPClientStatusActive {
+	if !ok || client.Status != MCPClientStatusActive || !linkedMCPClientSourceActive(ctx, s, client) {
 		return MCPClient{}, false
 	}
 	return client, true
+}
+
+func (s *FileStore) LookupActiveMCPClient(ctx context.Context, slug string) (MCPClient, bool, error) {
+	client, ok := s.MCPClientBySlug(ctx, slug)
+	if !ok || client.Status != MCPClientStatusActive || !linkedMCPClientSourceActive(ctx, s, client) {
+		return MCPClient{}, false, nil
+	}
+	return client, true, nil
 }
 
 func (s *FileStore) ActiveMCPClientByOAuthClientID(_ context.Context, oauthClientID string) (MCPClient, bool) {
@@ -854,6 +908,12 @@ func (s *FileStore) ActiveMCPClientByOAuthClientID(_ context.Context, oauthClien
 	client, ok := s.mcpClientByOAuthIDLocked(strings.TrimSpace(oauthClientID))
 	if !ok || client.Status != MCPClientStatusActive {
 		return MCPClient{}, false
+	}
+	if client.InteractiveClientID != "" {
+		source, found := s.mcpClientByIDLocked(client.InteractiveClientID)
+		if !found || source.Status != MCPClientStatusActive || mcpClientKind(*source) != MCPClientKindInteractive {
+			return MCPClient{}, false
+		}
 	}
 	return copyMCPClient(*client), true
 }
@@ -885,10 +945,16 @@ func (s *FileStore) CreateMCPClient(_ context.Context, client MCPClient) (MCPCli
 			return MCPClient{}, ErrMCPClientOAuthBinding
 		}
 	}
+	if err := s.validateLinkedMCPClientCreateLocked(client); err != nil {
+		return MCPClient{}, err
+	}
 	if s.activeMCPClientCountLocked() >= maxActiveMCPClients {
 		return MCPClient{}, ErrMCPClientLimit
 	}
 	if err := s.validateMCPClientNamespacesLocked(client); err != nil {
+		return MCPClient{}, err
+	}
+	if err := s.captureMCPClientConnectionsLocked(&client); err != nil {
 		return MCPClient{}, err
 	}
 	beforeSkills := cloneBuiltInLibrarySkills(s.librarySkills)
@@ -942,6 +1008,9 @@ func (s *FileStore) UpdateMCPClient(_ context.Context, update MCPClient, precond
 	if update.Kind != "" && update.Kind != mcpClientKind(*client) {
 		return MCPClient{}, fmt.Errorf("%w: kind is immutable", ErrInvalidMCPClient)
 	}
+	if update.InteractiveClientID != "" && update.InteractiveClientID != client.InteractiveClientID {
+		return MCPClient{}, fmt.Errorf("%w: interactive link is immutable", ErrInvalidMCPClient)
+	}
 	if update.agentProfileBindingSet || update.AgentProfileBinding != nil {
 		return MCPClient{}, fmt.Errorf("%w: agent profile binding changes require the profile-binding operation", ErrInvalidMCPClient)
 	}
@@ -973,7 +1042,15 @@ func (s *FileStore) UpdateMCPClient(_ context.Context, update MCPClient, precond
 	return copyMCPClient(*client), nil
 }
 
-func (s *FileStore) SetMCPClientNamespaces(_ context.Context, id string, namespaceIDs []string, precondition MCPClientPrecondition) (MCPClient, error) {
+func (s *FileStore) SetMCPClientNamespaces(ctx context.Context, id string, namespaceIDs []string, precondition MCPClientPrecondition) (MCPClient, error) {
+	return s.setMCPClientAccess(ctx, id, namespaceIDs, nil, precondition)
+}
+
+func (s *FileStore) SetMCPClientAccess(ctx context.Context, id string, namespaceIDs, connectionIDs []string, precondition MCPClientPrecondition) (MCPClient, error) {
+	return s.setMCPClientAccess(ctx, id, namespaceIDs, &connectionIDs, precondition)
+}
+
+func (s *FileStore) setMCPClientAccess(_ context.Context, id string, namespaceIDs []string, connectionIDs *[]string, precondition MCPClientPrecondition) (MCPClient, error) {
 	namespaceIDs, err := normalizeMCPClientNamespaceIDs(namespaceIDs)
 	if err != nil {
 		return MCPClient{}, err
@@ -995,11 +1072,22 @@ func (s *FileStore) SetMCPClientNamespaces(_ context.Context, id string, namespa
 	if err := s.validateMCPClientNamespacesLocked(proposed); err != nil {
 		return MCPClient{}, err
 	}
-	if sameStrings(client.ConnectionNamespaceIDs, namespaceIDs) {
+	if connectionIDs != nil {
+		proposed.ConnectionIDs, err = normalizeMCPClientConnectionIDs(*connectionIDs)
+		if err != nil {
+			return MCPClient{}, err
+		}
+		if err := s.captureMCPClientConnectionsLocked(&proposed); err != nil {
+			return MCPClient{}, err
+		}
+	}
+	if sameStrings(client.ConnectionNamespaceIDs, namespaceIDs) && maps.Equal(client.ConnectionGrants, proposed.ConnectionGrants) {
 		return copyMCPClient(*client), nil
 	}
 	before := copyMCPClient(*client)
 	client.ConnectionNamespaceIDs = namespaceIDs
+	client.ConnectionIDs = proposed.ConnectionIDs
+	client.ConnectionGrants = proposed.ConnectionGrants
 	client.Epoch = newEpoch()
 	client.Revision++
 	client.UpdatedAt = time.Now().UTC()
@@ -1011,6 +1099,14 @@ func (s *FileStore) SetMCPClientNamespaces(_ context.Context, id string, namespa
 }
 
 func (s *FileStore) BindMCPClientOAuthClient(_ context.Context, id, oauthClientID string, precondition MCPClientPrecondition, actor PlatformActor) (MCPClient, error) {
+	return s.bindMCPClientOAuthClient(id, oauthClientID, precondition, actor, false)
+}
+
+func (s *FileStore) ReplaceMCPClientOAuthClient(_ context.Context, id, oauthClientID string, precondition MCPClientPrecondition, actor PlatformActor) (MCPClient, error) {
+	return s.bindMCPClientOAuthClient(id, oauthClientID, precondition, actor, true)
+}
+
+func (s *FileStore) bindMCPClientOAuthClient(id, oauthClientID string, precondition MCPClientPrecondition, actor PlatformActor, replace bool) (MCPClient, error) {
 	oauthClientID = strings.TrimSpace(oauthClientID)
 	if !validMCPClientOAuthClientID(oauthClientID) {
 		return MCPClient{}, fmt.Errorf("%w: OAuth client ID is invalid", ErrInvalidMCPClient)
@@ -1038,7 +1134,7 @@ func (s *FileStore) BindMCPClientOAuthClient(_ context.Context, id, oauthClientI
 	if client.OAuthClientID == oauthClientID {
 		return copyMCPClient(*client), nil
 	}
-	if client.OAuthClientID != "" {
+	if client.OAuthClientID != "" && !replace {
 		return MCPClient{}, ErrMCPClientOAuthBinding
 	}
 	if existing, exists := s.mcpClientByOAuthIDLocked(oauthClientID); exists && existing.ID != client.ID {
@@ -1138,16 +1234,25 @@ func (s *FileStore) RevokeMCPClient(_ context.Context, id, revokedBy string, pre
 	if client.Status == MCPClientStatusRevoked {
 		return copyMCPClient(*client), nil
 	}
-	before := copyMCPClient(*client)
+	before := make(map[*MCPClient]MCPClient)
+	for _, linked := range s.mcpClients {
+		if linked != nil && (linked.ID == client.ID || linked.InteractiveClientID == client.ID) && linked.Status == MCPClientStatusActive {
+			before[linked] = copyMCPClient(*linked)
+		}
+	}
 	now := time.Now().UTC()
-	client.Status = MCPClientStatusRevoked
-	client.Epoch = newEpoch()
-	client.Revision++
-	client.UpdatedAt = now
-	client.RevokedAt = &now
-	client.RevokedBy = revokedBy
+	for linked := range before {
+		linked.Status = MCPClientStatusRevoked
+		linked.Epoch = newEpoch()
+		linked.Revision++
+		linked.UpdatedAt = now
+		linked.RevokedAt = &now
+		linked.RevokedBy = revokedBy
+	}
 	if err := s.saveLocked(); err != nil {
-		*client = before
+		for linked, original := range before {
+			*linked = original
+		}
 		return MCPClient{}, err
 	}
 	return copyMCPClient(*client), nil

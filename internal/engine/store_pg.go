@@ -26,6 +26,11 @@ type PgStore struct {
 	// succeeds, so a partially constructed store never owns a worker.
 	audit *auditWriter
 
+	// bootID is random per process and stamped on the approvals it parks
+	// (pending_calls.owner_boot_id), so operators can tell which Engine process
+	// owned a call that boot recovery cancelled.
+	bootID string
+
 	poolCloseOnce           sync.Once
 	poolCloseAfterAuditOnce sync.Once
 }
@@ -560,6 +565,7 @@ const accountsMigrate = `
 ALTER TABLE narthex_accounts ADD COLUMN IF NOT EXISTS disabled_tools TEXT[];
 ALTER TABLE narthex_accounts ADD COLUMN IF NOT EXISTS tool_overrides JSONB NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE narthex_accounts ADD COLUMN IF NOT EXISTS read_only BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE narthex_accounts ADD COLUMN IF NOT EXISTS member_credentials BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE narthex_accounts ADD COLUMN IF NOT EXISTS scope TEXT NOT NULL DEFAULT '';
 ALTER TABLE narthex_accounts ADD COLUMN IF NOT EXISTS connection_namespace_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE narthex_accounts ADD COLUMN IF NOT EXISTS connection_scope TEXT NOT NULL DEFAULT 'shared';
@@ -585,6 +591,22 @@ BEGIN
             CHECK (connection_scope IN ('shared','personal','service'));
     END IF;
 END $$;`
+
+// Each member's own upstream credential for an account in member-credential
+// mode. Tokens are encrypted like the account's own; deleting the account
+// deletes them, and incarnation_id keeps a recreated account from inheriting
+// them.
+const memberCredentialsSchema = `
+CREATE TABLE IF NOT EXISTS narthex_account_member_credentials (
+    account_name   TEXT NOT NULL REFERENCES narthex_accounts(name) ON DELETE CASCADE,
+    subject        TEXT NOT NULL,
+    incarnation_id TEXT NOT NULL,
+    access_token   TEXT NOT NULL DEFAULT '',
+    refresh_token  TEXT NOT NULL DEFAULT '',
+    bearer_token   TEXT NOT NULL DEFAULT '',
+    updated_at     TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (account_name, subject)
+);`
 
 // Connection namespaces deliberately use a separate table family from the
 // legacy narthex_namespaces + narthex_namespace_accounts endpoint-bundle
@@ -916,6 +938,16 @@ CREATE TABLE IF NOT EXISTS narthex_library_artifact_media_blobs (
                (mime_type <> 'image/svg+xml' AND delivery_mode='inline'))
 );
 
+CREATE TABLE IF NOT EXISTS narthex_library_collaborations (
+ artifact_id TEXT PRIMARY KEY REFERENCES narthex_library_artifacts(id) ON DELETE CASCADE,
+ state TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS narthex_library_collaboration_principals (
+ artifact_id TEXT NOT NULL REFERENCES narthex_library_artifacts(id) ON DELETE CASCADE,
+ principal_hash TEXT NOT NULL,
+ PRIMARY KEY (artifact_id, principal_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_library_collaboration_principals ON narthex_library_collaboration_principals(principal_hash);
 CREATE TABLE IF NOT EXISTS narthex_library_artifact_grants (
     id                      TEXT PRIMARY KEY,
     artifact_id             TEXT NOT NULL REFERENCES narthex_library_artifacts(id) ON DELETE RESTRICT,
@@ -1449,7 +1481,7 @@ func isCheckViolation(err error) bool {
 	return errors.As(err, &pgErr) && pgErr.Code == "23514"
 }
 
-const accountCols = `name,label,workspace,url,auth_mode,connection_namespace_id,connection_scope,owner_subject,revision,incarnation_id,client_id,client_secret,access_token,refresh_token,token_endpoint,resource,scope,bearer_token,disabled_tools,tool_overrides,read_only`
+const accountCols = `name,label,workspace,url,auth_mode,connection_namespace_id,connection_scope,owner_subject,revision,incarnation_id,client_id,client_secret,access_token,refresh_token,token_endpoint,resource,scope,bearer_token,disabled_tools,tool_overrides,read_only,member_credentials`
 
 const engineSchemaBootstrapLock = "narthex-engine-schema-bootstrap:v1"
 
@@ -1502,6 +1534,10 @@ func NewPgStore(ctx context.Context, dsn string) (*PgStore, error) {
 		closePool()
 		return nil, fmt.Errorf("migrate accounts schema: %w", err)
 	}
+	if _, err := pool.Exec(ctx, memberCredentialsSchema); err != nil {
+		closePool()
+		return nil, fmt.Errorf("ensure member credentials schema: %w", err)
+	}
 	if _, err := pool.Exec(ctx, connectionNamespacesSchema); err != nil {
 		closePool()
 		return nil, fmt.Errorf("ensure connection namespaces schema: %w", err)
@@ -1510,7 +1546,7 @@ func NewPgStore(ctx context.Context, dsn string) (*PgStore, error) {
 		closePool()
 		return nil, fmt.Errorf("ensure MCP client registry schema: %w", err)
 	}
-	store := &PgStore{pool: pool}
+	store := &PgStore{pool: pool, bootID: newApprovalID()}
 	if err := store.backfillConnectionNamespaces(ctx); err != nil {
 		closePool()
 		return nil, fmt.Errorf("backfill connection namespaces: %w", err)
@@ -1852,6 +1888,48 @@ func (s *PgStore) CurrentTokenGeneration(ctx context.Context) (string, error) {
 	return generation, nil
 }
 
+// Health alerts share the generic engine-state key/value table: one
+// healthAlertKeyPrefix+account row per account with an outstanding alert.
+const healthAlertKeyPrefix = "health_alert:"
+
+var _ HealthAlertStore = (*PgStore)(nil)
+
+func (s *PgStore) HealthAlerts(ctx context.Context) (map[string]string, error) {
+	rows, err := s.pool.Query(ctx, `SELECT key, value FROM narthex_engine_state WHERE starts_with(key, $1)`, healthAlertKeyPrefix)
+	if err != nil {
+		return nil, fmt.Errorf("load health alerts: %w", err)
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var key, status string
+		if err := rows.Scan(&key, &status); err != nil {
+			return nil, fmt.Errorf("load health alerts: %w", err)
+		}
+		out[strings.TrimPrefix(key, healthAlertKeyPrefix)] = status
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("load health alerts: %w", err)
+	}
+	return out, nil
+}
+
+func (s *PgStore) SetHealthAlert(ctx context.Context, account, status string) error {
+	var err error
+	if status == "" {
+		_, err = s.pool.Exec(ctx, `DELETE FROM narthex_engine_state WHERE key=$1`, healthAlertKeyPrefix+account)
+	} else {
+		_, err = s.pool.Exec(ctx, `
+INSERT INTO narthex_engine_state (key,value)
+VALUES ($1,$2)
+ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value`, healthAlertKeyPrefix+account, status)
+	}
+	if err != nil {
+		return fmt.Errorf("persist health alert: %w", err)
+	}
+	return nil
+}
+
 // RotateTokenGeneration uses compare-and-swap so a stale Engine instance can
 // never overwrite a newer revocation generation. On a stale expectation it
 // returns the already-current value for the caller to adopt.
@@ -1938,7 +2016,9 @@ CREATE TABLE IF NOT EXISTS pending_calls (
     decided_at              TIMESTAMPTZ,
     decided_by              TEXT NOT NULL DEFAULT '',
     decision_note           TEXT NOT NULL DEFAULT '',
-    kind                    TEXT NOT NULL DEFAULT ''
+    kind                    TEXT NOT NULL DEFAULT '',
+    owner_boot_id           TEXT NOT NULL DEFAULT '',
+    heartbeat_at            TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS pending_calls_ts_idx ON pending_calls (ts DESC);`
 
@@ -1956,6 +2036,11 @@ ALTER TABLE pending_calls ADD COLUMN IF NOT EXISTS account_incarnation_id TEXT N
 ALTER TABLE pending_calls ADD COLUMN IF NOT EXISTS account_revision BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE pending_calls ADD COLUMN IF NOT EXISTS connection_namespace_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE pending_calls ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT '';
+-- Rows that exist when the column is first added (a previous revision may
+-- still be serving them) read as freshly heartbeated, so that first boot's
+-- recovery leaves them alone; see RecoverPendingApprovals.
+ALTER TABLE pending_calls ADD COLUMN IF NOT EXISTS owner_boot_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE pending_calls ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT now();
 UPDATE pending_calls
 SET expires_at = ts + interval '3 minutes'
 WHERE expires_at IS NULL;
@@ -2263,7 +2348,7 @@ func (s *PgStore) scanAccount(row accountScanner) (Account, error) {
 		&a.IncarnationID,
 		&a.ClientID, &a.ClientSecret, &a.AccessToken, &a.RefreshToken,
 		&a.TokenEndpoint, &a.Resource, &a.Scope, &a.BearerToken,
-		&a.DisabledTools, &overrides, &a.ReadOnly,
+		&a.DisabledTools, &overrides, &a.ReadOnly, &a.MemberCredentials,
 	)
 	if err != nil {
 		return Account{}, err
@@ -2287,10 +2372,20 @@ func (s *PgStore) scanAccount(row accountScanner) (Account, error) {
 }
 
 func (s *PgStore) Accounts() []Account {
-	rows, err := s.pool.Query(context.Background(), `SELECT `+accountCols+` FROM narthex_accounts ORDER BY name`)
+	out, err := s.ListAccounts(context.Background())
 	if err != nil {
 		log.Printf("engine: list accounts failed: %v", err)
-		return nil
+	}
+	return out
+}
+
+// ListAccounts is Accounts with the read failure reported. A row that cannot
+// be decrypted is still omitted (and logged): that is a persistent property of
+// the row, not a failed read.
+func (s *PgStore) ListAccounts(ctx context.Context) ([]Account, error) {
+	rows, err := s.pool.Query(ctx, `SELECT `+accountCols+` FROM narthex_accounts ORDER BY name`)
+	if err != nil {
+		return nil, err
 	}
 	defer rows.Close()
 	var out []Account
@@ -2305,10 +2400,7 @@ func (s *PgStore) Accounts() []Account {
 		}
 		out = append(out, a)
 	}
-	if err := rows.Err(); err != nil {
-		log.Printf("engine: iterate accounts failed: %v", err)
-	}
-	return out
+	return out, rows.Err()
 }
 
 func (s *PgStore) Token(name string) string {
@@ -2456,12 +2548,12 @@ func (s *PgStore) Create(ctx context.Context, a Account) error {
 	}
 	tag, err := tx.Exec(ctx, `
 INSERT INTO narthex_accounts (`+accountCols+`)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
 ON CONFLICT (name) DO NOTHING`,
 		a.Name, a.Label, a.Group, a.URL, a.AuthMode,
 		a.ConnectionNamespaceID, a.ConnectionScope, a.OwnerSubject, a.Revision,
 		a.IncarnationID, a.ClientID, clientSecret, accessToken, refreshToken,
-		a.TokenEndpoint, a.Resource, a.Scope, bearerToken, a.DisabledTools, ob, a.ReadOnly)
+		a.TokenEndpoint, a.Resource, a.Scope, bearerToken, a.DisabledTools, ob, a.ReadOnly, a.MemberCredentials)
 	if err != nil {
 		return err
 	}
@@ -2552,7 +2644,7 @@ func (s *PgStore) Upsert(ctx context.Context, a Account) error {
 	}
 	_, err = tx.Exec(ctx, `
 INSERT INTO narthex_accounts (`+accountCols+`)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
 ON CONFLICT (name) DO UPDATE SET
   label=$2, workspace=$3, url=$4, auth_mode=$5,
   connection_namespace_id=$6, connection_scope=$7, owner_subject=$8, revision=$9,
@@ -2562,11 +2654,11 @@ ON CONFLICT (name) DO UPDATE SET
 	END,
   client_id=$11, client_secret=$12, access_token=$13, refresh_token=$14,
   token_endpoint=$15, resource=$16, scope=$17, bearer_token=$18,
-  disabled_tools=$19, tool_overrides=$20, read_only=$21`,
+  disabled_tools=$19, tool_overrides=$20, read_only=$21, member_credentials=$22`,
 		a.Name, a.Label, a.Group, a.URL, a.AuthMode,
 		a.ConnectionNamespaceID, a.ConnectionScope, a.OwnerSubject, a.Revision,
 		a.IncarnationID, a.ClientID, clientSecret, accessToken, refreshToken,
-		a.TokenEndpoint, a.Resource, a.Scope, bearerToken, a.DisabledTools, ob, a.ReadOnly)
+		a.TokenEndpoint, a.Resource, a.Scope, bearerToken, a.DisabledTools, ob, a.ReadOnly, a.MemberCredentials)
 	if err != nil {
 		return err
 	}
@@ -2755,6 +2847,10 @@ func (s *PgStore) UpdateAccountPolicy(ctx context.Context, name string, precondi
 		current.ReadOnly = *mutation.ReadOnly
 		changed = true
 	}
+	if mutation.MemberCredentials != nil && current.MemberCredentials != *mutation.MemberCredentials {
+		current.MemberCredentials = *mutation.MemberCredentials
+		changed = true
+	}
 	if !changed {
 		if err := tx.Commit(ctx); err != nil {
 			return Account{}, err
@@ -2773,7 +2869,7 @@ func (s *PgStore) UpdateAccountPolicy(ctx context.Context, name string, precondi
 	current.Revision++
 	updated, err := s.scanAccount(tx.QueryRow(ctx, `
 UPDATE narthex_accounts
-SET label=$2,disabled_tools=$3,tool_overrides=$4,read_only=$5,revision=$6
+SET label=$2,disabled_tools=$3,tool_overrides=$4,read_only=$5,revision=$6,member_credentials=$12
 WHERE name=$1
   AND incarnation_id=$7
   AND revision=$8
@@ -2783,7 +2879,7 @@ WHERE name=$1
 RETURNING `+accountCols,
 		current.Name, current.Label, current.DisabledTools, overrides, current.ReadOnly, current.Revision,
 		precondition.IncarnationID, beforeRevision, precondition.ConnectionNamespaceID,
-		precondition.ConnectionScope, precondition.OwnerSubject))
+		precondition.ConnectionScope, precondition.OwnerSubject, current.MemberCredentials))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Account{}, ErrAccountPolicyPrecondition
 	}
@@ -3918,10 +4014,18 @@ func (s *PgStore) LogPending(ctx context.Context, p PendingCall) error {
 	}
 	_, err = s.pool.Exec(ctx, `
 INSERT INTO pending_calls
-    (id,ts,connector,account,account_incarnation_id,account_revision,connection_namespace_id,tool,args,status,expires_at,kind)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+    (id,ts,connector,account,account_incarnation_id,account_revision,connection_namespace_id,tool,args,status,expires_at,kind,owner_boot_id)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
 		p.ID, p.TS, p.Connector, p.Account, p.AccountIncarnationID, p.AccountRevision, p.ConnectionNamespaceID,
-		p.Tool, encryptedArgs, p.Status, p.ExpiresAt, p.Kind)
+		p.Tool, encryptedArgs, p.Status, p.ExpiresAt, p.Kind, s.bootID)
+	return err
+}
+
+// HeartbeatPending records that the process parking this call is still
+// waiting on it. RecoverPendingApprovals only cancels rows whose heartbeat is
+// older than approvalOwnerStaleAfter.
+func (s *PgStore) HeartbeatPending(ctx context.Context, id string) error {
+	_, err := s.pool.Exec(ctx, `UPDATE pending_calls SET heartbeat_at=now() WHERE id=$1 AND status='pending'`, id)
 	return err
 }
 
@@ -3969,6 +4073,23 @@ func (s *PgStore) SetDecision(ctx context.Context, id, status string) error {
 func (s *PgStore) DecidePending(ctx context.Context, id string, decision ApprovalDecision) (PendingCall, error) {
 	decision, err := normalizeHumanDecision(decision)
 	if err != nil {
+		return PendingCall{}, err
+	}
+	// A call whose owning process stopped heartbeating has no waiter left to
+	// dispatch it, so cancel it rather than record a decision for a call that
+	// will never run. Rows without an owner were parked by an Engine that
+	// predates heartbeats; their liveness is unknown, so they are left alone.
+	abandoned, err := s.scanPendingCall(s.pool.QueryRow(ctx, `
+UPDATE pending_calls
+SET status='cancelled', decided_at=now(), decided_by='engine',
+    decision_note='Engine stopped; original MCP request was not replayed'
+WHERE id=$1 AND status='pending' AND expires_at > now() AND owner_boot_id <> ''
+  AND heartbeat_at < now() - ($2::bigint * interval '1 second')
+RETURNING `+pendingCallColumns, id, int64(approvalOwnerStaleAfter/time.Second)))
+	if err == nil {
+		return abandoned, ErrApprovalNotPending
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
 		return PendingCall{}, err
 	}
 	actor, note, err := s.encryptDecisionMetadata(decision.Actor, decision.Note)
@@ -4067,10 +4188,12 @@ WHERE status='pending' AND expires_at <= $1`, now)
 	return tag.RowsAffected(), nil
 }
 
-// ApprovalRecovery summarizes startup recovery. Non-expired rows are
-// cancelled, not approved or replayed: their original MCP transport request
-// ended with the previous Engine process and generic tool calls are not safe to
-// re-run from stored arguments.
+// ApprovalRecovery summarizes startup recovery. Non-expired rows whose owning
+// process stopped heartbeating are cancelled, not approved or replayed: their
+// original MCP transport request ended with that process and generic tool
+// calls are not safe to re-run from stored arguments. Rows a live process is
+// still heartbeating (for example the previous revision during a rollout,
+// which keeps serving while this one boots) stay parked with their waiter.
 type ApprovalRecovery struct {
 	Expired   int64
 	Cancelled int64
@@ -4093,13 +4216,15 @@ WHERE status='pending' AND expires_at <= $1`, now)
 	}
 	result.Expired = tag.RowsAffected()
 
-	// Only rows still pending after the deadline sweep are cancelled. This is
-	// an explicit interrupted-request outcome, not a fabricated timeout.
+	// Only rows still pending after the deadline sweep, and whose owner stopped
+	// heartbeating, are cancelled. This is an explicit interrupted-request
+	// outcome, not a fabricated timeout. Heartbeats are written and compared
+	// on the database clock, so Engine clock skew cannot misjudge liveness.
 	tag, err = tx.Exec(ctx, `
 UPDATE pending_calls
 SET status='cancelled', decided_at=now(), decided_by='engine',
     decision_note='Engine restarted; original MCP request was not replayed'
-WHERE status='pending'`)
+WHERE status='pending' AND heartbeat_at < now() - ($1::bigint * interval '1 second')`, int64(approvalOwnerStaleAfter/time.Second))
 	if err != nil {
 		return ApprovalRecovery{}, err
 	}
@@ -4143,4 +4268,65 @@ func (s *PgStore) PendingCalls(ctx context.Context) ([]PendingCall, error) {
 		out = append(out, p)
 	}
 	return out, rows.Err()
+}
+
+var _ MemberCredentialStore = (*PgStore)(nil)
+
+func (s *PgStore) MemberCredential(ctx context.Context, account, subject string) (MemberCredential, bool, error) {
+	c := MemberCredential{Account: account, Subject: subject}
+	err := s.pool.QueryRow(ctx, `
+SELECT incarnation_id, access_token, refresh_token, bearer_token, updated_at
+FROM narthex_account_member_credentials
+WHERE account_name=$1 AND subject=$2`, account, subject).Scan(
+		&c.IncarnationID, &c.AccessToken, &c.RefreshToken, &c.BearerToken, &c.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return MemberCredential{}, false, nil
+	}
+	if err != nil {
+		return MemberCredential{}, false, err
+	}
+	for _, field := range []*string{&c.AccessToken, &c.RefreshToken, &c.BearerToken} {
+		if *field, err = s.dec(*field); err != nil {
+			return MemberCredential{}, false, fmt.Errorf("decrypt member credential for %q: %w", account, err)
+		}
+	}
+	return c, true, nil
+}
+
+func (s *PgStore) PutMemberCredential(ctx context.Context, credential MemberCredential) error {
+	if credential.Subject == "" || credential.IncarnationID == "" {
+		return ErrAccountIncarnation
+	}
+	encrypted := [3]string{}
+	for i, value := range []string{credential.AccessToken, credential.RefreshToken, credential.BearerToken} {
+		var err error
+		if encrypted[i], err = s.enc(value); err != nil {
+			return fmt.Errorf("encrypt member credential: %w", err)
+		}
+	}
+	tag, err := s.pool.Exec(ctx, `
+INSERT INTO narthex_account_member_credentials
+	(account_name, subject, incarnation_id, access_token, refresh_token, bearer_token, updated_at)
+SELECT name, $2, incarnation_id, $4, $5, $6, $7
+FROM narthex_accounts
+WHERE name=$1 AND incarnation_id=$3
+ON CONFLICT (account_name, subject) DO UPDATE SET
+	incarnation_id=EXCLUDED.incarnation_id, access_token=EXCLUDED.access_token,
+	refresh_token=EXCLUDED.refresh_token, bearer_token=EXCLUDED.bearer_token,
+	updated_at=EXCLUDED.updated_at`,
+		credential.Account, credential.Subject, credential.IncarnationID,
+		encrypted[0], encrypted[1], encrypted[2], credential.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrAccountIncarnation
+	}
+	return nil
+}
+
+func (s *PgStore) DeleteMemberCredential(ctx context.Context, account, subject string) error {
+	_, err := s.pool.Exec(ctx, `
+DELETE FROM narthex_account_member_credentials WHERE account_name=$1 AND subject=$2`, account, subject)
+	return err
 }

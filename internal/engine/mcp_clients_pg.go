@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 	"time"
 
@@ -72,6 +73,12 @@ ALTER TABLE narthex_mcp_clients ADD COLUMN IF NOT EXISTS agent_profile_bound_at 
 -- Kind is fixed at creation. Every row that predates it is interactive, which
 -- the column default supplies when the column is first added.
 ALTER TABLE narthex_mcp_clients ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'interactive';
+-- Exact connection grants pin the immutable account incarnation, never a folder.
+ALTER TABLE narthex_mcp_clients ADD COLUMN IF NOT EXISTS connection_grants JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE narthex_mcp_clients ADD COLUMN IF NOT EXISTS interactive_client_id TEXT NOT NULL DEFAULT '';
+CREATE UNIQUE INDEX IF NOT EXISTS narthex_mcp_clients_active_interactive_link_unique
+    ON narthex_mcp_clients (interactive_client_id)
+    WHERE interactive_client_id <> '' AND status='active';
 -- A revoked client retains its history but must not permanently prevent
 -- deleting an otherwise-empty credential folder. Active grants are rejected
 -- by the application before delete; cascade only prunes inert grant rows.
@@ -132,6 +139,15 @@ BEGIN
                 OR (kind <> 'workload' AND left(oauth_client_id, 9) <> 'workload:')
             );
     END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'narthex_mcp_clients_interactive_link_check'
+          AND conrelid = 'narthex_mcp_clients'::regclass
+    ) THEN
+        ALTER TABLE narthex_mcp_clients
+            ADD CONSTRAINT narthex_mcp_clients_interactive_link_check
+            CHECK (interactive_client_id = '' OR (kind = 'workload' AND interactive_client_id <> id));
+    END IF;
 END $$;`
 
 var _ MCPClientStore = (*PgStore)(nil)
@@ -143,7 +159,7 @@ var _ MCPClientStore = (*PgStore)(nil)
 const mcpClientColumns = `c.id,c.slug,c.name,c.subject,c.oauth_client_id,c.runtime_attestor_public_key,c.status,c.epoch,c.revision,
        c.created_by,c.created_at,c.updated_at,c.revoked_at,c.revoked_by,
        c.agent_profile_id,c.agent_profile_revision,c.agent_profile_policy_digest,c.agent_profile_bound_at,
-       c.kind`
+       c.kind,c.connection_grants,c.interactive_client_id`
 
 const mcpClientSelect = `
 SELECT ` + mcpClientColumns + `,
@@ -201,13 +217,14 @@ func scanMCPClientColumns(row pgx.Row, extra ...any) (MCPClient, error) {
 		&client.Status, &client.Epoch, &client.Revision, &client.CreatedBy,
 		&client.CreatedAt, &client.UpdatedAt, &client.RevokedAt, &client.RevokedBy,
 		&profile.profileID, &profile.profileRevision, &profile.policyDigest, &profile.boundAt,
-		&client.Kind,
+		&client.Kind, &client.ConnectionGrants, &client.InteractiveClientID,
 	}
 	targets = append(targets, extra...)
 	if err := row.Scan(targets...); err != nil {
 		return MCPClient{}, err
 	}
 	client.AgentProfileBinding = profile.binding()
+	client.ConnectionIDs = mcpClientConnectionIDs(client.ConnectionGrants)
 	// The CHECK admits only the two kinds; normalizing keeps an unexpected
 	// value from ever being classified as a workload client.
 	client.Kind = mcpClientKind(client)
@@ -370,8 +387,8 @@ SELECT EXISTS(
     SELECT 1 FROM narthex_accounts
     WHERE connection_namespace_id=$1
       AND connection_scope='personal'
-      AND owner_subject <> $2
-)`, namespaceID, client.Subject).Scan(&crossSubjectPersonal); err != nil {
+      AND (owner_subject <> $2 OR $3 <> '')
+)`, namespaceID, client.Subject, client.InteractiveClientID).Scan(&crossSubjectPersonal); err != nil {
 			return err
 		}
 		if crossSubjectPersonal {
@@ -416,12 +433,12 @@ func lockActiveMCPClientsForAccountMoveTx(ctx context.Context, tx pgx.Tx, namesp
 SELECT c.id
 FROM narthex_mcp_clients c
 WHERE c.status='active'
-  AND EXISTS (
+  AND (c.connection_grants <> '{}'::jsonb OR EXISTS (
       SELECT 1
       FROM narthex_mcp_client_namespaces g
       WHERE g.client_id=c.id
         AND g.connection_namespace_id=ANY($1)
-  )
+  ))
 ORDER BY c.id
 FOR UPDATE`, namespaceIDs)
 	if err != nil {
@@ -513,11 +530,11 @@ func validatePersonalAccountMCPClientGrantsTx(ctx context.Context, tx pgx.Tx, ac
 SELECT EXISTS(
     SELECT 1
     FROM narthex_mcp_clients c
-    JOIN narthex_mcp_client_namespaces g ON g.client_id=c.id
+    LEFT JOIN narthex_mcp_client_namespaces g ON g.client_id=c.id
     WHERE c.status='active'
-      AND g.connection_namespace_id=$1
-      AND c.subject <> $2
-)`, account.ConnectionNamespaceID, account.OwnerSubject).Scan(&conflict); err != nil {
+      AND (g.connection_namespace_id=$1 OR c.connection_grants->>$3=$4)
+      AND (c.subject <> $2 OR c.interactive_client_id <> '')
+)`, account.ConnectionNamespaceID, account.OwnerSubject, account.Name, account.IncarnationID).Scan(&conflict); err != nil {
 		return err
 	}
 	if conflict {
@@ -548,7 +565,7 @@ ORDER BY c.slug,c.id`)
 
 func (s *PgStore) ActiveMCPClients(ctx context.Context) ([]MCPClient, error) {
 	rows, err := s.pool.Query(ctx, mcpClientSelect+`
-WHERE c.status='active'`+mcpClientGroupBy+`
+WHERE c.status='active' AND (c.interactive_client_id='' OR EXISTS (SELECT 1 FROM narthex_mcp_clients source WHERE source.id=c.interactive_client_id AND source.status='active' AND source.kind='interactive'))`+mcpClientGroupBy+`
 ORDER BY c.slug,c.id`)
 	if err != nil {
 		return nil, err
@@ -573,6 +590,19 @@ func (s *PgStore) MCPClient(ctx context.Context, id string) (MCPClient, bool) {
 	return client, true
 }
 
+// LookupMCPClient preserves database failures for lifecycle reconciliation.
+// Only a successful query with no row is evidence that a client is missing.
+func (s *PgStore) LookupMCPClient(ctx context.Context, id string) (MCPClient, bool, error) {
+	client, err := loadMCPClient(ctx, s.pool, strings.TrimSpace(id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return MCPClient{}, false, nil
+	}
+	if err != nil {
+		return MCPClient{}, false, err
+	}
+	return client, true, nil
+}
+
 func (s *PgStore) MCPClientBySlug(ctx context.Context, slug string) (MCPClient, bool) {
 	client, err := scanMCPClient(s.pool.QueryRow(ctx, mcpClientSelect+`
 WHERE c.slug=$1`+mcpClientGroupBy, normalizeMCPClientSlug(slug)))
@@ -582,12 +612,33 @@ WHERE c.slug=$1`+mcpClientGroupBy, normalizeMCPClientSlug(slug)))
 	return client, true
 }
 
+// LookupActiveMCPClient resolves an endpoint slug in one query and, unlike
+// ActiveMCPClient, reports a failed read as an error instead of "not found".
+func (s *PgStore) LookupActiveMCPClient(ctx context.Context, slug string) (MCPClient, bool, error) {
+	client, err := scanMCPClient(s.pool.QueryRow(ctx, mcpClientSelect+`
+WHERE c.slug=$1`+mcpClientGroupBy, normalizeMCPClientSlug(slug)))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return MCPClient{}, false, nil
+	}
+	if err != nil {
+		return MCPClient{}, false, err
+	}
+	sourceActive, sourceErr := linkedMCPClientSourceActiveTx(ctx, s.pool, client)
+	if sourceErr != nil {
+		return MCPClient{}, false, sourceErr
+	}
+	if client.Status != MCPClientStatusActive || !sourceActive {
+		return MCPClient{}, false, nil
+	}
+	return client, true, nil
+}
+
 func (s *PgStore) ActiveMCPClient(ctx context.Context, endpointIdentifier string) (MCPClient, bool) {
-	if client, ok := s.MCPClient(ctx, endpointIdentifier); ok && client.Status == MCPClientStatusActive {
+	if client, ok := s.MCPClient(ctx, endpointIdentifier); ok && client.Status == MCPClientStatusActive && linkedMCPClientSourceActive(ctx, s, client) {
 		return client, true
 	}
 	client, ok := s.MCPClientBySlug(ctx, endpointIdentifier)
-	if !ok || client.Status != MCPClientStatusActive {
+	if !ok || client.Status != MCPClientStatusActive || !linkedMCPClientSourceActive(ctx, s, client) {
 		return MCPClient{}, false
 	}
 	return client, true
@@ -599,7 +650,7 @@ func (s *PgStore) ActiveMCPClientByOAuthClientID(ctx context.Context, oauthClien
 		return MCPClient{}, false
 	}
 	client, err := scanMCPClient(s.pool.QueryRow(ctx, mcpClientSelect+`
-WHERE c.oauth_client_id=$1 AND c.status='active'`+mcpClientGroupBy, oauthClientID))
+WHERE c.oauth_client_id=$1 AND c.status='active' AND (c.interactive_client_id='' OR EXISTS (SELECT 1 FROM narthex_mcp_clients source WHERE source.id=c.interactive_client_id AND source.status='active' AND source.kind='interactive'))`+mcpClientGroupBy, oauthClientID))
 	if err != nil {
 		return MCPClient{}, false
 	}
@@ -618,6 +669,9 @@ func (s *PgStore) CreateMCPClient(ctx context.Context, client MCPClient) (MCPCli
 	// This inexpensive workspace-local lock serializes the active-record cap,
 	// slug suffix selection, and public OAuth-ID uniqueness across replicas.
 	if err := lockMCPClientRegistryTx(ctx, tx); err != nil {
+		return MCPClient{}, err
+	}
+	if err := validateLinkedMCPClientCreateTx(ctx, tx, client); err != nil {
 		return MCPClient{}, err
 	}
 	var idExists bool
@@ -665,12 +719,12 @@ func (s *PgStore) CreateMCPClient(ctx context.Context, client MCPClient) (MCPCli
 	if _, err := tx.Exec(ctx, `
 INSERT INTO narthex_mcp_clients
     (id,slug,name,subject,oauth_client_id,runtime_attestor_public_key,status,epoch,revision,created_by,created_at,updated_at,revoked_at,revoked_by,
-     agent_profile_id,agent_profile_revision,agent_profile_policy_digest,agent_profile_bound_at,kind)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
+     agent_profile_id,agent_profile_revision,agent_profile_policy_digest,agent_profile_bound_at,kind,interactive_client_id)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
 		client.ID, client.Slug, client.Name, client.Subject, client.OAuthClientID, client.RuntimeAttestorPublicKey,
 		client.Status, client.Epoch, client.Revision, client.CreatedBy,
 		client.CreatedAt, client.UpdatedAt, client.RevokedAt, client.RevokedBy,
-		profileID, profileRevision, policyDigest, profileBoundAt, string(client.Kind)); err != nil {
+		profileID, profileRevision, policyDigest, profileBoundAt, string(client.Kind), client.InteractiveClientID); err != nil {
 		return MCPClient{}, err
 	}
 	// Once the managed manifest is installed, client creation keeps the global
@@ -686,6 +740,12 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
 		return MCPClient{}, err
 	}
 	if err := validateMCPClientNamespacesTx(ctx, tx, client); err != nil {
+		return MCPClient{}, err
+	}
+	if err := captureMCPClientConnectionsTx(ctx, tx, &client); err != nil {
+		return MCPClient{}, err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE narthex_mcp_clients SET connection_grants=$2 WHERE id=$1`, client.ID, client.ConnectionGrants); err != nil {
 		return MCPClient{}, err
 	}
 	for _, namespaceID := range client.ConnectionNamespaceIDs {
@@ -730,6 +790,9 @@ func (s *PgStore) UpdateMCPClient(ctx context.Context, update MCPClient, precond
 	if update.Kind != "" && update.Kind != mcpClientKind(client) {
 		return MCPClient{}, fmt.Errorf("%w: kind is immutable", ErrInvalidMCPClient)
 	}
+	if update.InteractiveClientID != "" && update.InteractiveClientID != client.InteractiveClientID {
+		return MCPClient{}, fmt.Errorf("%w: interactive link is immutable", ErrInvalidMCPClient)
+	}
 	if update.agentProfileBindingSet || update.AgentProfileBinding != nil {
 		return MCPClient{}, fmt.Errorf("%w: agent profile binding changes require the profile-binding operation", ErrInvalidMCPClient)
 	}
@@ -765,6 +828,14 @@ RETURNING epoch,revision,updated_at`, client.ID, name, key, newEpoch()).Scan(&cl
 }
 
 func (s *PgStore) SetMCPClientNamespaces(ctx context.Context, id string, namespaceIDs []string, precondition MCPClientPrecondition) (MCPClient, error) {
+	return s.setMCPClientAccess(ctx, id, namespaceIDs, nil, precondition)
+}
+
+func (s *PgStore) SetMCPClientAccess(ctx context.Context, id string, namespaceIDs, connectionIDs []string, precondition MCPClientPrecondition) (MCPClient, error) {
+	return s.setMCPClientAccess(ctx, id, namespaceIDs, &connectionIDs, precondition)
+}
+
+func (s *PgStore) setMCPClientAccess(ctx context.Context, id string, namespaceIDs []string, connectionIDs *[]string, precondition MCPClientPrecondition) (MCPClient, error) {
 	namespaceIDs, err := normalizeMCPClientNamespaceIDs(namespaceIDs)
 	if err != nil {
 		return MCPClient{}, err
@@ -799,7 +870,16 @@ func (s *PgStore) SetMCPClientNamespaces(ctx context.Context, id string, namespa
 	if err := validateMCPClientNamespacesTx(ctx, tx, proposed); err != nil {
 		return MCPClient{}, err
 	}
-	if sameStrings(client.ConnectionNamespaceIDs, namespaceIDs) {
+	if connectionIDs != nil {
+		proposed.ConnectionIDs, err = normalizeMCPClientConnectionIDs(*connectionIDs)
+		if err != nil {
+			return MCPClient{}, err
+		}
+		if err := captureMCPClientConnectionsTx(ctx, tx, &proposed); err != nil {
+			return MCPClient{}, err
+		}
+	}
+	if sameStrings(client.ConnectionNamespaceIDs, namespaceIDs) && maps.Equal(client.ConnectionGrants, proposed.ConnectionGrants) {
 		if err := tx.Commit(ctx); err != nil {
 			return MCPClient{}, err
 		}
@@ -817,12 +897,14 @@ VALUES ($1,$2)`, client.ID, namespaceID); err != nil {
 	}
 	if err := tx.QueryRow(ctx, `
 UPDATE narthex_mcp_clients
-SET epoch=$2,revision=revision+1,updated_at=now()
+SET epoch=$2,revision=revision+1,updated_at=now(),connection_grants=$3
 WHERE id=$1
-RETURNING epoch,revision,updated_at`, client.ID, newEpoch()).Scan(&client.Epoch, &client.Revision, &client.UpdatedAt); err != nil {
+RETURNING epoch,revision,updated_at`, client.ID, newEpoch(), proposed.ConnectionGrants).Scan(&client.Epoch, &client.Revision, &client.UpdatedAt); err != nil {
 		return MCPClient{}, err
 	}
 	client.ConnectionNamespaceIDs = namespaceIDs
+	client.ConnectionIDs = proposed.ConnectionIDs
+	client.ConnectionGrants = proposed.ConnectionGrants
 	if err := tx.Commit(ctx); err != nil {
 		return MCPClient{}, err
 	}
@@ -830,6 +912,14 @@ RETURNING epoch,revision,updated_at`, client.ID, newEpoch()).Scan(&client.Epoch,
 }
 
 func (s *PgStore) BindMCPClientOAuthClient(ctx context.Context, id, oauthClientID string, precondition MCPClientPrecondition, actor PlatformActor) (MCPClient, error) {
+	return s.bindMCPClientOAuthClient(ctx, id, oauthClientID, precondition, actor, false)
+}
+
+func (s *PgStore) ReplaceMCPClientOAuthClient(ctx context.Context, id, oauthClientID string, precondition MCPClientPrecondition, actor PlatformActor) (MCPClient, error) {
+	return s.bindMCPClientOAuthClient(ctx, id, oauthClientID, precondition, actor, true)
+}
+
+func (s *PgStore) bindMCPClientOAuthClient(ctx context.Context, id, oauthClientID string, precondition MCPClientPrecondition, actor PlatformActor, replace bool) (MCPClient, error) {
 	oauthClientID = strings.TrimSpace(oauthClientID)
 	if !validMCPClientOAuthClientID(oauthClientID) {
 		return MCPClient{}, fmt.Errorf("%w: OAuth client ID is invalid", ErrInvalidMCPClient)
@@ -866,7 +956,7 @@ func (s *PgStore) BindMCPClientOAuthClient(ctx context.Context, id, oauthClientI
 		}
 		return client, nil
 	}
-	if client.OAuthClientID != "" {
+	if client.OAuthClientID != "" && !replace {
 		return MCPClient{}, ErrMCPClientOAuthBinding
 	}
 	var exists bool
@@ -982,6 +1072,9 @@ func (s *PgStore) RevokeMCPClient(ctx context.Context, id, revokedBy string, pre
 		return MCPClient{}, err
 	}
 	defer tx.Rollback(ctx)
+	if err := lockMCPClientRegistryTx(ctx, tx); err != nil {
+		return MCPClient{}, err
+	}
 	client, err := loadMCPClientForUpdate(ctx, tx, strings.TrimSpace(id))
 	if err != nil {
 		return MCPClient{}, err
@@ -1006,6 +1099,12 @@ RETURNING epoch,revision,updated_at,revoked_at,revoked_by`, client.ID, newEpoch(
 		return MCPClient{}, err
 	}
 	client.Status = MCPClientStatusRevoked
+	// Source revocation and every dependent workload epoch change commit together.
+	if _, err := tx.Exec(ctx, `UPDATE narthex_mcp_clients
+SET status='revoked',epoch=$2,revision=revision+1,updated_at=$3,revoked_at=$3,revoked_by=$4
+WHERE interactive_client_id=$1 AND status='active'`, client.ID, newEpoch(), now, revokedBy); err != nil {
+		return MCPClient{}, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return MCPClient{}, err
 	}

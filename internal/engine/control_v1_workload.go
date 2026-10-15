@@ -139,7 +139,7 @@ func (c *ConsoleAPI) prepareWorkloadTokenClient(ctx context.Context, store MCPCl
 		// unknown one on this route.
 		return MCPClient{}, mcpClientFailure(ErrMCPClientNotFound)
 	}
-	if client.Status != MCPClientStatusActive {
+	if client.Status != MCPClientStatusActive || !linkedMCPClientSourceActive(ctx, store, client) {
 		return MCPClient{}, mcpClientFailure(ErrMCPClientRevoked)
 	}
 	switch client.OAuthClientID {

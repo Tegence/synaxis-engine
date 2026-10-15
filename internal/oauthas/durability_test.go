@@ -77,6 +77,17 @@ func (s *memoryOAuthGrantStore) LoadRefreshGrant(_ context.Context, tokenHash st
 	return grant, true, nil
 }
 
+func (s *memoryOAuthGrantStore) RenewRefreshGrant(_ context.Context, tokenHash string, expiresAt, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	grant, ok := s.refresh[tokenHash]
+	if ok && now.Before(grant.ExpiresAt) && grant.ExpiresAt.Before(expiresAt) {
+		grant.ExpiresAt = expiresAt
+		s.refresh[tokenHash] = grant
+	}
+	return nil
+}
+
 func (s *memoryOAuthGrantStore) RevokeOAuthGrantsForResource(_ context.Context, resource string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -168,6 +179,7 @@ func (s *memoryOAuthGrantStore) ReleaseHostedConsentReplay(_ context.Context, re
 
 var _ OAuthGrantStore = (*memoryOAuthGrantStore)(nil)
 var _ OAuthGrantEpochStore = (*memoryOAuthGrantStore)(nil)
+var _ OAuthGrantRenewalStore = (*memoryOAuthGrantStore)(nil)
 
 type memoryDurableOAuthStore struct {
 	*memoryTokenGenerationStore
@@ -390,5 +402,74 @@ func TestEpochScopedResourceRevocationKeepsReplacementGrants(t *testing.T) {
 	}
 	if _, found, err := store.LoadRefreshGrant(context.Background(), durableGrantTokenHash(oldRefresh), now); err != nil || found {
 		t.Fatalf("retired-epoch refresh found=%v err=%v", found, err)
+	}
+}
+
+// A grant in regular use must not force a monthly re-authorization, but it
+// still lapses refreshTTL after its last use and never outlives
+// refreshMaxLifetime from the original consent. Tokens stay non-rotating.
+func TestRefreshGrantRenewsOnUseUpToItsMaximumLifetime(t *testing.T) {
+	store := newMemoryDurableOAuthStore()
+	epochs := map[string]string{"/mcp": "root-v1"}
+	issued := time.Date(2026, time.August, 9, 12, 0, 0, 0, time.UTC)
+	now := issued
+	server := newDurableOAuthServer(t, store, epochs, &now)
+	const clientID = "mcp_renewing_client"
+	const redirectURI = "https://client.example/callback"
+	verifier := strings.Repeat("r", 64)
+	exchange := tokenExchange(server, url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {createDurableCode(t, server, clientID, redirectURI, verifier, "/mcp")},
+		"client_id":     {clientID},
+		"redirect_uri":  {redirectURI},
+		"code_verifier": {verifier},
+	})
+	if exchange.Code != http.StatusOK {
+		t.Fatalf("code exchange = %d %s", exchange.Code, exchange.Body)
+	}
+	_, refreshToken := decodeTokenResponse(t, exchange)
+	refresh := func() int {
+		t.Helper()
+		response := tokenExchange(server, url.Values{
+			"grant_type": {"refresh_token"}, "refresh_token": {refreshToken}, "client_id": {clientID},
+		})
+		if response.Code == http.StatusOK {
+			if _, same := decodeTokenResponse(t, response); same != refreshToken {
+				t.Fatal("refresh rotated the refresh token")
+			}
+		}
+		return response.Code
+	}
+
+	// Used every 25 days, the grant outlives the old fixed 30-day expiry...
+	for now.Sub(issued) < refreshMaxLifetime-25*24*time.Hour {
+		now = now.Add(25 * 24 * time.Hour)
+		if code := refresh(); code != http.StatusOK {
+			t.Fatalf("refresh at day %d = %d", int(now.Sub(issued).Hours()/24), code)
+		}
+	}
+	// ...but not its maximum lifetime.
+	now = issued.Add(refreshMaxLifetime)
+	if code := refresh(); code != http.StatusBadRequest {
+		t.Fatalf("refresh at the maximum lifetime = %d, want 400", code)
+	}
+
+	// An unused grant still lapses refreshTTL after its last use.
+	issued = now
+	second := tokenExchange(server, url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {createDurableCode(t, server, clientID, redirectURI, verifier, "/mcp")},
+		"client_id":     {clientID},
+		"redirect_uri":  {redirectURI},
+		"code_verifier": {verifier},
+	})
+	_, refreshToken = decodeTokenResponse(t, second)
+	now = issued.Add(10 * 24 * time.Hour)
+	if code := refresh(); code != http.StatusOK {
+		t.Fatalf("refresh after 10 days = %d", code)
+	}
+	now = now.Add(refreshTTL)
+	if code := refresh(); code != http.StatusBadRequest {
+		t.Fatalf("refresh %s after its last use = %d, want 400", refreshTTL, code)
 	}
 }

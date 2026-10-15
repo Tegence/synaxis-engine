@@ -19,7 +19,9 @@ type mcpClientDTO struct {
 	Slug                         string                      `json:"slug"`
 	Name                         string                      `json:"name"`
 	Subject                      string                      `json:"subject"`
+	InteractiveClientID          string                      `json:"interactiveClientId,omitempty"`
 	Kind                         MCPClientKind               `json:"kind"` // "interactive" or "workload"; fixed at creation
+	ConnectionIDs                []string                    `json:"connectionIds"`
 	ConnectionNamespaceIDs       []string                    `json:"connectionNamespaceIds"`
 	Status                       MCPClientStatus             `json:"status"`
 	OAuthBound                   bool                        `json:"oauthBound"`
@@ -165,7 +167,9 @@ func (c *ConsoleAPI) toMCPClientDTO(actor PlatformActor, client MCPClient) mcpCl
 		Name:                         client.Name,
 		Subject:                      client.Subject,
 		Kind:                         mcpClientKind(client),
+		InteractiveClientID:          client.InteractiveClientID,
 		ConnectionNamespaceIDs:       append([]string(nil), client.ConnectionNamespaceIDs...),
+		ConnectionIDs:                append([]string(nil), client.ConnectionIDs...),
 		Status:                       client.Status,
 		OAuthBound:                   client.OAuthClientID != "",
 		RuntimeAttestationConfigured: client.RuntimeAttestorPublicKey != "",
@@ -208,6 +212,10 @@ func mcpClientFailure(err error) *consoleFailure {
 		return newConsoleFailure(http.StatusTooManyRequests, controlCodeCapacityLimited, "MCP client capacity limit reached")
 	case errors.Is(err, ErrMCPClientNamespaceSubject):
 		return newConsoleFailure(http.StatusUnprocessableEntity, controlCodeValidationFailed, "the selected namespace contains a personal connection for another member")
+	case errors.Is(err, ErrAccountIncarnation):
+		return newConsoleFailure(http.StatusConflict, controlCodeRevisionMismatch, "connection changed; remove its old grant before selecting the replacement")
+	case errors.Is(err, ErrAccountNotFound):
+		return newConsoleFailure(http.StatusNotFound, controlCodeNotFound, "connection not found")
 	case errors.Is(err, ErrConnectionNamespaceNotFound):
 		// Keep a folder identifier from becoming an enumeration oracle.
 		return newConsoleFailure(http.StatusNotFound, controlCodeNotFound, "connection namespace not found")
@@ -333,7 +341,10 @@ func (c *ConsoleAPI) createMCPClient(w http.ResponseWriter, r *http.Request, wir
 		Slug                     string        `json:"slug"`
 		Subject                  string        `json:"subject"`
 		Kind                     MCPClientKind `json:"kind"`
+		InteractiveClientID      string        `json:"interactiveClientId"`
+		SourceRevision           int64         `json:"sourceRevision"`
 		ConnectionNamespaceIDs   []string      `json:"connectionNamespaceIds"`
+		ConnectionIDs            []string      `json:"connectionIds"`
 		RuntimeAttestorPublicKey string        `json:"runtimeAttestorPublicKey"`
 	}
 	if failure := wire.decodeJSON(w, r, &request); failure != nil {
@@ -376,6 +387,15 @@ func (c *ConsoleAPI) createMCPClient(w http.ResponseWriter, r *http.Request, wir
 		wire.writeFailure(w, mcpClientNamespaceAccessFailure(err))
 		return
 	}
+	connectionIDs, err := normalizeMCPClientConnectionIDs(request.ConnectionIDs)
+	if err != nil {
+		wire.writeFailure(w, mcpClientFailure(err))
+		return
+	}
+	if err := c.validateMCPClientConnectionAccess(r.Context(), actor, subject, connectionIDs); err != nil {
+		wire.writeFailure(w, mcpClientFailure(err))
+		return
+	}
 	name := strings.TrimSpace(request.Name)
 	if wire.control {
 		// The control contract treats the caller-chosen slug as a natural key:
@@ -385,7 +405,7 @@ func (c *ConsoleAPI) createMCPClient(w http.ResponseWriter, r *http.Request, wir
 		if slug := normalizeMCPClientSlug(request.Slug); slug != "" {
 			if existing, found := store.MCPClientBySlug(r.Context(), slug); found && existing.Status == MCPClientStatusActive {
 				if canReadMCPClient(actor, existing) && existing.Name == name && existing.Subject == subject && mcpClientKind(existing) == kind &&
-					sameStrings(existing.ConnectionNamespaceIDs, namespaceIDs) && existing.RuntimeAttestorPublicKey == request.RuntimeAttestorPublicKey {
+					existing.InteractiveClientID == request.InteractiveClientID && sameStrings(existing.ConnectionNamespaceIDs, namespaceIDs) && sameStrings(existing.ConnectionIDs, connectionIDs) && existing.RuntimeAttestorPublicKey == request.RuntimeAttestorPublicKey {
 					writeJSON(w, http.StatusOK, c.toMCPClientDTO(actor, existing))
 					return
 				}
@@ -399,7 +419,10 @@ func (c *ConsoleAPI) createMCPClient(w http.ResponseWriter, r *http.Request, wir
 		Slug:                   strings.TrimSpace(request.Slug),
 		Subject:                subject,
 		Kind:                   kind,
+		InteractiveClientID:    request.InteractiveClientID,
+		SourceRevision:         request.SourceRevision,
 		ConnectionNamespaceIDs: namespaceIDs,
+		ConnectionIDs:          connectionIDs,
 		// Keep the key byte-for-byte so the core canonical-key validator rejects
 		// accidental whitespace instead of silently configuring a different
 		// attestor identity.
@@ -513,8 +536,9 @@ func (c *ConsoleAPI) serveMCPClientNamespaces(w http.ResponseWriter, r *http.Req
 		return
 	}
 	var request struct {
-		ConnectionNamespaceIDs []string `json:"connectionNamespaceIds"`
-		Revision               int64    `json:"revision"`
+		ConnectionNamespaceIDs []string  `json:"connectionNamespaceIds"`
+		ConnectionIDs          *[]string `json:"connectionIds"`
+		Revision               int64     `json:"revision"`
 	}
 	if failure := wire.decodeJSON(w, r, &request); failure != nil {
 		wire.writeFailure(w, failure)
@@ -533,7 +557,26 @@ func (c *ConsoleAPI) serveMCPClientNamespaces(w http.ResponseWriter, r *http.Req
 		wire.writeFailure(w, mcpClientNamespaceAccessFailure(err))
 		return
 	}
-	updated, err := store.SetMCPClientNamespaces(r.Context(), client.ID, namespaceIDs, MCPClientPrecondition{ID: client.ID, Revision: request.Revision})
+	var updated MCPClient
+	if request.ConnectionIDs != nil {
+		ids, normalizeErr := normalizeMCPClientConnectionIDs(*request.ConnectionIDs)
+		if normalizeErr != nil {
+			wire.writeFailure(w, mcpClientFailure(normalizeErr))
+			return
+		}
+		if accessErr := c.validateMCPClientConnectionAccess(r.Context(), actor, client.Subject, ids); accessErr != nil {
+			wire.writeFailure(w, mcpClientFailure(accessErr))
+			return
+		}
+		accessStore, supported := store.(MCPClientAccessStore)
+		if !supported {
+			wire.writeFailure(w, newConsoleFailure(http.StatusNotImplemented, controlCodeCapabilityUnavailable, "individual connection access is unavailable"))
+			return
+		}
+		updated, err = accessStore.SetMCPClientAccess(r.Context(), client.ID, namespaceIDs, ids, MCPClientPrecondition{ID: client.ID, Revision: request.Revision})
+	} else {
+		updated, err = store.SetMCPClientNamespaces(r.Context(), client.ID, namespaceIDs, MCPClientPrecondition{ID: client.ID, Revision: request.Revision})
+	}
 	if err != nil {
 		wire.writeFailure(w, mcpClientFailure(err))
 		return

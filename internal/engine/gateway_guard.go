@@ -21,7 +21,11 @@ package engine
 //     serialization (redacted, charged to the size budget, injection-scanned;
 //     structuredContent is dropped whole if it overflows the budget, and
 //     either carrier is dropped rather than passed through if it no longer
-//     parses after redaction).
+//     parses after redaction);
+//   - nested tool_result content, sharing the same text/structured budget.
+//
+// Unsupported input requests, tool_use content and excessive nesting become
+// an explicit tool error. They are never passed through as unguarded binary.
 //
 // Binary items (images, audio, blob resources) pass through untouched and
 // don't count toward the size budget. Protocol errors (err != nil, no result)
@@ -182,7 +186,12 @@ func guardSerialized(v any, g compiledGuards, out any) (size, redactions int, fl
 			}
 		}
 	}
-	if err := json.Unmarshal([]byte(s), out); err != nil {
+	if !json.Valid([]byte(s)) {
+		return len(s), redactions, flagged, false
+	}
+	decoder := json.NewDecoder(strings.NewReader(s))
+	decoder.UseNumber()
+	if err := decoder.Decode(out); err != nil {
 		return len(s), redactions, flagged, false
 	}
 	return len(s), redactions, flagged, true
@@ -193,142 +202,181 @@ func guardSerialized(v any, g compiledGuards, out any) (size, redactions int, fl
 // resources) plus its structuredContent/_meta carriers, and returns the
 // guarded result plus the
 // comma-joined guard markers for the audit row ("truncated", "redacted:N",
-// "flagged:injection"; "" = nothing fired). The input result is not mutated —
+// "flagged:injection", "blocked:unsupported_content"; "" = nothing fired).
+// The input result is not mutated —
 // a shallow copy with a fresh Content slice is returned when anything at all
 // needs inspecting (cheap: content items are small headers over strings).
 func applyGuards(res *mcp.CallToolResult, g compiledGuards) (*mcp.CallToolResult, string) {
 	if res == nil {
 		return res, ""
 	}
-	content := make([]mcp.Content, len(res.Content))
-	copy(content, res.Content)
+	if !res.ResultType.IsComplete() || res.InputRequests != nil || res.RequestState != "" {
+		return unsupportedGuardResult()
+	}
+	p := guardPipeline{guards: g, budget: g.maxBytes}
+	out := *res
+	out.Content = p.content(res.Content, 0)
+	if p.unsupported {
+		return unsupportedGuardResult()
+	}
+	out.StructuredContent = p.structured(res.StructuredContent, res.RawStructuredContent)
+	// mcp-go prefers its preserved wire JSON when marshaling. Only the
+	// guarded replacement may leave this pipeline; the input stays intact.
+	out.RawStructuredContent = nil
+	out.Meta = p.meta(res.Meta)
+	var marks []string
+	if p.truncated {
+		marks = append(marks, "truncated")
+	}
+	if p.redactions > 0 {
+		marks = append(marks, fmt.Sprintf("redacted:%d", p.redactions))
+	}
+	if p.flagged {
+		marks = append(marks, "flagged:injection")
+	}
+	return &out, strings.Join(marks, ",")
+}
 
-	// 1) Redact: every operator pattern, every guardable text item (plain
-	// text and embedded text resources), count replacements.
-	redactions := 0
-	for i, c := range content {
-		text, ok := getGuardableText(c)
-		if !ok {
+func unsupportedGuardResult() (*mcp.CallToolResult, string) {
+	return mcp.NewToolResultError("The upstream tool result used an unsupported response format and was not returned."), "blocked:unsupported_content"
+}
+
+// A tool_result content item can itself contain more tool results. Limit
+// recursion independently of the complete result-byte cap and refuse carriers
+// we cannot guard, rather than treating arbitrary model-visible input as binary.
+const maxGuardContentDepth = 32
+
+type guardPipeline struct {
+	guards        compiledGuards
+	budget        int
+	redactions    int
+	truncated     bool
+	textExhausted bool
+	flagged       bool
+	unsupported   bool
+}
+
+func (p *guardPipeline) content(content []mcp.Content, depth int) []mcp.Content {
+	kept := make([]mcp.Content, 0, len(content))
+	for _, c := range content {
+		switch nested := c.(type) {
+		case mcp.ToolResultContent:
+			if depth >= maxGuardContentDepth {
+				p.unsupported = true
+				return nil
+			}
+			kept = append(kept, p.toolResult(nested, depth+1))
+			if p.unsupported {
+				return nil
+			}
+			continue
+		case *mcp.ToolResultContent:
+			if nested == nil || depth >= maxGuardContentDepth {
+				p.unsupported = true
+				return nil
+			}
+			copy := p.toolResult(*nested, depth+1)
+			if p.unsupported {
+				return nil
+			}
+			kept = append(kept, &copy)
 			continue
 		}
-		changed := false
-		for _, re := range g.redact {
+		text, ok := getGuardableText(c)
+		if !ok {
+			switch c.(type) {
+			case mcp.ImageContent, *mcp.ImageContent, mcp.AudioContent, *mcp.AudioContent,
+				mcp.EmbeddedResource, *mcp.EmbeddedResource, mcp.ResourceLink, *mcp.ResourceLink:
+				kept = append(kept, c)
+			default:
+				// tool_use carries arbitrary input, not an ordinary tool
+				// result. Unknown future carriers also fail closed here.
+				p.unsupported = true
+				return nil
+			}
+			continue
+		}
+		for _, re := range p.guards.redact {
 			if n := len(re.FindAllStringIndex(text, -1)); n > 0 {
-				redactions += n
+				p.redactions += n
 				text = re.ReplaceAllString(text, redactedMark)
-				changed = true
 			}
 		}
-		if changed {
-			content[i] = setGuardableText(c, text)
+		if p.guards.maxBytes > 0 {
+			if p.textExhausted {
+				continue
+			}
+			if len(text) > p.budget {
+				text = text[:runeBoundary(text, p.budget)] +
+					fmt.Sprintf("\n\n[narthex: result truncated at %d bytes]", p.guards.maxBytes)
+				p.truncated, p.textExhausted = true, true
+				p.budget = 0
+			} else {
+				p.budget -= len(text)
+			}
 		}
-	}
-
-	// 2) Size cap: total guardable-text bytes across items, in order. The
-	// first item that overflows the remaining budget is truncated rune-safely
-	// and gets the visible marker; every later guardable item is dropped
-	// entirely. Binary items pass through untouched and are not charged.
-	// `budget` carries what's left so structuredContent (step 4) is charged
-	// against the same cap.
-	truncated := false
-	budget := g.maxBytes
-	if g.maxBytes > 0 {
-		kept := make([]mcp.Content, 0, len(content))
-		for _, c := range content {
-			text, ok := getGuardableText(c)
-			if !ok {
-				kept = append(kept, c)
-				continue
-			}
-			if truncated {
-				continue // budget already spent — drop the item
-			}
-			if len(text) <= budget {
-				budget -= len(text)
-				kept = append(kept, c)
-				continue
-			}
-			text = text[:runeBoundary(text, budget)] +
-				fmt.Sprintf("\n\n[narthex: result truncated at %d bytes]", g.maxBytes)
-			truncated = true
-			budget = 0
-			kept = append(kept, setGuardableText(c, text))
-		}
-		content = kept
-	}
-
-	// 3) Injection scan (post-redaction/cap — what the model will see).
-	// Flag only; never modify.
-	flagged := false
-	if g.scanInjection {
-	scan:
-		for _, c := range content {
-			text, ok := getGuardableText(c)
-			if !ok {
-				continue
-			}
+		if p.guards.scanInjection {
 			for _, re := range injectionPatterns {
 				if re.MatchString(text) {
-					flagged = true
-					break scan
+					p.flagged = true
+					break
 				}
 			}
 		}
+		kept = append(kept, setGuardableText(c, text))
 	}
+	return kept
+}
 
-	// 4) Non-Content carriers. structuredContent and result _meta are parsed
-	// off the upstream wire and re-serialized to the client verbatim, so they
-	// are just as model-visible as text content and get the same treatment
-	// via their JSON serialization. This runs BEFORE the audit LogCall (the
-	// caller records the returned result), preserving the invariant that a
-	// recorded payload never contains what redaction removed.
-	structured := res.StructuredContent
-	if structured != nil {
-		var guarded any
-		size, n, fl, ok := guardSerialized(structured, g, &guarded)
-		redactions += n
-		flagged = flagged || fl
-		switch {
-		case !ok:
-			// Unserializable, or redaction broke the JSON structure (e.g. a
-			// pattern matched across quotes) — never pass the raw value on.
-			structured = map[string]any{"narthex": "structured content removed by redaction"}
-		case g.maxBytes > 0 && size > budget:
-			structured = nil // overflows the shared cap — drop it whole
-			truncated = true
-		default:
-			if g.maxBytes > 0 {
-				budget -= size
-			}
-			structured = guarded
+func (p *guardPipeline) toolResult(result mcp.ToolResultContent, depth int) mcp.ToolResultContent {
+	result.Content = p.content(result.Content, depth)
+	result.StructuredContent = p.structured(result.StructuredContent, result.RawStructuredContent)
+	result.RawStructuredContent = nil
+	result.Meta = p.meta(result.Meta)
+	return result
+}
+
+func (p *guardPipeline) structured(value any, raw json.RawMessage) any {
+	if len(raw) > 0 {
+		// Guard what the SDK would actually serialize. Normalize string
+		// escaping before redaction, while keeping integers above 2^53 exact.
+		decoder := json.NewDecoder(strings.NewReader(string(raw)))
+		decoder.UseNumber()
+		if !json.Valid(raw) || decoder.Decode(&value) != nil {
+			return map[string]any{"narthex": "structured content removed by redaction"}
 		}
 	}
-	meta := res.Meta
-	if meta != nil {
-		var guarded mcp.Meta
-		_, n, fl, ok := guardSerialized(meta, g, &guarded)
-		redactions += n
-		flagged = flagged || fl
-		if ok {
-			meta = &guarded
-		} else {
-			meta = nil // undecodable post-redaction — drop rather than leak
+	if value == nil {
+		return nil
+	}
+	var guarded any
+	size, n, flagged, ok := guardSerialized(value, p.guards, &guarded)
+	p.redactions += n
+	p.flagged = p.flagged || flagged
+	switch {
+	case !ok:
+		return map[string]any{"narthex": "structured content removed by redaction"}
+	case p.guards.maxBytes > 0 && size > p.budget:
+		p.truncated = true
+		return nil
+	default:
+		if p.guards.maxBytes > 0 {
+			p.budget -= size
 		}
+		return guarded
 	}
+}
 
-	var marks []string
-	if truncated {
-		marks = append(marks, "truncated")
+func (p *guardPipeline) meta(value *mcp.Meta) *mcp.Meta {
+	if value == nil {
+		return nil
 	}
-	if redactions > 0 {
-		marks = append(marks, fmt.Sprintf("redacted:%d", redactions))
+	var guarded mcp.Meta
+	_, n, flagged, ok := guardSerialized(value, p.guards, &guarded)
+	p.redactions += n
+	p.flagged = p.flagged || flagged
+	if !ok {
+		return nil
 	}
-	if flagged {
-		marks = append(marks, "flagged:injection")
-	}
-	out := *res
-	out.Content = content
-	out.StructuredContent = structured
-	out.Meta = meta
-	return &out, strings.Join(marks, ",")
+	return &guarded
 }

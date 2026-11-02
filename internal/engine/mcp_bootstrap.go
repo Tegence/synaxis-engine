@@ -89,14 +89,16 @@ func mcpBootstrapDescription(surface mcpBootstrapSurface) string {
 	}
 }
 
-func newSynaxisMCPServer(name string, surface mcpBootstrapSurface, features mcpBootstrapFeatures) *server.MCPServer {
-	return server.NewMCPServer(
-		name,
-		synaxisMCPServerVersion,
+func newSynaxisMCPServer(name string, surface mcpBootstrapSurface, features mcpBootstrapFeatures, extra ...server.ServerOption) *server.MCPServer {
+	options := append([]server.ServerOption{
 		server.WithDescription(mcpBootstrapDescription(surface)),
 		server.WithInstructions(mcpBootstrapInstructions(surface, features)),
 		server.WithToolCapabilities(true),
-	)
+		// A panicking tool handler becomes a tool error instead of net/http
+		// aborting the client's connection mid-response.
+		server.WithRecovery(),
+	}, extra...)
+	return server.NewMCPServer(name, synaxisMCPServerVersion, options...)
 }
 
 // NewRootMCPServer constructs the Engine's shared /mcp surface. Root Library

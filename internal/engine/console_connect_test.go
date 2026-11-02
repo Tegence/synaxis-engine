@@ -23,6 +23,8 @@ type fakeConnector struct {
 	startErr    error
 	finishErr   error
 	store       *FileStore
+	// memberAccount and memberSubject record the last StartMemberConnect.
+	memberAccount, memberSubject string
 }
 
 func (f *fakeConnector) StartConnect(_ context.Context, _, _, _, _, _ string, sc *StaticCreds) (string, error) {
@@ -31,6 +33,15 @@ func (f *fakeConnector) StartConnect(_ context.Context, _, _, _, _, _ string, sc
 	f.sawStatic = sc != nil
 	if f.authURL == "" {
 		f.authURL = "https://auth.example.com/authorize?client_id=x&state=y"
+	}
+	return f.authURL, f.startErr
+}
+
+func (f *fakeConnector) StartMemberConnect(_ context.Context, account Account, subject, _ string) (string, error) {
+	f.startCalled = true
+	f.memberAccount, f.memberSubject = account.Name, subject
+	if f.authURL == "" {
+		f.authURL = "https://auth.example.com/authorize?client_id=x&state=member"
 	}
 	return f.authURL, f.startErr
 }

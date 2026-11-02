@@ -407,9 +407,14 @@ func TestPlatformServiceActorAllowsOnlyExactControlV1ServiceRoutes(t *testing.T)
 	}{
 		{name: "meta", method: http.MethodGet, path: "/control/v1/meta"},
 		{name: "run correlations", method: http.MethodGet, path: "/control/v1/run-correlations"},
+		{name: "lifecycle state", method: http.MethodGet, path: clientPath + "/lifecycle-state"},
 		{name: "activation snapshot", method: http.MethodGet, path: clientPath + "/activation-snapshot"},
 		{name: "bind profile", method: http.MethodPut, path: clientPath + "/profile-binding", body: bindingBody},
 		{name: "unbind profile", method: http.MethodDelete, path: clientPath + "/profile-binding", body: []byte(`{"revision":2}`)},
+		// Connecting a member's workload client; the handlers limit both to
+		// workload clients and PATCH to libraryProjection plus revision.
+		{name: "set library projection", method: http.MethodPatch, path: clientPath, body: []byte(`{"libraryProjection":"private_outputs","revision":1}`)},
+		{name: "namespaces", method: http.MethodPut, path: clientPath + "/namespaces", body: []byte(`{"connectionNamespaceIds":[],"connectionIds":[],"revision":1}`)},
 	} {
 		t.Run(allowed.name, func(t *testing.T) {
 			claims := actorClaimsForTest(now, allowed.method, allowed.path, allowed.body)
@@ -433,12 +438,18 @@ func TestPlatformServiceActorAllowsOnlyExactControlV1ServiceRoutes(t *testing.T)
 		{name: "list clients", method: http.MethodGet, path: "/control/v1/mcp-clients"},
 		{name: "register client", method: http.MethodPost, path: "/control/v1/mcp-clients"},
 		{name: "read client", method: http.MethodGet, path: clientPath},
-		{name: "rename client", method: http.MethodPatch, path: clientPath},
-		{name: "namespaces", method: http.MethodPut, path: clientPath + "/namespaces"},
+		{name: "patch namespaces", method: http.MethodPatch, path: clientPath + "/namespaces"},
+		{name: "replace client", method: http.MethodPut, path: clientPath},
+		{name: "unsafe patch identifier", method: http.MethodPatch, path: "/control/v1/mcp-clients/mcpcli~123"},
+		{name: "unsafe namespaces identifier", method: http.MethodPut, path: "/control/v1/mcp-clients/mcpcli~123/namespaces"},
+		{name: "extra namespaces segment", method: http.MethodPut, path: clientPath + "/namespaces/extra"},
 		{name: "oauth reset", method: http.MethodPost, path: clientPath + "/oauth-client/reset"},
 		{name: "revoke", method: http.MethodPost, path: clientPath + "/revoke"},
 		{name: "wrong binding method", method: http.MethodPost, path: clientPath + "/profile-binding"},
 		{name: "wrong snapshot method", method: http.MethodPost, path: clientPath + "/activation-snapshot"},
+		{name: "wrong lifecycle method", method: http.MethodPost, path: clientPath + "/lifecycle-state"},
+		{name: "unsafe lifecycle identifier", method: http.MethodGet, path: "/control/v1/mcp-clients/mcpcli~123/lifecycle-state"},
+		{name: "extra lifecycle segment", method: http.MethodGet, path: clientPath + "/lifecycle-state/extra"},
 		{name: "wrong meta method", method: http.MethodPost, path: "/control/v1/meta"},
 		{name: "wrong feed method", method: http.MethodPost, path: "/control/v1/run-correlations"},
 		{name: "feed sub-resource", method: http.MethodGet, path: "/control/v1/run-correlations/lrc_1"},

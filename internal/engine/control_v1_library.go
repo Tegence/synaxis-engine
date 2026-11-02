@@ -18,6 +18,7 @@ import (
 // is served solely by the exact-version read after the same authorization.
 const (
 	controlSubjectHeader             = "X-Synaxis-Subject"
+	controlSubjectsHeader            = "X-Synaxis-Subjects"
 	controlLibraryArtifactPageLimit  = libraryControlArtifactPageMax
 	controlLibraryGrantReasonMaxSize = 1024
 	controlLibraryNotFoundTitle      = "library artifact not found"
@@ -59,17 +60,53 @@ func controlSubject(r *http.Request) (subject string, scoped bool, failure *cons
 	return values[0], true, nil
 }
 
-// controlSubjectSurfaces resolves a subject to the IDs of its active
-// subject-bound registrations. Revoked registrations drop out, so an artifact
-// they owned or were granted stops appearing in the subject's scope.
-func controlSubjectSurfaces(ctx context.Context, clients MCPClientStore, subject string) ([]string, *consoleFailure) {
+// controlLibrarySubjects supports the service's explicit artifact scope across
+// a member and the agents it owns. The control plane derives these identities;
+// this header is never accepted from an ordinary actor. A union is intentionally
+// unable to read chat replies, which require a separately authorized run read.
+func controlLibrarySubjects(r *http.Request, actor PlatformActor) ([]string, bool, bool, *consoleFailure) {
+	values := r.Header.Values(controlSubjectsHeader)
+	if len(values) == 0 {
+		subject, scoped, failure := controlSubject(r)
+		if !scoped || failure != nil {
+			return nil, scoped, false, failure
+		}
+		return []string{subject}, true, false, nil
+	}
+	if actor.Role != "service" || actor.UserID != platformServiceActorID {
+		return nil, false, true, newConsoleFailure(http.StatusForbidden, controlCodeForbidden, "combined Library scope requires the Platform service")
+	}
+	if len(values) != 1 || len(values[0]) > 16<<10 || len(r.Header.Values(controlSubjectHeader)) != 0 {
+		return nil, false, true, newConsoleFailure(http.StatusBadRequest, controlCodeValidationFailed, "invalid "+controlSubjectsHeader)
+	}
+	subjects := strings.Split(values[0], ",")
+	if len(subjects) > 100 {
+		return nil, false, true, newConsoleFailure(http.StatusBadRequest, controlCodeValidationFailed, "invalid "+controlSubjectsHeader)
+	}
+	seen := make(map[string]bool, len(subjects))
+	for _, subject := range subjects {
+		if validateMCPClientSubject(subject) != nil || seen[subject] {
+			return nil, false, true, newConsoleFailure(http.StatusBadRequest, controlCodeValidationFailed, "invalid "+controlSubjectsHeader)
+		}
+		seen[subject] = true
+	}
+	return subjects, true, true, nil
+}
+
+// controlSubjectsSurfaces resolves subjects to active registrations. Revoked
+// registrations cease contributing ownership or grant access to the union.
+func controlSubjectsSurfaces(ctx context.Context, clients MCPClientStore, subjects []string) ([]string, *consoleFailure) {
 	active, err := clients.ActiveMCPClients(ctx)
 	if err != nil {
 		return nil, newConsoleFailure(http.StatusBadGateway, controlCodeEngineUnavailable, "MCP client registry is unavailable")
 	}
-	surfaces := make([]string, 0, 2)
+	wanted := make(map[string]bool, len(subjects))
+	for _, subject := range subjects {
+		wanted[subject] = true
+	}
+	surfaces := make([]string, 0, len(subjects))
 	for _, client := range active {
-		if client.Subject == subject {
+		if wanted[client.Subject] {
 			surfaces = append(surfaces, client.ID)
 		}
 	}
@@ -143,6 +180,7 @@ func newControlLibraryVersionRefDTO(version LibraryArtifactVersion) controlLibra
 // agent-surface key (a structural projection reference, not an actor
 // identity) and never a version body.
 type controlLibraryArtifactDTO struct {
+	CreatedBy      string                       `json:"createdBy,omitempty"`
 	ID             string                       `json:"id"`
 	Title          string                       `json:"title"`
 	Summary        string                       `json:"summary"`
@@ -230,8 +268,11 @@ type controlLibraryArtifactDetailDTO struct {
 }
 
 type controlLibraryVersionBodyDTO struct {
-	Version controlLibraryVersionDTO `json:"version"`
-	Body    string                   `json:"body"`
+	ContentKind   string                    `json:"contentKind"`
+	Artifacts     []LibraryChatArtifactCard `json:"artifacts"`
+	SavedArtifact *LibraryChatArtifactCard  `json:"savedArtifact,omitempty"`
+	Version       controlLibraryVersionDTO  `json:"version"`
+	Body          string                    `json:"body"`
 }
 
 type controlLibraryRecipientDTO struct {
@@ -283,7 +324,7 @@ func controlLibraryFailure(err error) *consoleFailure {
 // With X-Synaxis-Subject the page is the subject's scope; without it an
 // owner, admin, or the service principal reads the whole catalog's metadata.
 func (c *ConsoleAPI) handleControlLibraryArtifacts(w http.ResponseWriter, r *http.Request) {
-	library, clients, _, failure := c.controlLibraryAdministration(r)
+	library, clients, actor, failure := c.controlLibraryAdministration(r)
 	if failure != nil {
 		controlWire.writeFailure(w, failure)
 		return
@@ -297,14 +338,14 @@ func (c *ConsoleAPI) handleControlLibraryArtifacts(w http.ResponseWriter, r *htt
 		controlWire.writeFailure(w, newConsoleFailure(http.StatusNotImplemented, controlCodeCapabilityUnavailable, "library control projection is not supported by this store"))
 		return
 	}
-	subject, scoped, failure := controlSubject(r)
+	subjects, scoped, _, failure := controlLibrarySubjects(r, actor)
 	if failure != nil {
 		controlWire.writeFailure(w, failure)
 		return
 	}
 	scope := LibraryControlArtifactScope{Everything: true}
 	if scoped {
-		surfaces, failure := controlSubjectSurfaces(r.Context(), clients, subject)
+		surfaces, failure := controlSubjectsSurfaces(r.Context(), clients, subjects)
 		if failure != nil {
 			controlWire.writeFailure(w, failure)
 			return
@@ -340,7 +381,7 @@ func (c *ConsoleAPI) handleControlLibraryArtifacts(w http.ResponseWriter, r *htt
 // artifact must be owned by or granted to the subject (404 otherwise), and a
 // mere grantee sees only the grants held by its own registrations.
 func (c *ConsoleAPI) handleControlLibraryArtifactByID(w http.ResponseWriter, r *http.Request) {
-	library, clients, _, failure := c.controlLibraryAdministration(r)
+	library, clients, actor, failure := c.controlLibraryAdministration(r)
 	if failure != nil {
 		controlWire.writeFailure(w, failure)
 		return
@@ -349,13 +390,13 @@ func (c *ConsoleAPI) handleControlLibraryArtifactByID(w http.ResponseWriter, r *
 		controlWire.writeMethodNotAllowed(w, http.MethodGet)
 		return
 	}
-	subject, scoped, failure := controlSubject(r)
+	subjects, scoped, combined, failure := controlLibrarySubjects(r, actor)
 	if failure != nil {
 		controlWire.writeFailure(w, failure)
 		return
 	}
 	artifact, found := library.LibraryArtifact(r.Context(), strings.TrimSpace(r.PathValue("id")))
-	if !found {
+	if !found || (combined && artifact.ContentKind == LibraryContentChatReply) {
 		controlWire.writeFailure(w, newConsoleFailure(http.StatusNotFound, controlCodeNotFound, controlLibraryNotFoundTitle))
 		return
 	}
@@ -380,7 +421,7 @@ func (c *ConsoleAPI) handleControlLibraryArtifactByID(w http.ResponseWriter, r *
 		UpdatedAt:     head.CreatedAt,
 	}
 	if scoped {
-		surfaces, failure := controlSubjectSurfaces(r.Context(), clients, subject)
+		surfaces, failure := controlSubjectsSurfaces(r.Context(), clients, subjects)
 		if failure != nil {
 			controlWire.writeFailure(w, failure)
 			return
@@ -392,19 +433,36 @@ func (c *ConsoleAPI) handleControlLibraryArtifactByID(w http.ResponseWriter, r *
 		}
 		item.Access, item.GrantedVersion = access, granted
 		if access == LibraryControlArtifactAccessGranted {
-			visible := grants[:0]
-			for _, grant := range grants {
-				if containsSurface(surfaces, grant.AgentSurfaceID) {
-					visible = append(visible, grant)
+			// Exact-version grants also bound metadata. A newer private head,
+			// revoked version, or another recipient's grant is not visible.
+			item.LatestVersion = *granted
+			item.UpdatedAt = granted.CreatedAt
+			visibleGrants := make([]LibraryArtifactGrant, 0, len(grants))
+			visibleVersions := make([]LibraryArtifactVersion, 0, len(versions))
+			for _, version := range versions {
+				visible := false
+				for _, grant := range grants {
+					if grant.RevokedAt.IsZero() && containsSurface(surfaces, grant.AgentSurfaceID) && grant.ArtifactVersionID == version.ID && grant.ArtifactVersionDigest == version.Digest {
+						visible = true
+						visibleGrants = append(visibleGrants, grant)
+					}
+				}
+				if visible {
+					visibleVersions = append(visibleVersions, version)
 				}
 			}
-			grants = visible
+			grants, versions = visibleGrants, visibleVersions
 		}
 	}
 	dto := controlLibraryArtifactDetailDTO{
 		controlLibraryArtifactDTO: newControlLibraryArtifactDTO(item),
 		Versions:                  make([]controlLibraryVersionDTO, 0, len(versions)),
 		Grants:                    make([]controlLibraryGrantDTO, 0, len(grants)),
+	}
+	// Only the internal, unscoped detail read carries the immutable creator
+	// for Platform ownership checks. Lists and member-scoped projections omit it.
+	if !scoped && actor.Role == "service" && actor.UserID == platformServiceActorID {
+		dto.CreatedBy = artifact.CreatedBy
 	}
 	for _, version := range versions {
 		dto.Versions = append(dto.Versions, newControlLibraryVersionDTO(version))
@@ -422,7 +480,7 @@ func (c *ConsoleAPI) handleControlLibraryArtifactByID(w http.ResponseWriter, r *
 // artifact, unknown version, and missing authorization are the same 404 so
 // the route is not an enumeration oracle.
 func (c *ConsoleAPI) handleControlLibraryArtifactVersion(w http.ResponseWriter, r *http.Request) {
-	library, clients, _, failure := c.controlLibraryAdministration(r)
+	library, clients, actor, failure := c.controlLibraryAdministration(r)
 	if failure != nil {
 		controlWire.writeFailure(w, failure)
 		return
@@ -431,7 +489,7 @@ func (c *ConsoleAPI) handleControlLibraryArtifactVersion(w http.ResponseWriter, 
 		controlWire.writeMethodNotAllowed(w, http.MethodGet)
 		return
 	}
-	subject, scoped, failure := controlSubject(r)
+	subjects, scoped, combined, failure := controlLibrarySubjects(r, actor)
 	if failure != nil {
 		controlWire.writeFailure(w, failure)
 		return
@@ -440,14 +498,14 @@ func (c *ConsoleAPI) handleControlLibraryArtifactVersion(w http.ResponseWriter, 
 		controlWire.writeFailure(w, newConsoleFailure(http.StatusBadRequest, controlCodeValidationFailed, controlSubjectHeader+" is required"))
 		return
 	}
-	surfaces, failure := controlSubjectSurfaces(r.Context(), clients, subject)
+	surfaces, failure := controlSubjectsSurfaces(r.Context(), clients, subjects)
 	if failure != nil {
 		controlWire.writeFailure(w, failure)
 		return
 	}
 	notFound := newConsoleFailure(http.StatusNotFound, controlCodeNotFound, controlLibraryNotFoundTitle)
 	artifact, found := library.LibraryArtifact(r.Context(), strings.TrimSpace(r.PathValue("id")))
-	if !found {
+	if !found || (combined && artifact.ContentKind == LibraryContentChatReply) {
 		controlWire.writeFailure(w, notFound)
 		return
 	}
@@ -468,7 +526,17 @@ func (c *ConsoleAPI) handleControlLibraryArtifactVersion(w http.ResponseWriter, 
 		controlWire.writeFailure(w, notFound)
 		return
 	}
-	writeJSON(w, http.StatusOK, controlLibraryVersionBodyDTO{Version: newControlLibraryVersionDTO(version), Body: version.Body})
+	if strings.HasSuffix(r.URL.Path, "/media") {
+		c.writeControlLibraryArtifactMedia(w, r, artifact, version)
+		return
+	}
+	dto := controlLibraryVersionBodyDTO{Version: newControlLibraryVersionDTO(version), Body: version.Body, ContentKind: libraryContentKind(artifact.ContentKind), Artifacts: []LibraryChatArtifactCard{}}
+	if chats, ok := library.(LibraryChatArtifactStore); ok && artifact.ContentKind == LibraryContentChatReply {
+		if cards, saved, err := chats.LibraryChatArtifactCards(r.Context(), artifact.ID, version.ID, surfaces); err == nil {
+			dto.Artifacts, dto.SavedArtifact = cards, saved
+		}
+	}
+	writeJSON(w, http.StatusOK, dto)
 }
 
 // handleControlLibraryArtifactGrants serves

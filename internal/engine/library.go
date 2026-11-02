@@ -305,6 +305,8 @@ var (
 // only in immutable LibrarySkillVersion rows; changing instructions always
 // creates another version.
 type LibrarySkill struct {
+	// Private skills belong to CreatedBy. Legacy skills remain administrator-managed.
+	Private     bool      `json:"private,omitempty"`
 	ID          string    `json:"id"`
 	Slug        string    `json:"slug"`
 	Name        string    `json:"name"`
@@ -397,6 +399,7 @@ type LibraryArtifactDraft struct {
 // never point at a ConnectionNamespace: those are credential ownership
 // boundaries, not Library organization or delivery scopes.
 type LibrarySkillBinding struct {
+	SharedGrantID     string    `json:"sharedGrantId,omitempty"`
 	ID                string    `json:"id"`
 	SkillID           string    `json:"skillId"`
 	ScopeKind         string    `json:"scopeKind"`
@@ -468,14 +471,17 @@ type LibraryRun struct {
 // immutable LibraryArtifactVersion, so a publication can always point to a
 // stable version/digest instead of a mutable head.
 type LibraryArtifact struct {
-	ID             string `json:"id"`
-	Title          string `json:"title"`
-	Summary        string `json:"summary,omitempty"`
-	Origin         string `json:"origin"`
-	RunID          string `json:"runId,omitempty"`
-	SkillID        string `json:"skillId,omitempty"`
-	SkillVersionID string `json:"skillVersionId,omitempty"`
-	BindingID      string `json:"bindingId,omitempty"`
+	// Empty is a legacy record, eligible only for provenance-backed classification.
+	ContentKind     string                   `json:"contentKind,omitempty"`
+	LinkedArtifacts []LibraryChatArtifactRef `json:"linkedArtifacts,omitempty"`
+	ID              string                   `json:"id"`
+	Title           string                   `json:"title"`
+	Summary         string                   `json:"summary,omitempty"`
+	Origin          string                   `json:"origin"`
+	RunID           string                   `json:"runId,omitempty"`
+	SkillID         string                   `json:"skillId,omitempty"`
+	SkillVersionID  string                   `json:"skillVersionId,omitempty"`
+	BindingID       string                   `json:"bindingId,omitempty"`
 	// AgentSurfaceID is a non-secret, durable client projection key for a
 	// subject-bound direct artifact. Actor identity remains private in
 	// CreatedBy; this opaque structural ID is intentionally not returned by
@@ -1193,6 +1199,9 @@ func validateLibraryRun(run LibraryRun) error {
 }
 
 func validateLibraryArtifact(artifact LibraryArtifact) error {
+	if err := validateLibraryChatArtifactFields(artifact); err != nil {
+		return err
+	}
 	if strings.TrimSpace(artifact.Title) == "" || len(artifact.Title) > libraryMaxNameBytes {
 		return fmt.Errorf("artifact title is required and must be at most %d bytes", libraryMaxNameBytes)
 	}
@@ -1395,6 +1404,7 @@ func prepareLibraryHumanArtifact(artifact LibraryArtifact, version LibraryArtifa
 	if version.ID != "" || version.ArtifactID != "" || version.Version != 0 {
 		return LibraryRun{}, LibraryArtifact{}, LibraryArtifactVersion{}, errors.New("human artifact version must derive immutable identity")
 	}
+	artifact.ContentKind = libraryContentKind(artifact.ContentKind)
 	artifact.ID = newLibraryArtifactID()
 	artifact.RunID = newLibraryRunID()
 	if artifact.CreatedAt.IsZero() {
@@ -1496,6 +1506,9 @@ func prepareLibraryMCPClientArtifact(client MCPClient, artifact LibraryArtifact,
 		return LibraryRun{}, LibraryArtifact{}, LibraryArtifactVersion{}, errors.New("MCP client artifact version must derive immutable identity")
 	}
 
+	// An omitted kind is kept unclassified for runners already in flight
+	// during an Engine upgrade. Authoritative host reconciliation can classify
+	// those replies later; explicit artifact/chat_reply writes never change.
 	artifact.ID = newLibraryArtifactID()
 	artifact.RunID = newLibraryRunID()
 	artifact.CreatedBy = client.Subject
@@ -1552,6 +1565,7 @@ func prepareLibraryRootMCPArtifact(artifact LibraryArtifact, version LibraryArti
 		return LibraryRun{}, LibraryArtifact{}, LibraryArtifactVersion{}, errors.New("root MCP artifact version must derive immutable identity")
 	}
 
+	artifact.ContentKind = libraryContentKind(artifact.ContentKind)
 	artifact.ID = newLibraryArtifactID()
 	artifact.RunID = newLibraryRunID()
 	artifact.CreatedBy = libraryRootMCPActorRef
@@ -1677,17 +1691,21 @@ func copyLibrarySkillEvaluation(evaluation LibrarySkillEvaluation) LibrarySkillE
 	return evaluation
 }
 
-func copyLibraryArtifact(artifact LibraryArtifact) LibraryArtifact { return artifact }
+func copyLibraryArtifact(artifact LibraryArtifact) LibraryArtifact {
+	artifact.LinkedArtifacts = append([]LibraryChatArtifactRef(nil), artifact.LinkedArtifacts...)
+	return artifact
+}
 
 // libraryArtifactMetadata strips private provenance identifiers from a list
 // projection. Artifact read enforces the separate exact-ID authorization path.
 func libraryArtifactMetadata(artifact LibraryArtifact) LibraryArtifact {
 	return LibraryArtifact{
-		ID:        artifact.ID,
-		Title:     artifact.Title,
-		Summary:   artifact.Summary,
-		Origin:    artifact.Origin,
-		CreatedAt: artifact.CreatedAt,
+		ContentKind: artifact.ContentKind,
+		ID:          artifact.ID,
+		Title:       artifact.Title,
+		Summary:     artifact.Summary,
+		Origin:      artifact.Origin,
+		CreatedAt:   artifact.CreatedAt,
 	}
 }
 

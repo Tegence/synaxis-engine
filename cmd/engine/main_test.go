@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -47,7 +48,7 @@ func TestServeEngineHTTPDrainsActiveRequestsOnContextCancellation(t *testing.T) 
 		w.WriteHeader(http.StatusOK)
 	})}
 	serveErr := make(chan error, 1)
-	go func() { serveErr <- serveEngineHTTP(ctx, server, listener) }()
+	go func() { serveErr <- serveEngineHTTP(ctx, server, listener, nil) }()
 
 	clientErr := make(chan error, 1)
 	go func() {
@@ -91,6 +92,59 @@ func TestServeEngineHTTPDrainsActiveRequestsOnContextCancellation(t *testing.T) 
 		}
 	case <-time.After(time.Second):
 		t.Fatal("server did not stop after active request drained")
+	}
+}
+
+// An MCP GET listening stream never returns on its own. Shutdown used to wait
+// for it until Cloud Run's SIGKILL, so the drain and deferred cleanup never ran.
+func TestServeEngineHTTPEndsListeningStreamsWithinTheShutdownBudget(t *testing.T) {
+	previous := engineRequestDrainGrace
+	engineRequestDrainGrace = 50 * time.Millisecond
+	t.Cleanup(func() { engineRequestDrainGrace = previous })
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	started := make(chan struct{})
+	streamEnded := make(chan struct{})
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		close(started)
+		<-r.Context().Done()
+		close(streamEnded)
+	})}
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- serveEngineHTTP(ctx, server, listener, nil) }()
+	go func() {
+		client := &http.Client{Transport: &http.Transport{Proxy: nil}}
+		if response, err := client.Get("http://" + listener.Addr().String()); err == nil {
+			_, _ = io.Copy(io.Discard, response.Body)
+			response.Body.Close()
+		}
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("stream never reached the server")
+	}
+	cancel()
+	select {
+	case <-streamEnded:
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown did not end the listening stream")
+	}
+	select {
+	case err := <-serveErr:
+		if err != nil {
+			t.Fatalf("serveEngineHTTP shutdown: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not finish its drain")
 	}
 }
 

@@ -320,10 +320,10 @@ func TestDuplicateCreateDoesNotBlockExplicitUpdateOrReconnect(t *testing.T) {
 		t.Fatalf("PATCH existing = %d, body %s; want 200", rec.Code, rec.Body)
 	}
 
-	rec, _ = doJSON(t, mux, token, http.MethodPost, "/api/servers/acme/token",
+	rec, _ = doJSON(t, mux, token, http.MethodPut, "/api/servers/acme/token",
 		`{"token":"reconnected-secret"}`)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("POST token reconnect = %d, body %s; want 200", rec.Code, rec.Body)
+		t.Fatalf("PUT token reconnect = %d, body %s; want 200", rec.Code, rec.Body)
 	}
 
 	account, ok := gateway.store.Account("acme")
@@ -432,5 +432,60 @@ func TestNamespaceOnlyMoveSkipsUpstreamAndFailedPolicyPatchCanBeRetried(t *testi
 	}
 	if names := connectorNames(t, gateway, "client"); !eq(names, []string{"notion__search"}) {
 		t.Fatalf("retry did not repair read-only endpoint cache: %v", names)
+	}
+}
+
+func TestTokenConnectionRejectsOAuthReauthorization(t *testing.T) {
+	_, _, gateway := newConnectorConsole(t, map[string][]string{"github": {}})
+	api := NewConsoleAPI(gateway.store, gateway, NewConnector(gateway.store, gateway), "pw", "test-secret", "https://engine.example", "http://localhost:3000", "")
+	mux := http.NewServeMux()
+	api.Routes(mux)
+	token := api.signToken()
+	account, _ := gateway.store.Account("github")
+	account.AuthMode = "token"
+	account.BearerToken = "existing-token"
+	if err := gateway.store.Upsert(t.Context(), account); err != nil {
+		t.Fatal(err)
+	}
+	rec, _ := doJSON(t, mux, token, http.MethodPost, "/api/servers/github/connect", "")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("connect = %d, body %s; want 400", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "token") {
+		t.Fatalf("missing token recovery guidance: %s", rec.Body)
+	}
+	saved, _ := gateway.store.Account("github")
+	if saved.BearerToken != "existing-token" || saved.AuthMode != "token" {
+		t.Fatal("OAuth attempt changed token credentials")
+	}
+}
+
+func TestTokenUpdateRejectsGETWithoutChangingCredential(t *testing.T) {
+	mux, token, gateway := newConnectorConsole(t, map[string][]string{"github": {}})
+	account, _ := gateway.store.Account("github")
+	account.AuthMode = "token"
+	account.BearerToken = "existing-token"
+	if err := gateway.store.Upsert(t.Context(), account); err != nil {
+		t.Fatal(err)
+	}
+
+	rec, _ := doJSON(t, mux, token, http.MethodGet, "/api/servers/github/token", `{"token":"replacement-token"}`)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET token = %d, body %s; want 405", rec.Code, rec.Body)
+	}
+	if got := rec.Header().Get("Allow"); got != "PUT, POST" {
+		t.Fatalf("Allow = %q, want PUT, POST", got)
+	}
+	saved, _ := gateway.store.Account("github")
+	if saved.BearerToken != "existing-token" {
+		t.Fatal("GET changed the stored token")
+	}
+	rec, _ = doJSON(t, mux, token, http.MethodPost, "/api/servers/github/token", `{"token":"legacy-client-token"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST token = %d, body %s; want 200 for existing clients", rec.Code, rec.Body)
+	}
+	saved, _ = gateway.store.Account("github")
+	if saved.BearerToken != "legacy-client-token" {
+		t.Fatal("POST did not update the stored token")
 	}
 }

@@ -80,7 +80,13 @@ func (s *FileStore) LibraryControlArtifactPage(_ context.Context, scope LibraryC
 
 	items := make([]LibraryControlArtifact, 0, len(selected))
 	for _, entry := range selected {
+		if entry.artifact.ContentKind == LibraryContentChatReply {
+			continue
+		}
 		head := heads[entry.artifact.ID]
+		if entry.access == LibraryControlArtifactAccessGranted {
+			head = entry.granted
+		}
 		if head == nil {
 			continue
 		}

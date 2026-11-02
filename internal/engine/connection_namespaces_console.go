@@ -15,11 +15,13 @@ import (
 // a console client from accidentally treating an endpoint membership as
 // authority to manage a credential.
 type connectionNamespaceDTO struct {
-	ID        string `json:"id"`
-	Slug      string `json:"slug"`
-	Label     string `json:"label"`
-	Revision  int64  `json:"revision"`
-	CreatedBy string `json:"createdBy,omitempty"`
+	ID           string `json:"id"`
+	Scope        string `json:"scope"`
+	OwnerSubject string `json:"ownerSubject,omitempty"`
+	Slug         string `json:"slug"`
+	Label        string `json:"label"`
+	Revision     int64  `json:"revision"`
+	CreatedBy    string `json:"createdBy,omitempty"`
 
 	CreatedAt string `json:"createdAt,omitempty"`
 	UpdatedAt string `json:"updatedAt,omitempty"`
@@ -83,7 +85,7 @@ func connectionNamespaceManager(ns ConnectionNamespace, subject string) bool {
 
 func (c *ConsoleAPI) canReadConnectionNamespace(actor PlatformActor, ns ConnectionNamespace) bool {
 	return connectionNamespaceAdministrator(actor) ||
-		(actor.Role == "operator" && connectionNamespaceManager(ns, actor.UserID))
+		(actor.Role == "operator" && ((ns.OwnerSubject != "" && ns.OwnerSubject == actor.UserID) || (ns.OwnerSubject == "" && connectionNamespaceManager(ns, actor.UserID))))
 }
 
 func (c *ConsoleAPI) canManageConnectionNamespace(actor PlatformActor, ns ConnectionNamespace) bool {
@@ -94,14 +96,22 @@ func (c *ConsoleAPI) canManageConnectionNamespaceMembership(actor PlatformActor)
 	return connectionNamespaceAdministrator(actor)
 }
 
-func (c *ConsoleAPI) canDeleteConnectionNamespace(actor PlatformActor, _ ConnectionNamespace) bool {
+func (c *ConsoleAPI) canDeleteConnectionNamespace(actor PlatformActor, ns ConnectionNamespace) bool {
 	// Creation attribution is audit-only. Deleting a credential ownership
 	// boundary remains a workspace-administration action; the store separately
 	// rejects a namespace which still owns an account.
-	return connectionNamespaceAdministrator(actor)
+	return connectionNamespaceAdministrator(actor) || (actor.Role == "operator" && ns.OwnerSubject == actor.UserID)
 }
 
 func (c *ConsoleAPI) canManageAccount(ctx context.Context, actor PlatformActor, a Account) bool {
+	// Decide everything the actor alone decides before reading the store: an
+	// administrator manages every account and a non-operator none.
+	if connectionNamespaceAdministrator(actor) {
+		return true
+	}
+	if actor.Role != "operator" {
+		return false
+	}
 	return canManageAccountPreloaded(actor, a, c.namespacesForAccount(ctx, a))
 }
 
@@ -141,33 +151,80 @@ func (c *ConsoleAPI) namespacesForAccount(ctx context.Context, a Account) map[st
 	return namespacesByID
 }
 
-// callVisibilityData preloads every account once plus each connection
-// namespace referenced by the given call records, so the activity list can
-// evaluate the operator visibility boundary with a bounded number of store
-// reads instead of one account+namespace pair per record. Namespace lookups
-// use the request context so a client disconnect cancels them.
-func (c *ConsoleAPI) callVisibilityData(ctx context.Context, calls []CallRecord) (map[string]Account, map[string]ConnectionNamespace) {
-	accounts := c.store.Accounts()
-	accountsByName := make(map[string]Account, len(accounts))
+// namespaceCache memoizes one request's ownership-namespace reads, so an
+// account boundary evaluated across many rows (or activity pages) reads each
+// distinct namespace once. A namespace the store lacks is remembered too.
+type namespaceCache struct {
+	byID    map[string]ConnectionNamespace
+	checked map[string]bool
+}
+
+func newNamespaceCache() *namespaceCache {
+	return &namespaceCache{byID: map[string]ConnectionNamespace{}, checked: map[string]bool{}}
+}
+
+// loadOwnershipNamespaces reads into cache, once each, the ownership
+// namespaces of accounts. Personal and namespace-less accounts need none.
+// Lookups use the request context so a client disconnect cancels them.
+func (c *ConsoleAPI) loadOwnershipNamespaces(ctx context.Context, cache *namespaceCache, accounts []Account) {
+	store, ok := c.connectionNamespaceStore()
+	if !ok {
+		return
+	}
 	for _, a := range accounts {
-		accountsByName[a.Name] = a
+		id := a.ConnectionNamespaceID
+		if a.IsPersonal() || id == "" || cache.checked[id] {
+			continue
+		}
+		cache.checked[id] = true
+		if ns, found := store.ConnectionNamespace(ctx, id); found {
+			cache.byID[id] = ns
+		}
 	}
-	namespaceIDs := make(map[string]struct{})
+}
+
+// readableAccounts filters accounts to those actor may read (canReadAccount),
+// with one lookup per distinct ownership namespace instead of one per
+// account — and none at all for an administrator.
+func (c *ConsoleAPI) readableAccounts(ctx context.Context, actor PlatformActor, accounts []Account) []Account {
+	if connectionNamespaceAdministrator(actor) {
+		return accounts
+	}
+	if actor.Role != "operator" {
+		return []Account{}
+	}
+	namespaces := newNamespaceCache()
+	c.loadOwnershipNamespaces(ctx, namespaces, accounts)
+	out := make([]Account, 0, len(accounts))
+	for _, a := range accounts {
+		if canManageAccountPreloaded(actor, a, namespaces.byID) {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// accountsByName indexes one account listing, for boundaries evaluated over
+// many records.
+func (c *ConsoleAPI) accountsByName() map[string]Account {
+	accounts := c.store.Accounts()
+	byName := make(map[string]Account, len(accounts))
+	for _, a := range accounts {
+		byName[a.Name] = a
+	}
+	return byName
+}
+
+// loadCallNamespaces reads the ownership namespaces of the accounts calls
+// reference that earlier pages have not already read.
+func (c *ConsoleAPI) loadCallNamespaces(ctx context.Context, cache *namespaceCache, accountsByName map[string]Account, calls []CallRecord) {
+	referenced := make([]Account, 0, len(calls))
 	for _, call := range calls {
-		a, found := accountsByName[call.Account]
-		if found && !a.IsPersonal() && a.ConnectionNamespaceID != "" {
-			namespaceIDs[a.ConnectionNamespaceID] = struct{}{}
+		if a, found := accountsByName[call.Account]; found {
+			referenced = append(referenced, a)
 		}
 	}
-	namespacesByID := make(map[string]ConnectionNamespace, len(namespaceIDs))
-	if store, ok := c.connectionNamespaceStore(); ok {
-		for id := range namespaceIDs {
-			if ns, found := store.ConnectionNamespace(ctx, id); found {
-				namespacesByID[id] = ns
-			}
-		}
-	}
-	return accountsByName, namespacesByID
+	c.loadOwnershipNamespaces(ctx, cache, referenced)
 }
 
 // canReadAccount is intentionally the same boundary as management for now.
@@ -179,13 +236,18 @@ func (c *ConsoleAPI) canReadAccount(ctx context.Context, actor PlatformActor, a 
 
 func (c *ConsoleAPI) toConnectionNamespaceDTO(actor PlatformActor, ns ConnectionNamespace) connectionNamespaceDTO {
 	dto := connectionNamespaceDTO{
-		ID:                  ns.ID,
+		ID:    ns.ID,
+		Scope: "shared", OwnerSubject: ns.OwnerSubject,
 		Slug:                ns.Slug,
 		Label:               ns.Label,
 		Revision:            ns.Revision,
 		CanManage:           c.canManageConnectionNamespace(actor, ns),
 		CanManageMembership: c.canManageConnectionNamespaceMembership(actor),
 		CanDelete:           c.canDeleteConnectionNamespace(actor, ns),
+	}
+	if ns.OwnerSubject != "" {
+		dto.Scope = "personal"
+		dto.CanManageMembership = false
 	}
 	if !ns.CreatedAt.IsZero() {
 		dto.CreatedAt = ns.CreatedAt.UTC().Format(time.RFC3339Nano)
@@ -253,37 +315,33 @@ func (c *ConsoleAPI) readableAccount(w http.ResponseWriter, r *http.Request, id 
 	return a, actor, true
 }
 
-// visibleCall checks one record against live store reads; single-record
-// routes (call detail, replay) keep this per-row freshness.
-func (c *ConsoleAPI) visibleCall(ctx context.Context, actor PlatformActor, call CallRecord) bool {
-	if connectionNamespaceAdministrator(actor) {
-		return true
-	}
-	if actor.Role != "operator" || strings.TrimSpace(call.Account) == "" {
-		return false
-	}
-	a, found := c.store.Account(call.Account)
-	return found && c.canReadAccount(ctx, actor, a)
+// visibleCall checks the actor and signed ownership on detail and replay routes.
+func (c *ConsoleAPI) visibleCall(_ context.Context, actor PlatformActor, call CallRecord) bool {
+	return connectionNamespaceAdministrator(actor) || (actor.Role == "operator" && actorOwnsCall(actor, call))
 }
 
-// visibleCallPreloaded is visibleCall evaluated against preloaded accounts and
-// namespaces: same short-circuits and denial cases, no store reads per row.
-func visibleCallPreloaded(actor PlatformActor, call CallRecord, accountsByName map[string]Account, namespacesByID map[string]ConnectionNamespace) bool {
-	if connectionNamespaceAdministrator(actor) {
-		return true
-	}
-	if actor.Role != "operator" || strings.TrimSpace(call.Account) == "" {
-		return false
-	}
-	a, found := accountsByName[call.Account]
-	return found && canManageAccountPreloaded(actor, a, namespacesByID)
+// Folder administration does not grant access to other people's activity.
+// Both list and detail use the signed caller/owned-agent scope.
+func visibleCallPreloaded(actor PlatformActor, call CallRecord, _ map[string]Account, _ map[string]ConnectionNamespace) bool {
+	return connectionNamespaceAdministrator(actor) || (actor.Role == "operator" && actorOwnsCall(actor, call))
 }
 
 func (c *ConsoleAPI) visibleApproval(ctx context.Context, actor PlatformActor, call PendingCall) bool {
+	if call.PrivateOwnerSubject != "" {
+		return connectionNamespaceAdministrator(actor) || (actor.Role == "operator" && actor.UserID == call.PrivateOwnerSubject)
+	}
 	if connectionNamespaceAdministrator(actor) {
 		return true
 	}
-	if actor.Role != "operator" || strings.TrimSpace(call.Account) == "" {
+	if actor.Role != "operator" {
+		return false
+	}
+	// Delegated account management authorizes live approval decisions, not
+	// access to other callers' retained activity once a decision is complete.
+	if call.Status != ApprovalPending {
+		return actorOwnsCall(actor, CallRecord{CallerSubject: call.CallerSubject})
+	}
+	if strings.TrimSpace(call.Account) == "" {
 		return false
 	}
 	a, found := c.store.Account(call.Account)
@@ -306,6 +364,9 @@ func (c *ConsoleAPI) visibleCallRecord(w http.ResponseWriter, r *http.Request, i
 	}
 	if !found || !c.visibleCall(r.Context(), actor, record) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "call not found"})
+		return CallRecord{}, PlatformActor{}, false
+	}
+	if !c.allowPrivateToolPayload(w, r, actor, record) {
 		return CallRecord{}, PlatformActor{}, false
 	}
 	return record, actor, true
@@ -332,6 +393,10 @@ func (c *ConsoleAPI) managedApprovalRecord(w http.ResponseWriter, r *http.Reques
 	}
 	if !found || !c.visibleApproval(r.Context(), actor, call) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "pending call not found"})
+		return PendingCall{}, PlatformActor{}, false
+	}
+	if c.privateApprovalPayload(actor, call) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "only the personal connection owner can decide this call"})
 		return PendingCall{}, PlatformActor{}, false
 	}
 	return call, actor, true
@@ -441,7 +506,7 @@ func (c *ConsoleAPI) defaultPersonalConnectionNamespace(ctx context.Context, act
 		return ConnectionNamespace{}, err
 	}
 	for _, ns := range namespaces {
-		if strings.EqualFold(strings.TrimSpace(ns.Label), "Personal") &&
+		if strings.EqualFold(strings.TrimSpace(ns.Label), "Personal") && ns.OwnerSubject == actor.UserID &&
 			c.canManageConnectionNamespace(actor, ns) {
 			return ns, nil
 		}
@@ -450,9 +515,10 @@ func (c *ConsoleAPI) defaultPersonalConnectionNamespace(ctx context.Context, act
 		// The opaque random suffix makes "Personal" safe for many different
 		// users while the human-facing label remains simple.  The namespace ID,
 		// rather than this slug or label, is the API authority key.
-		Slug:      "personal-" + newEpoch(),
-		Label:     "Personal",
-		CreatedBy: actor.UserID,
+		OwnerSubject: actor.UserID,
+		Slug:         "personal-" + newEpoch(),
+		Label:        "Personal",
+		CreatedBy:    actor.UserID,
 	})
 }
 
@@ -501,22 +567,33 @@ func (c *ConsoleAPI) handleConnectionNamespaces(w http.ResponseWriter, r *http.R
 }
 
 func (c *ConsoleAPI) createConnectionNamespace(w http.ResponseWriter, r *http.Request, store ConnectionNamespaceStore, actor PlatformActor) {
-	if !connectionNamespaceAdministrator(actor) {
-		// An operator's automatic Personal folder is intentionally created only
-		// by defaultPersonalConnectionNamespace. Creating any other folder here
-		// would make the operator its manager and let them manufacture a new
-		// shared/root-exposed authority boundary without an admin delegation.
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "workspace administration is required to create shared connection namespaces"})
-		return
-	}
 	var request struct {
 		Label    string   `json:"label"`
 		Slug     string   `json:"slug"`
 		Managers []string `json:"managers"`
+		Scope    string   `json:"scope"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&request); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
 		return
+	}
+	personal := request.Scope == "personal" || (request.Scope == "" && actor.Role == "operator")
+	if request.Scope != "" && request.Scope != "personal" && request.Scope != "shared" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "scope must be personal or shared"})
+		return
+	}
+	if !connectionNamespaceAdministrator(actor) && (actor.Role != "operator" || !personal) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "workspace administration is required to create shared connection namespaces"})
+		return
+	}
+	if personal && len(request.Managers) > 0 {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "personal folders cannot delegate management"})
+		return
+	}
+	ownerSubject := ""
+	if personal {
+		ownerSubject = actor.UserID
+		request.Slug = "personal-" + newEpoch()
 	}
 	label := strings.TrimSpace(request.Label)
 	if label == "" {
@@ -534,6 +611,7 @@ func (c *ConsoleAPI) createConnectionNamespace(w http.ResponseWriter, r *http.Re
 		}
 	}
 	ns, err := store.CreateConnectionNamespace(r.Context(), ConnectionNamespace{
+		OwnerSubject:  ownerSubject,
 		Slug:          strings.TrimSpace(request.Slug),
 		Label:         label,
 		CreatedBy:     actor.UserID,
@@ -645,6 +723,10 @@ func (c *ConsoleAPI) handleConnectionNamespaceManagers(w http.ResponseWriter, r 
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "connection namespace not found"})
 		return
 	}
+	if ns.OwnerSubject != "" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "personal folders cannot delegate management"})
+		return
+	}
 	switch r.Method {
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, c.toConnectionNamespaceDTO(actor, ns))
@@ -695,6 +777,10 @@ func (c *ConsoleAPI) handleConnectionNamespaceManagerBySubject(w http.ResponseWr
 	ns, found := store.ConnectionNamespace(r.Context(), strings.TrimSpace(r.PathValue("id")))
 	if !found {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "connection namespace not found"})
+		return
+	}
+	if ns.OwnerSubject != "" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "personal folders cannot delegate management"})
 		return
 	}
 	subject := strings.TrimSpace(r.PathValue("subject"))

@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -76,6 +78,43 @@ type Account struct {
 	// ReadOnlyHint (or, absent annotations, matching a conservative read-name
 	// heuristic) are registered. Mutating tools are never exposed to Claude.
 	ReadOnly bool `json:"readOnly,omitempty"`
+
+	// MemberCredentials makes every subject-bound MCP client call this
+	// account with its own member's upstream credential (MemberCredential)
+	// instead of the account's. The account's own credential still lists the
+	// tools. A call without a member credential, or from an endpoint without a
+	// subject, fails closed rather than acting as the account.
+	MemberCredentials bool `json:"memberCredentials,omitempty"`
+	// CallerDelegated marks a service account that acts only for the caller
+	// named in a per-call grant. It is delivered only by an exact connection
+	// grant; tools/call exchanges the caller's grant at TokenEndpoint with
+	// ClientID/ClientSecret for Resource. The account's BearerToken only lists
+	// the tools.
+	CallerDelegated bool `json:"callerDelegated,omitempty"`
+}
+
+// MemberCredential is one member's own upstream credential for an account in
+// MemberCredentials mode. It belongs to one account incarnation: a deleted and
+// recreated account never inherits it.
+type MemberCredential struct {
+	Account       string    `json:"account"`
+	IncarnationID string    `json:"incarnation_id"`
+	Subject       string    `json:"subject"`
+	AccessToken   string    `json:"access_token,omitempty"`
+	RefreshToken  string    `json:"refresh_token,omitempty"`
+	BearerToken   string    `json:"bearer_token,omitempty"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+// MemberCredentialStore persists member credentials. Both built-in stores
+// implement it.
+type MemberCredentialStore interface {
+	MemberCredential(ctx context.Context, account, subject string) (MemberCredential, bool, error)
+	// PutMemberCredential inserts or replaces one member's credential. It
+	// fails with ErrAccountIncarnation unless the account still has
+	// credential.IncarnationID.
+	PutMemberCredential(ctx context.Context, credential MemberCredential) error
+	DeleteMemberCredential(ctx context.Context, account, subject string) error
 }
 
 // ConnectionScope describes how an account may be exposed. It is an account
@@ -124,6 +163,7 @@ type ConnectionNamespace struct {
 	Label         string                            `json:"label"`
 	Revision      int64                             `json:"revision"`
 	CreatedBy     string                            `json:"created_by,omitempty"`
+	OwnerSubject  string                            `json:"owner_subject,omitempty"`
 	CreatedAt     time.Time                         `json:"created_at,omitempty"`
 	UpdatedAt     time.Time                         `json:"updated_at,omitempty"`
 	ManagerGrants []ConnectionNamespaceManagerGrant `json:"manager_grants,omitempty"`
@@ -196,10 +236,11 @@ func (p AccountPolicyPrecondition) matches(a Account) bool {
 // list or readOnly=false). It deliberately has no ownership or credential
 // fields, so a stale console snapshot cannot restore either one.
 type AccountPolicyMutation struct {
-	Label         *string
-	DisabledTools *[]string
-	ToolOverrides *map[string]ToolOverride
-	ReadOnly      *bool
+	Label             *string
+	DisabledTools     *[]string
+	ToolOverrides     *map[string]ToolOverride
+	ReadOnly          *bool
+	MemberCredentials *bool
 }
 
 // ToolOverride is the operator-owned presentation policy for one upstream
@@ -643,6 +684,13 @@ type AccountStore interface {
 	SetReadOnly(ctx context.Context, name string, ro bool) error
 }
 
+// accountLister is the error-reporting account listing. Accounts() predates
+// it and cannot tell an empty store from a failed read; projection rebuilds
+// need to, or one database blip removes every upstream tool from an endpoint.
+type accountLister interface {
+	ListAccounts(ctx context.Context) ([]Account, error)
+}
+
 // StaticOAuthConfig is the pre-registered OAuth application configuration for
 // providers that do not support dynamic client registration. It deliberately
 // contains no provider tokens: it is persisted before the browser leaves the
@@ -690,6 +738,14 @@ type PortableAccountConfigStore interface {
 	UpdatePortableAccountConfig(ctx context.Context, name string, update PortableAccountConfig) (Account, error)
 }
 
+// HealthAlertStore persists the watch loop's outstanding "needs attention"
+// alerts (account -> status) so an Engine restart does not re-announce an
+// account that is still down. Stores without it alert again after a restart.
+type HealthAlertStore interface {
+	HealthAlerts(ctx context.Context) (map[string]string, error)
+	SetHealthAlert(ctx context.Context, account, status string) error // "" clears
+}
+
 // ErrAccountExists is returned by AccountStore.Create when the account name is
 // already present. Explicit update and reconnect paths continue to use Upsert.
 var ErrAccountExists = errors.New("account already exists")
@@ -728,6 +784,7 @@ func oauthCompletionPreconditionForAccount(account Account) OAuthCompletionPreco
 // ---- FileStore: thread-safe JSON file (local dev / single instance) ----
 
 type FileStore struct {
+	knowledgeDocuments   map[string]KnowledgeDocument
 	path                 string
 	mu                   sync.Mutex
 	accounts             []*Account
@@ -735,6 +792,8 @@ type FileStore struct {
 	namespaces           []*Namespace
 	connectionNamespaces []*ConnectionNamespace
 	mcpClients           []*MCPClient
+	connectionGrants     []*ConnectionGrant
+	subjectAccess        map[string]bool
 	// Skills domain state (SkillStore facet — see skills_file.go). Kept as
 	// plain slices/maps, same as every other FileStore facet above.
 	skillSources  []*SkillSource
@@ -765,6 +824,7 @@ type FileStore struct {
 	// editable generated output candidates plus hash-only replay records.
 	libraryArtifactDrafts       []*LibraryArtifactDraft
 	libraryArtifactDraftImports []*librarySkillDraftImportRecord
+	librarySkillGrants          []*LibrarySkillGrant
 	librarySkillBindings        []*LibrarySkillBinding
 	// librarySkillBindingGenerations is a monotonic, durable binding-set
 	// marker per skill. It is intentionally separate from public skill JSON:
@@ -776,12 +836,14 @@ type FileStore struct {
 	// clients follow it instead of the manifest compiled into their process.
 	libraryBuiltInCurrentVersions map[string]string
 	librarySkillEvaluations       []*LibrarySkillEvaluation
+	libraryChatSaves              []*libraryChatSaveRecord
 	libraryArtifacts              []*LibraryArtifact
 	libraryArtifactVersions       []*LibraryArtifactVersion
 	// One private immutable image blob may belong to an image-format artifact
 	// version. It is deliberately per-version rather than content-deduplicated.
 	libraryArtifactMediaBlobs []*libraryArtifactMediaBlob
 	libraryArtifactGrants     []*LibraryArtifactGrant
+	libraryCollaborations     map[string]*libraryCollaborationState
 	libraryRuns               []*LibraryRun
 	// Memories are a separate Library facet: logical lifecycle records,
 	// immutable authored versions, and exact-version surface grants.
@@ -802,6 +864,12 @@ type FileStore struct {
 	libraryMCPClientSkillAuthoringRequests    []*libraryMCPClientSkillAuthoringRequestRecord
 	libraryMCPClientSkillAuthoringAuditEvents []*LibraryMCPClientSkillAuthoringAuditEvent
 	oauthTokenGeneration                      string
+	healthAlerts                              map[string]string   // HealthAlertStore
+	memberCredentials                         []*MemberCredential // MemberCredentialStore
+	browserRuns                               []BrowserRun
+	browserSignIns                            []BrowserSignIn
+	linkedOAuthFlows                          []LinkedOAuthFlow
+	linkedAccounts                            []*LinkedAccountRecord
 	// OAuth grants live beside the durable generation so local Engines do not
 	// accept a code on one process and forget it after a restart. Hosted
 	// replicas use PgStore's transactional implementation instead.
@@ -822,16 +890,21 @@ var _ ConnectionNamespaceStore = (*FileStore)(nil)
 var _ StaticOAuthConfigStore = (*FileStore)(nil)
 var _ LibraryRuntimeAttestationStore = (*FileStore)(nil)
 var _ LibraryMemoryStore = (*FileStore)(nil)
+var _ HealthAlertStore = (*FileStore)(nil)
+var _ MemberCredentialStore = (*FileStore)(nil)
 
 // fileStoreData is the on-disk shape. Older files were a bare JSON array of
 // accounts; LoadFileStore still accepts that, and a missing "connectors"
 // field simply loads as empty.
 type fileStoreData struct {
+	KnowledgeDocuments                        map[string]KnowledgeDocument                   `json:"knowledge_documents,omitempty"`
 	Accounts                                  []*Account                                     `json:"accounts"`
 	Connectors                                []*VirtualConnector                            `json:"connectors,omitempty"`
 	Namespaces                                []*Namespace                                   `json:"namespaces,omitempty"`
 	ConnectionNamespaces                      []*ConnectionNamespace                         `json:"connection_namespaces,omitempty"`
 	MCPClients                                []*MCPClient                                   `json:"mcp_clients,omitempty"`
+	ConnectionGrants                          []*ConnectionGrant                             `json:"connection_grants,omitempty"`
+	SubjectAccess                             map[string]bool                                `json:"subject_access,omitempty"`
 	SkillSources                              []*SkillSource                                 `json:"skill_sources,omitempty"`
 	Skills                                    []*Skill                                       `json:"skills,omitempty"`
 	SkillVersions                             []*SkillVersion                                `json:"skill_versions,omitempty"`
@@ -846,14 +919,17 @@ type fileStoreData struct {
 	LibrarySkillDraftImports                  []*librarySkillDraftImportRecord               `json:"library_skill_draft_imports,omitempty"`
 	LibraryArtifactDrafts                     []*LibraryArtifactDraft                        `json:"library_artifact_drafts,omitempty"`
 	LibraryArtifactDraftImports               []*librarySkillDraftImportRecord               `json:"library_artifact_draft_imports,omitempty"`
+	LibrarySkillGrants                        []*LibrarySkillGrant                           `json:"library_skill_grants,omitempty"`
 	LibrarySkillBindings                      []*LibrarySkillBinding                         `json:"library_skill_bindings,omitempty"`
 	LibrarySkillBindingGenerations            map[string]int64                               `json:"library_skill_binding_generations,omitempty"`
 	LibraryBuiltInCurrentVersions             map[string]string                              `json:"library_builtin_current_versions,omitempty"`
 	LibrarySkillEvaluations                   []*LibrarySkillEvaluation                      `json:"library_skill_evaluations,omitempty"`
+	LibraryChatSaves                          []*libraryChatSaveRecord                       `json:"library_chat_saves,omitempty"`
 	LibraryArtifacts                          []*LibraryArtifact                             `json:"library_artifacts,omitempty"`
 	LibraryArtifactVersions                   []*LibraryArtifactVersion                      `json:"library_artifact_versions,omitempty"`
 	LibraryArtifactMediaBlobs                 []*libraryArtifactMediaBlob                    `json:"library_artifact_media_blobs,omitempty"`
 	LibraryArtifactGrants                     []*LibraryArtifactGrant                        `json:"library_artifact_grants,omitempty"`
+	LibraryCollaborations                     map[string]*libraryCollaborationState          `json:"library_collaborations,omitempty"`
 	LibraryRuns                               []*LibraryRun                                  `json:"library_runs,omitempty"`
 	LibraryMemories                           []*LibraryMemory                               `json:"library_memories,omitempty"`
 	LibraryMemoryVersions                     []*LibraryMemoryVersion                        `json:"library_memory_versions,omitempty"`
@@ -870,6 +946,12 @@ type fileStoreData struct {
 	// provenance boundary.
 	LibraryArtifactSurfaceIDs map[string]string                       `json:"library_artifact_surface_ids,omitempty"`
 	OAuthTokenGeneration      string                                  `json:"oauth_token_generation,omitempty"`
+	HealthAlerts              map[string]string                       `json:"health_alerts,omitempty"`
+	MemberCredentials         []*MemberCredential                     `json:"member_credentials,omitempty"`
+	BrowserRuns               []BrowserRun                            `json:"browser_runs,omitempty"`
+	BrowserSignIns            []BrowserSignIn                         `json:"browser_sign_ins,omitempty"`
+	LinkedOAuthFlows          []LinkedOAuthFlow                       `json:"linked_oauth_flows,omitempty"`
+	LinkedAccounts            []*LinkedAccountRecord                  `json:"linked_accounts,omitempty"`
 	OAuthAuthorizationCodes   map[string]fileOAuthAuthorizationCode   `json:"oauth_authorization_codes,omitempty"`
 	OAuthRefreshGrants        map[string]fileOAuthRefreshGrant        `json:"oauth_refresh_grants,omitempty"`
 	OAuthHostedConsentReplays map[string]fileOAuthHostedConsentReplay `json:"oauth_hosted_consent_replays,omitempty"`
@@ -936,6 +1018,13 @@ func LoadFileStore(path string) (*FileStore, error) {
 		return nil, fmt.Errorf("parse account store: %w", err)
 	}
 	s.accounts, s.connectors, s.namespaces, s.connectionNamespaces, s.mcpClients, s.oauthTokenGeneration = d.Accounts, d.Connectors, d.Namespaces, d.ConnectionNamespaces, d.MCPClients, d.OAuthTokenGeneration
+	s.connectionGrants, s.subjectAccess = d.ConnectionGrants, d.SubjectAccess
+	s.healthAlerts = d.HealthAlerts
+	s.memberCredentials = d.MemberCredentials
+	s.linkedAccounts = d.LinkedAccounts
+	s.linkedOAuthFlows = d.LinkedOAuthFlows
+	s.browserRuns = d.BrowserRuns
+	s.browserSignIns = d.BrowserSignIns
 	s.skillSources, s.skills, s.skillVersions, s.skillCarriers, s.skillDrift = d.SkillSources, d.Skills, d.SkillVersions, d.SkillCarriers, d.SkillDrift
 	s.skillChecks = d.SkillChecks
 	s.librarySkills, s.librarySkillVersions, s.librarySkillDrafts = d.LibrarySkills, d.LibrarySkillVersions, d.LibrarySkillDrafts
@@ -945,13 +1034,17 @@ func LoadFileStore(path string) (*FileStore, error) {
 	}
 	s.librarySkillDraftImports = d.LibrarySkillDraftImports
 	s.libraryArtifactDrafts, s.libraryArtifactDraftImports = d.LibraryArtifactDrafts, d.LibraryArtifactDraftImports
+	s.librarySkillGrants = d.LibrarySkillGrants
 	s.librarySkillBindings, s.librarySkillEvaluations = d.LibrarySkillBindings, d.LibrarySkillEvaluations
 	s.librarySkillBindingGenerations = d.LibrarySkillBindingGenerations
 	s.libraryBuiltInCurrentVersions = d.LibraryBuiltInCurrentVersions
+	s.libraryChatSaves = d.LibraryChatSaves
+	s.knowledgeDocuments = d.KnowledgeDocuments
 	s.libraryArtifacts, s.libraryArtifactVersions, s.libraryArtifactMediaBlobs, s.libraryArtifactGrants, s.libraryRuns = d.LibraryArtifacts, d.LibraryArtifactVersions, d.LibraryArtifactMediaBlobs, d.LibraryArtifactGrants, d.LibraryRuns
 	s.libraryMemories, s.libraryMemoryVersions, s.libraryMemoryGrants = d.LibraryMemories, d.LibraryMemoryVersions, d.LibraryMemoryGrants
 	s.libraryRuntimeAttestations = d.LibraryRuntimeAttestations
 	s.libraryRunCorrelations = d.LibraryRunCorrelations
+	s.libraryCollaborations = d.LibraryCollaborations
 	s.controlIdempotencyRecords = d.ControlIdempotencyRecords
 	s.libraryMCPClientArtifactVersionRequests = d.LibraryMCPClientArtifactVersionRequests
 	s.libraryMCPClientSkillAuthoringLeases = d.LibraryMCPClientSkillAuthoringLeases
@@ -999,6 +1092,10 @@ func (s *FileStore) Accounts() []Account {
 		out[i] = copyAccount(*a)
 	}
 	return out
+}
+
+func (s *FileStore) ListAccounts(context.Context) ([]Account, error) {
+	return s.Accounts(), nil
 }
 
 func (s *FileStore) Token(name string) string {
@@ -1077,11 +1174,14 @@ func (s *FileStore) SetBearerToken(_ context.Context, name, expectedIncarnationI
 
 func (s *FileStore) saveLocked() error {
 	b, err := json.MarshalIndent(fileStoreData{
+		KnowledgeDocuments:                        s.knowledgeDocuments,
 		Accounts:                                  s.accounts,
 		Connectors:                                s.connectors,
 		Namespaces:                                s.namespaces,
 		ConnectionNamespaces:                      s.connectionNamespaces,
 		MCPClients:                                s.mcpClients,
+		ConnectionGrants:                          s.connectionGrants,
+		SubjectAccess:                             s.subjectAccess,
 		SkillSources:                              s.skillSources,
 		Skills:                                    s.skills,
 		SkillVersions:                             s.skillVersions,
@@ -1096,14 +1196,17 @@ func (s *FileStore) saveLocked() error {
 		LibrarySkillDraftImports:                  s.librarySkillDraftImports,
 		LibraryArtifactDrafts:                     s.libraryArtifactDrafts,
 		LibraryArtifactDraftImports:               s.libraryArtifactDraftImports,
+		LibrarySkillGrants:                        s.librarySkillGrants,
 		LibrarySkillBindings:                      s.librarySkillBindings,
 		LibrarySkillBindingGenerations:            s.librarySkillBindingGenerations,
 		LibraryBuiltInCurrentVersions:             s.libraryBuiltInCurrentVersions,
 		LibrarySkillEvaluations:                   s.librarySkillEvaluations,
+		LibraryChatSaves:                          s.libraryChatSaves,
 		LibraryArtifacts:                          s.libraryArtifacts,
 		LibraryArtifactVersions:                   s.libraryArtifactVersions,
 		LibraryArtifactMediaBlobs:                 s.libraryArtifactMediaBlobs,
 		LibraryArtifactGrants:                     s.libraryArtifactGrants,
+		LibraryCollaborations:                     s.libraryCollaborations,
 		LibraryRuns:                               s.libraryRuns,
 		LibraryMemories:                           s.libraryMemories,
 		LibraryMemoryVersions:                     s.libraryMemoryVersions,
@@ -1116,6 +1219,12 @@ func (s *FileStore) saveLocked() error {
 		LibraryMCPClientSkillAuthoringAuditEvents: s.libraryMCPClientSkillAuthoringAuditEvents,
 		LibraryArtifactSurfaceIDs:                 s.libraryArtifactSurfaceIDsLocked(),
 		OAuthTokenGeneration:                      s.oauthTokenGeneration,
+		HealthAlerts:                              s.healthAlerts,
+		MemberCredentials:                         s.memberCredentials,
+		LinkedAccounts:                            s.linkedAccounts,
+		LinkedOAuthFlows:                          s.linkedOAuthFlows,
+		BrowserRuns:                               s.browserRuns,
+		BrowserSignIns:                            s.browserSignIns,
 		OAuthAuthorizationCodes:                   s.oauthAuthorizationCodes,
 		OAuthRefreshGrants:                        s.oauthRefreshGrants,
 		OAuthHostedConsentReplays:                 s.oauthHostedConsentReplays,
@@ -1155,6 +1264,31 @@ func (s *FileStore) LoadOrCreateTokenGeneration(ctx context.Context, candidate s
 		return "", fmt.Errorf("persist token generation: %w", err)
 	}
 	return s.oauthTokenGeneration, nil
+}
+
+func (s *FileStore) HealthAlerts(context.Context) (map[string]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return maps.Clone(s.healthAlerts), nil
+}
+
+func (s *FileStore) SetHealthAlert(_ context.Context, account, status string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.healthAlerts[account] == status {
+		return nil
+	}
+	if status == "" {
+		delete(s.healthAlerts, account)
+	} else {
+		if s.healthAlerts == nil {
+			s.healthAlerts = map[string]string{}
+		}
+		s.healthAlerts[account] = status
+	}
+	// ponytail: no rollback on a failed save; the next successful save of
+	// any state persists this alert state too.
+	return s.saveLocked()
 }
 
 func (s *FileStore) CurrentTokenGeneration(ctx context.Context) (string, error) {
@@ -1287,6 +1421,9 @@ func (s *FileStore) Upsert(_ context.Context, a Account) error {
 			}
 			break
 		}
+	}
+	if err := callerDelegatedUpsertProblem(previous, cp); err != nil {
+		return err
 	}
 	if previous == nil {
 		cp.IncarnationID = newAccountIncarnationID()
@@ -1441,6 +1578,10 @@ func (s *FileStore) Delete(_ context.Context, name, expectedIncarnationID string
 				cp := copyNamespace(*ns)
 				oldNamespaces[i] = &cp
 			}
+			oldMemberCredentials := s.memberCredentials
+			oldLinkedAccounts := s.linkedAccounts
+			s.linkedAccounts = slices.DeleteFunc(slices.Clone(s.linkedAccounts), func(record *LinkedAccountRecord) bool { return record != nil && record.ConnectionID == name })
+			s.memberCredentials = slices.DeleteFunc(slices.Clone(s.memberCredentials), func(c *MemberCredential) bool { return c.Account == name })
 			s.accounts = append(s.accounts[:i], s.accounts[i+1:]...)
 			for _, connector := range s.connectors {
 				delete(connector.Tools, name)
@@ -1465,12 +1606,64 @@ func (s *FileStore) Delete(_ context.Context, name, expectedIncarnationID string
 				s.accounts = oldAccounts
 				s.connectors = oldConnectors
 				s.namespaces = oldNamespaces
+				s.memberCredentials = oldMemberCredentials
+				s.linkedAccounts = oldLinkedAccounts
 				return err
 			}
 			return nil
 		}
 	}
 	return ErrAccountIncarnation
+}
+
+func (s *FileStore) MemberCredential(_ context.Context, account, subject string) (MemberCredential, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, credential := range s.memberCredentials {
+		if credential.Account == account && credential.Subject == subject {
+			return *credential, true, nil
+		}
+	}
+	return MemberCredential{}, false, nil
+}
+
+func (s *FileStore) PutMemberCredential(_ context.Context, credential MemberCredential) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	live := false
+	for _, a := range s.accounts {
+		live = live || (a.Name == credential.Account && credential.IncarnationID != "" && a.IncarnationID == credential.IncarnationID)
+	}
+	if !live || credential.Subject == "" {
+		return ErrAccountIncarnation
+	}
+	before := s.memberCredentials
+	s.memberCredentials = slices.DeleteFunc(slices.Clone(s.memberCredentials), func(c *MemberCredential) bool {
+		return c.Account == credential.Account && c.Subject == credential.Subject
+	})
+	s.memberCredentials = append(s.memberCredentials, &credential)
+	if err := s.saveLocked(); err != nil {
+		s.memberCredentials = before
+		return err
+	}
+	return nil
+}
+
+func (s *FileStore) DeleteMemberCredential(_ context.Context, account, subject string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	before := s.memberCredentials
+	s.memberCredentials = slices.DeleteFunc(slices.Clone(s.memberCredentials), func(c *MemberCredential) bool {
+		return c.Account == account && c.Subject == subject
+	})
+	if len(s.memberCredentials) == len(before) {
+		return nil
+	}
+	if err := s.saveLocked(); err != nil {
+		s.memberCredentials = before
+		return err
+	}
+	return nil
 }
 
 // UpdateAccountPolicy applies curation/presentation changes under the exact
@@ -1514,6 +1707,10 @@ func (s *FileStore) UpdateAccountPolicy(_ context.Context, name string, precondi
 		}
 		if mutation.ReadOnly != nil && account.ReadOnly != *mutation.ReadOnly {
 			account.ReadOnly = *mutation.ReadOnly
+			changed = true
+		}
+		if mutation.MemberCredentials != nil && account.MemberCredentials != *mutation.MemberCredentials {
+			account.MemberCredentials = *mutation.MemberCredentials
 			changed = true
 		}
 		if !changed {
@@ -1754,7 +1951,7 @@ func (s *FileStore) connectionNamespaceBySlugLocked(slug string) (*ConnectionNam
 func (s *FileStore) connectionNamespaceForLegacyLabelLocked(label string) (*ConnectionNamespace, bool) {
 	label = strings.TrimSpace(label)
 	for _, ns := range s.connectionNamespaces {
-		if ns != nil && strings.EqualFold(strings.TrimSpace(ns.Label), label) {
+		if ns != nil && ns.OwnerSubject == "" && strings.EqualFold(strings.TrimSpace(ns.Label), label) {
 			return ns, true
 		}
 	}
@@ -1772,6 +1969,9 @@ func (s *FileStore) ensureAccountConnectionNamespaceLocked(a *Account) (bool, er
 		ns, ok := s.connectionNamespaceByIDLocked(a.ConnectionNamespaceID)
 		if !ok {
 			return false, fmt.Errorf("%w: %s", ErrConnectionNamespaceNotFound, a.ConnectionNamespaceID)
+		}
+		if err := validatePersonalNamespaceAccount(*ns, *a); err != nil {
+			return false, err
 		}
 		if strings.TrimSpace(a.Group) == "" {
 			a.Group = ns.Label
@@ -2233,7 +2433,17 @@ func prepareConnectionNamespaceForCreate(ns *ConnectionNamespace) error {
 		return errors.New("connection namespace slug is required")
 	}
 	ns.CreatedBy = strings.TrimSpace(ns.CreatedBy)
+	ns.OwnerSubject = strings.TrimSpace(ns.OwnerSubject)
+	if ns.OwnerSubject != "" {
+		if !validActorIdentifier(ns.OwnerSubject) {
+			return errors.New("invalid personal folder owner")
+		}
+		ns.ManagerGrants = []ConnectionNamespaceManagerGrant{{Subject: ns.OwnerSubject}}
+	}
 	ns.ManagerGrants = initialConnectionNamespaceManagerGrants(ns.ManagerGrants, ns.CreatedBy)
+	if ns.OwnerSubject != "" {
+		ns.ManagerGrants = []ConnectionNamespaceManagerGrant{{Subject: ns.OwnerSubject}}
+	}
 	// Creation owns the initial CAS version. Accepting a caller-supplied
 	// revision would let a management client manufacture a future precondition.
 	ns.Revision = 1
@@ -2282,6 +2492,12 @@ func (s *FileStore) UpdateConnectionNamespace(_ context.Context, update Connecti
 	}
 	if update.CreatedBy != "" && strings.TrimSpace(update.CreatedBy) != ns.CreatedBy {
 		return ConnectionNamespace{}, errors.New("connection namespace creator is immutable")
+	}
+	if update.OwnerSubject != ns.OwnerSubject {
+		return ConnectionNamespace{}, errors.New("connection namespace ownership is immutable")
+	}
+	if ns.OwnerSubject != "" && !sameManagerGrants(normalizedManagerGrants(update.ManagerGrants), []ConnectionNamespaceManagerGrant{{Subject: ns.OwnerSubject}}) {
+		return ConnectionNamespace{}, errors.New("personal folders cannot delegate management")
 	}
 	label := strings.TrimSpace(update.Label)
 	if label == "" {
@@ -2432,6 +2648,9 @@ func (s *FileStore) MoveAccountToConnectionNamespace(_ context.Context, name, ex
 		proposed.ConnectionScope = assignment.Scope
 		proposed.OwnerSubject = assignment.OwnerSubject
 		proposed.Group = target.Label
+		if err := validatePersonalNamespaceAccount(*target, proposed); err != nil {
+			return Account{}, err
+		}
 		if err := s.validatePersonalAccountMCPClientGrantsLocked(proposed); err != nil {
 			return Account{}, err
 		}

@@ -46,7 +46,7 @@ func (c *ConsoleAPI) handleToolPolicy(w http.ResponseWriter, r *http.Request) {
 	}
 	tools, err := c.gw.ListAccountTools(r.Context(), accountID)
 	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		writeToolListingError(w, accountID, err, "")
 		return
 	}
 	var current ToolInfo
@@ -117,6 +117,10 @@ func (c *ConsoleAPI) handleToolPolicy(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "read-only governance requires a tool Synaxis classifies as read-only"})
 			return
 		}
+		if preset.requiresApproval() && accountDeliveredOnlyByExactGrant(account) {
+			writeApprovalNotSupportedForDelegated(w, r)
+			return
+		}
 		override.GovernancePreset = preset
 	}
 
@@ -144,13 +148,13 @@ func (c *ConsoleAPI) handleToolPolicy(w http.ResponseWriter, r *http.Request) {
 		writeAccountPolicyMutationError(w, err, "could not update connection policy")
 		return
 	}
-	if _, err := c.gw.ReplaceAccount(r.Context(), accountID); err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "policy saved, but live tool refresh failed: " + err.Error()})
+	if err := c.gw.refreshAccountTools(r.Context(), accountID); err != nil {
+		writeToolListingError(w, accountID, err, toolPolicySavedNotLive)
 		return
 	}
 	updated, err := c.gw.ListAccountTools(r.Context(), accountID)
 	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		writeToolListingError(w, accountID, err, toolPolicySavedNotLive)
 		return
 	}
 	for _, tool := range updated {
@@ -263,6 +267,10 @@ func (c *ConsoleAPI) handleLogTriage(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !c.connectorsSupported(w) {
+			return
+		}
+		if account, found := c.store.Account(rec.Account); found && accountDeliveredOnlyByExactGrant(account) {
+			writeApprovalNotSupportedForDelegated(w, r)
 			return
 		}
 		if rec.Connector == "" {
@@ -476,8 +484,13 @@ func (c *ConsoleAPI) handlePortableConfigImport(w http.ResponseWriter, r *http.R
 				return
 			}
 			aliases[effective] = tool
-			if _, err := normalizedGovernancePreset(override.GovernancePreset); err != nil {
+			preset, err := normalizedGovernancePreset(override.GovernancePreset)
+			if err != nil {
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid governance preset for " + account.Name + "/" + tool})
+				return
+			}
+			if existing, found := c.store.Account(account.Name); found && preset.requiresApproval() && accountDeliveredOnlyByExactGrant(existing) {
+				writeApprovalNotSupportedForDelegated(w, r)
 				return
 			}
 		}
@@ -506,6 +519,10 @@ func (c *ConsoleAPI) handlePortableConfigImport(w http.ResponseWriter, r *http.R
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "namespace " + strconv.Quote(namespace.Slug) + " references unknown account " + strconv.Quote(account)})
 				return
 			}
+		}
+		if name, found := callerDelegatedEndpointMember(c.store, normalizedNamespaceAccounts(namespace.Members)); found {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": ErrCallerDelegatedAccountExposure.Error() + ": " + strconv.Quote(name)})
+			return
 		}
 		if c.connStore != nil {
 			if _, exists := c.connStore.VirtualConnector(r.Context(), namespace.Slug); exists {
@@ -554,6 +571,9 @@ func (c *ConsoleAPI) handlePortableConfigImport(w http.ResponseWriter, r *http.R
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": msg})
 			return
 		}
+		if c.refuseCallerDelegatedConnectorPolicy(w, r, connector.Tools, connector.Approval) {
+			return
+		}
 		if msg, ok := validateMaxResultBytes(connector.MaxResultBytes); !ok {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": msg})
 			return
@@ -599,6 +619,9 @@ func (c *ConsoleAPI) handlePortableConfigImport(w http.ResponseWriter, r *http.R
 			group := strings.TrimSpace(imported.ConnectionNamespace)
 			if group == "" {
 				group = strings.TrimSpace(imported.Group)
+				if group != "" {
+					NoteDeprecated("field:account.group")
+				}
 			}
 			account = Account{
 				Name: imported.Name, AuthMode: "oauth", Group: group,

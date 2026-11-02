@@ -6,6 +6,17 @@ import (
 	"testing"
 )
 
+// validAccess is RequireAuth's decision minus the generation sync: the
+// memory-only token checks plus the durable client binding.
+func (s *Server) validAccess(tok, path string) bool {
+	clientID, resource, ok := s.verifyAccess(tok, path)
+	if !ok {
+		return false
+	}
+	allowed, err := s.clientResourceAllowed(clientID, resource)
+	return err == nil && allowed
+}
+
 // Access tokens are bound to the resource path they were authorized for —
 // a token minted for a curated connector (/mcp/work) must not open the
 // ungated aggregate endpoint (/mcp), or approval gating and connector

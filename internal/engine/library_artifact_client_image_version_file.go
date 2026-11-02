@@ -31,7 +31,7 @@ func (s *FileStore) CreateLibraryMCPClientImageArtifactVersion(_ context.Context
 		return LibraryMCPClientArtifactVersionCreateResult{}, ErrMCPClientNotFound
 	}
 	artifact := s.libraryArtifactLocked(request.ArtifactID)
-	if artifact == nil || artifact.Origin != LibraryArtifactOriginAgentDirect || artifact.AgentSurfaceID != client.ID ||
+	if artifact == nil || artifact.ContentKind == LibraryContentChatReply || artifact.Origin != LibraryArtifactOriginAgentDirect || artifact.AgentSurfaceID != client.ID ||
 		artifact.CreatedBy != client.Subject || artifact.RunID == "" {
 		return LibraryMCPClientArtifactVersionCreateResult{}, ErrLibraryArtifactNotFound
 	}

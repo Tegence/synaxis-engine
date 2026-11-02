@@ -121,7 +121,10 @@ func (u *Upstream) dial(ctx context.Context) (*upstreamConnection, error) {
 		return nil, responseLimiter.classify(err)
 	}
 	init := mcp.InitializeRequest{}
-	init.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
+	// This adapter uses the legacy initialize/session wire contract. Pin its
+	// version independently of the SDK's latest stateless protocol so every
+	// fresh dial still begins with initialize, without a discovery probe.
+	init.Params.ProtocolVersion = mcp.ProtocolVersion20251125
 	init.Params.ClientInfo = mcp.Implementation{Name: "synaxis-engine", Version: "0.0"}
 	if _, err := c.Initialize(ctx, init); err != nil {
 		err = responseLimiter.classify(err)
@@ -199,11 +202,20 @@ func (u *Upstream) ListTools(ctx context.Context) ([]mcp.Tool, error) {
 // CallTool routes a prefixed tool call to this upstream (prefix already stripped
 // by the caller). Same refresh-and-redial guarantee.
 func (u *Upstream) CallTool(ctx context.Context, bareName string, args map[string]any) (*mcp.CallToolResult, error) {
+	return u.CallToolWithMeta(ctx, bareName, args, nil)
+}
+
+// CallToolWithMeta is CallTool with an optional _meta. The request is built
+// fresh, so nothing of the inbound call (its headers, other _meta keys) can
+// reach the upstream; the only caller that passes meta is a caller-delegated
+// account forwarding io.synaxis/call-id (callerGrantCallMeta).
+func (u *Upstream) CallToolWithMeta(ctx context.Context, bareName string, args map[string]any, meta *mcp.Meta) (*mcp.CallToolResult, error) {
 	var out *mcp.CallToolResult
 	err := u.withConn(ctx, func(c *client.Client) error {
 		req := mcp.CallToolRequest{}
 		req.Params.Name = bareName
 		req.Params.Arguments = args
+		req.Params.Meta = meta
 		res, err := c.CallTool(ctx, req)
 		if err != nil {
 			return err

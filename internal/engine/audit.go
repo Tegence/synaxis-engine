@@ -12,14 +12,17 @@ import (
 // Claude actually did end to end". Args/Result are the (optional, size-capped)
 // recorded payloads: list reads return them EMPTY; only CallDetail carries them.
 type CallRecord struct {
-	ID        int64     `json:"id"`
-	TS        time.Time `json:"ts"`
-	Account   string    `json:"account"`
-	Tool      string    `json:"tool"`
-	OK        bool      `json:"ok"`
-	Ms        int64     `json:"ms"`
-	Error     string    `json:"error,omitempty"`
-	Connector string    `json:"connector,omitempty"` // "" = default /mcp endpoint
+	CallerSubject        string    `json:"-"`
+	AccountIncarnationID string    `json:"-"`
+	AccountOwnerSubject  string    `json:"-"`
+	ID                   int64     `json:"id"`
+	TS                   time.Time `json:"ts"`
+	Account              string    `json:"account"`
+	Tool                 string    `json:"tool"`
+	OK                   bool      `json:"ok"`
+	Ms                   int64     `json:"ms"`
+	Error                string    `json:"error,omitempty"`
+	Connector            string    `json:"connector,omitempty"` // "" = default /mcp endpoint
 	// EndpointKind and EndpointGeneration bind a connector-attributed audit
 	// row to the exact endpoint incarnation that accepted the call. Replay
 	// rejects legacy/mismatched identity rather than following a reused slug.

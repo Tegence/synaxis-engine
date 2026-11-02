@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -264,8 +265,8 @@ func TestClientBoundResourceRejectsStaleCodeRefreshAndAccessAfterRevocation(t *t
 		}
 		return nil
 	})
-	h.server.SetClientResourceAuthorizer(func(clientID, path string) bool {
-		return bound && clientID == h.clientID && path == resourcePath
+	h.server.SetClientResourceAuthorizer(func(clientID, path string) (bool, error) {
+		return bound && clientID == h.clientID && path == resourcePath, nil
 	})
 	requestToken := h.authorize(t, resource)
 	claims := h.claims(requestToken, "approval_jti_client_revoke")
@@ -325,8 +326,8 @@ func TestClientBoundTokenExchangeRequiresExactSingleResource(t *testing.T) {
 	const resourcePath = "/mcp/clients/personal-work"
 	h.epochs[resourcePath] = "client-epoch-1"
 	h.server.SetHostedConsentAuthorizer(func(context.Context, string, string, string, string) error { return nil })
-	h.server.SetClientResourceAuthorizer(func(clientID, path string) bool {
-		return clientID == h.clientID && path == resourcePath
+	h.server.SetClientResourceAuthorizer(func(clientID, path string) (bool, error) {
+		return clientID == h.clientID && path == resourcePath, nil
 	})
 	issueCode := func(t *testing.T) string {
 		t.Helper()
@@ -941,5 +942,225 @@ func TestConfigureHostedConsentRejectsUnsafeConfiguration(t *testing.T) {
 	}
 	if err := server.ConfigureHostedConsent("https://app.example/consent", publicKey[:8]); err == nil {
 		t.Fatal("short Ed25519 public key should fail")
+	}
+}
+
+// clientBoundTokens completes consent and the code exchange for one
+// client-bound resource, returning the issued access and refresh tokens.
+func (h *hostedConsentHarness) clientBoundTokens(t *testing.T, resource, jti string) (string, string) {
+	t.Helper()
+	requestToken := h.authorize(t, resource)
+	claims := h.claims(requestToken, jti)
+	claims.Subject, claims.Role = "usr_personal_owner", "operator"
+	consent := completeHostedConsent(h.mux, requestToken, approvalAssertion(t, h.privateKey, claims), nil)
+	if consent.Code != http.StatusFound {
+		t.Fatalf("completion=%d body=%s", consent.Code, consent.Body)
+	}
+	redirect, err := url.Parse(consent.Header().Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := h.token(url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {redirect.Query().Get("code")},
+		"client_id":     {h.clientID},
+		"redirect_uri":  {h.redirect},
+		"code_verifier": {h.verifier},
+		"resource":      {resource},
+	})
+	if response.Code != http.StatusOK {
+		t.Fatalf("code exchange=%d body=%s", response.Code, response.Body)
+	}
+	var tokens struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&tokens); err != nil {
+		t.Fatal(err)
+	}
+	return tokens.AccessToken, tokens.RefreshToken
+}
+
+func (h *hostedConsentHarness) token(form url.Values) *httptest.ResponseRecorder {
+	request := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response := httptest.NewRecorder()
+	h.mux.ServeHTTP(response, request)
+	return response
+}
+
+// A binding that could not be read is not a revoked binding. Answering a
+// database blip with 401 and invalid_grant made healthy agents discard their
+// tokens and demand a full re-authorization.
+func TestClientBindingReadFailureIsRetryableNotARevocation(t *testing.T) {
+	h := newHostedConsentHarness(t)
+	const resource = "https://engine.example/mcp/clients/personal-work"
+	const resourcePath = "/mcp/clients/personal-work"
+	h.epochs[resourcePath] = "client-epoch-1"
+	h.server.SetHostedConsentAuthorizer(func(context.Context, string, string, string, string) error { return nil })
+	var readErr error
+	h.server.SetClientResourceAuthorizer(func(clientID, path string) (bool, error) {
+		if readErr != nil {
+			return false, readErr
+		}
+		return clientID == h.clientID && path == resourcePath, nil
+	})
+	access, refresh := h.clientBoundTokens(t, resource, "approval_jti_read_failure")
+	refreshForm := url.Values{"grant_type": {"refresh_token"}, "refresh_token": {refresh}, "client_id": {h.clientID}, "resource": {resource}}
+
+	readErr = errors.New("connection reset by peer")
+	if status, called := requireAuthStatus(h.server, access, resourcePath); status != http.StatusServiceUnavailable || called {
+		t.Fatalf("access during read failure = %d (served=%v), want 503 and not served", status, called)
+	}
+	if response := h.token(refreshForm); response.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(response.Body.String(), "temporarily_unavailable") || response.Header().Get("Retry-After") == "" {
+		t.Fatalf("refresh during read failure = %d %s, want retryable 503", response.Code, response.Body)
+	}
+
+	readErr = nil
+	if status, called := requireAuthStatus(h.server, access, resourcePath); status != http.StatusNoContent || !called {
+		t.Fatalf("access after recovery = %d (served=%v), want served", status, called)
+	}
+	if response := h.token(refreshForm); response.Code != http.StatusOK {
+		t.Fatalf("refresh after recovery = %d %s", response.Code, response.Body)
+	}
+}
+
+func TestHostedConsentExplainsWhyItRefused(t *testing.T) {
+	const resource = "https://engine.example/mcp/clients/personal-work"
+	const resourcePath = "/mcp/clients/personal-work"
+	for _, test := range []struct {
+		name   string
+		err    error
+		status int
+		reason string
+	}{
+		{"endpoint bound to another app", fmt.Errorf("bind: %w", ErrClientBoundToOtherApp), http.StatusForbidden, ConsentReasonClientBound},
+		{"binding state unavailable", fmt.Errorf("load: %w", ErrAuthorizationStateUnavailable), http.StatusServiceUnavailable, ""},
+		{"actor not permitted", errors.New("actor cannot authorize this MCP client"), http.StatusForbidden, ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			h := newHostedConsentHarness(t)
+			h.epochs[resourcePath] = "client-epoch-1"
+			h.server.SetHostedConsentAuthorizer(func(context.Context, string, string, string, string) error { return test.err })
+			requestToken := h.authorize(t, resource)
+			claims := h.claims(requestToken, "approval_jti_refusal")
+			claims.Subject, claims.Role = "usr_personal_owner", "operator"
+			response := completeHostedConsent(h.mux, requestToken, approvalAssertion(t, h.privateKey, claims), nil)
+			if response.Code != test.status || response.Header().Get(ConsentReasonHeader) != test.reason {
+				t.Fatalf("completion = %d reason %q, want %d reason %q (body %s)",
+					response.Code, response.Header().Get(ConsentReasonHeader), test.status, test.reason, response.Body)
+			}
+		})
+	}
+}
+
+// While the Engine has not (re)built its endpoint projection, a token for an
+// endpoint missing from memory may still be valid. It must get a retryable
+// 503, never the 401 / invalid_grant / invalid_target that make a client
+// throw its tokens away; once the projection is settled, those answers are
+// correct again.
+func TestUnprojectedResourceIsRetryableUntilTheProjectionSettles(t *testing.T) {
+	h := newHostedConsentHarness(t)
+	const resource = "https://engine.example/mcp/clients/personal-work"
+	const resourcePath = "/mcp/clients/personal-work"
+	h.epochs[resourcePath] = "client-epoch-1"
+	h.server.SetHostedConsentAuthorizer(func(context.Context, string, string, string, string) error { return nil })
+	h.server.SetClientResourceAuthorizer(func(clientID, path string) (bool, error) {
+		return clientID == h.clientID && path == resourcePath, nil
+	})
+	ready := true
+	h.server.SetResourceProjectionReady(func() bool { return ready })
+	access, refresh := h.clientBoundTokens(t, resource, "approval_jti_projection")
+	refreshForm := url.Values{"grant_type": {"refresh_token"}, "refresh_token": {refresh}, "client_id": {h.clientID}, "resource": {resource}}
+	authorizeQuery := url.Values{
+		"client_id": {h.clientID}, "redirect_uri": {h.redirect}, "response_type": {"code"},
+		"code_challenge_method": {"S256"}, "code_challenge": {h.challenge}, "scope": {"mcp"},
+		"state": {"s"}, "resource": {resource},
+	}
+	authorizeError := func() string {
+		t.Helper()
+		response := httptest.NewRecorder()
+		h.mux.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/authorize?"+authorizeQuery.Encode(), nil))
+		location, err := url.Parse(response.Header().Get("Location"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return location.Query().Get("error")
+	}
+
+	// The endpoint drops out of memory (a refresh that could not read state).
+	delete(h.epochs, resourcePath)
+	ready = false
+	if status, called := requireAuthStatus(h.server, access, resourcePath); status != http.StatusServiceUnavailable || called {
+		t.Fatalf("access while not projected = %d (served=%v), want 503", status, called)
+	}
+	if response := h.token(refreshForm); response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("refresh while not projected = %d %s, want 503", response.Code, response.Body)
+	}
+	if got := authorizeError(); got != "temporarily_unavailable" {
+		t.Fatalf("authorize while not projected error = %q, want temporarily_unavailable", got)
+	}
+
+	// Projected again: the same token and grant work.
+	h.epochs[resourcePath] = "client-epoch-1"
+	ready = true
+	if status, called := requireAuthStatus(h.server, access, resourcePath); status != http.StatusNoContent || !called {
+		t.Fatalf("access after projection = %d (served=%v)", status, called)
+	}
+	if response := h.token(refreshForm); response.Code != http.StatusOK {
+		t.Fatalf("refresh after projection = %d %s", response.Code, response.Body)
+	}
+
+	// Settled and genuinely gone: the endpoint really was deleted.
+	delete(h.epochs, resourcePath)
+	if status, _ := requireAuthStatus(h.server, access, resourcePath); status != http.StatusUnauthorized {
+		t.Fatalf("access to a deleted endpoint = %d, want 401", status)
+	}
+	if response := h.token(refreshForm); response.Code != http.StatusBadRequest {
+		t.Fatalf("refresh for a deleted endpoint = %d, want 400 invalid_grant", response.Code)
+	}
+	if got := authorizeError(); got != "invalid_target" {
+		t.Fatalf("authorize for a deleted endpoint error = %q, want invalid_target", got)
+	}
+}
+
+// Only Platform's signed replace claim reaches the replacer, and only for a
+// client-bound endpoint; every other approval uses the ordinary authorizer.
+func TestHostedConsentReplaceClaimUsesTheReplacerForClientEndpointsOnly(t *testing.T) {
+	refuseBound := func(context.Context, string, string, string, string) error {
+		return fmt.Errorf("bind: %w", ErrClientBoundToOtherApp)
+	}
+	for _, test := range []struct {
+		name     string
+		resource string
+		path     string
+		replace  bool
+		want     int
+	}{
+		{"replace on a client endpoint", "https://engine.example/mcp/clients/personal-work", "/mcp/clients/personal-work", true, http.StatusFound},
+		{"no replace on a client endpoint", "https://engine.example/mcp/clients/personal-work", "/mcp/clients/personal-work", false, http.StatusForbidden},
+		{"replace on a shared endpoint", "https://engine.example/mcp/team", "/mcp/team", true, http.StatusForbidden},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			h := newHostedConsentHarness(t)
+			h.epochs[test.path] = "epoch-1"
+			replacerCalls := 0
+			h.server.SetHostedConsentAuthorizer(refuseBound)
+			h.server.SetHostedConsentReplacer(func(context.Context, string, string, string, string) error {
+				replacerCalls++
+				return nil
+			})
+			requestToken := h.authorize(t, test.resource)
+			claims := h.claims(requestToken, "approval_jti_replace")
+			claims.Subject, claims.Role, claims.Replace = "usr_personal_owner", "operator", test.replace
+			response := completeHostedConsent(h.mux, requestToken, approvalAssertion(t, h.privateKey, claims), nil)
+			if response.Code != test.want {
+				t.Fatalf("completion = %d, want %d (body %s)", response.Code, test.want, response.Body)
+			}
+			if wantCalls := map[bool]int{true: 1, false: 0}[test.want == http.StatusFound]; replacerCalls != wantCalls {
+				t.Fatalf("replacer calls = %d, want %d", replacerCalls, wantCalls)
+			}
+		})
 	}
 }

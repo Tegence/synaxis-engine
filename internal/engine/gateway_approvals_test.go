@@ -12,6 +12,7 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"github.com/mark3labs/mcp-go/server/servertest"
 )
 
 // ---- read-only heuristic ----
@@ -135,7 +136,7 @@ func newApprovalTestGateway(t *testing.T) (*Gateway, *int32) {
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			return mcp.NewToolResultText("got-upstream"), nil
 		})
-	ts := server.NewTestStreamableHTTPServer(up)
+	ts := servertest.NewTestStreamableHTTPServer(up)
 	t.Cleanup(ts.Close)
 
 	fs, err := LoadFileStore(filepath.Join(t.TempDir(), "accounts.json"))
@@ -593,7 +594,6 @@ func TestDecideValidation(t *testing.T) {
 		t.Fatal("an invalid status must error")
 	}
 }
-
 
 // failingTerminalStore fails the conditional terminal transition, simulating a
 // store that is unavailable exactly when a parked call reaches its deadline.

@@ -285,7 +285,7 @@ func (s *FileStore) LibraryMCPRootSkillPage(_ context.Context, cursor LibraryMCP
 	}
 	items := make([]LibraryMCPRootSkill, 0, len(s.librarySkills))
 	for _, skill := range s.librarySkills {
-		if skill == nil {
+		if skill == nil || skill.Private {
 			continue
 		}
 		latest := latestBySkill[skill.ID]
@@ -739,7 +739,7 @@ func (s *FileStore) LibrarySkillResolutionSelections(_ context.Context, request 
 
 	bindingsBySkill := make(map[string][]LibrarySkillBinding, len(skills))
 	for _, binding := range s.librarySkillBindings {
-		if binding != nil {
+		if binding != nil && s.skillBindingGrantAllowedLocked(*binding) {
 			bindingsBySkill[binding.SkillID] = append(bindingsBySkill[binding.SkillID], copyLibrarySkillBinding(*binding))
 		}
 	}
@@ -765,7 +765,7 @@ func (s *FileStore) LibraryAgentSurfaceSkillSelections(_ context.Context, agentS
 func (s *FileStore) libraryAgentSurfaceSkillSelectionsLocked(agentSurfaceID string) ([]LibraryAgentSurfaceSkillSelection, error) {
 	selected := make(map[string]LibraryAgentSurfaceSkillSelection)
 	for _, binding := range s.librarySkillBindings {
-		if binding == nil || binding.ScopeKind != LibraryScopeAgentSurface || binding.ScopeID != agentSurfaceID {
+		if binding == nil || binding.ScopeKind != LibraryScopeAgentSurface || binding.ScopeID != agentSurfaceID || !s.skillBindingGrantAllowedLocked(*binding) {
 			continue
 		}
 		skill := s.librarySkillLocked(binding.SkillID)
@@ -791,6 +791,9 @@ func (s *FileStore) libraryAgentSurfaceSkillSelectionsLocked(agentSurfaceID stri
 		candidate := LibraryAgentSurfaceSkillSelection{
 			Skill: copyLibrarySkill(*skill), Binding: copyLibrarySkillBinding(*binding), Version: copyLibrarySkillVersion(*version),
 		}
+		if binding.SharedGrantID != "" {
+			candidate.Skill.Description = ""
+		}
 		current, exists := selected[skill.ID]
 		if !exists || candidate.Binding.Priority > current.Binding.Priority || (candidate.Binding.Priority == current.Binding.Priority && candidate.Binding.ID < current.Binding.ID) {
 			selected[skill.ID] = candidate
@@ -815,6 +818,13 @@ func (s *FileStore) libraryAgentSurfaceSkillSelectionsLocked(agentSurfaceID stri
 func (s *FileStore) UpsertLibrarySkillBinding(_ context.Context, binding LibrarySkillBinding) (LibrarySkillBinding, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if skill := s.librarySkillLocked(binding.SkillID); binding.SharedGrantID != "" || (skill != nil && skill.Private) {
+		return LibrarySkillBinding{}, ErrLibraryMemberSkillAccess
+	}
+	return s.upsertLibrarySkillBindingLocked(binding)
+}
+
+func (s *FileStore) upsertLibrarySkillBindingLocked(binding LibrarySkillBinding) (LibrarySkillBinding, error) {
 	if isBuiltInLibrarySkillID(binding.SkillID) || isReservedBuiltInLibraryBindingID(binding.ID) {
 		return LibrarySkillBinding{}, ErrLibraryBuiltInManaged
 	}
@@ -869,6 +879,10 @@ func (s *FileStore) UpsertLibrarySkillBinding(_ context.Context, binding Library
 func (s *FileStore) DeleteLibrarySkillBinding(_ context.Context, skillID, bindingID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.deleteLibrarySkillBindingLocked(skillID, bindingID)
+}
+
+func (s *FileStore) deleteLibrarySkillBindingLocked(skillID, bindingID string) error {
 	if isBuiltInLibrarySkillID(skillID) {
 		return ErrLibraryBuiltInManaged
 	}
@@ -963,9 +977,15 @@ func (s *FileStore) LibraryConsoleRunPage(_ context.Context, cursor LibraryConso
 		return LibraryConsoleRunPage{}, err
 	}
 
+	hidden := map[string]bool{}
+	for _, artifact := range s.libraryArtifacts {
+		if artifact != nil && artifact.ContentKind == LibraryContentChatReply {
+			hidden[artifact.RunID] = true
+		}
+	}
 	items := make([]LibraryRun, 0, len(s.libraryRuns))
 	for _, run := range s.libraryRuns {
-		if run == nil {
+		if run == nil || hidden[run.ID] {
 			continue
 		}
 		if !cursor.Timestamp.IsZero() && !(run.StartedAt.Before(cursor.Timestamp) || (run.StartedAt.Equal(cursor.Timestamp) && run.ID < cursor.ID)) {
@@ -1056,7 +1076,7 @@ func (s *FileStore) LibraryArtifacts(_ context.Context) ([]LibraryArtifact, erro
 	defer s.mu.Unlock()
 	out := make([]LibraryArtifact, 0, len(s.libraryArtifacts))
 	for _, artifact := range s.libraryArtifacts {
-		if artifact != nil {
+		if artifact != nil && artifact.ContentKind != LibraryContentChatReply {
 			out = append(out, copyLibraryArtifact(*artifact))
 		}
 	}
@@ -1080,7 +1100,7 @@ func (s *FileStore) LibraryConsoleArtifactPage(_ context.Context, cursor Library
 
 	items := make([]LibraryConsoleArtifact, 0, len(s.libraryArtifacts))
 	for _, artifact := range s.libraryArtifacts {
-		if artifact == nil {
+		if artifact == nil || artifact.ContentKind == LibraryContentChatReply {
 			continue
 		}
 		if !cursor.Timestamp.IsZero() && !(artifact.CreatedAt.Before(cursor.Timestamp) || (artifact.CreatedAt.Equal(cursor.Timestamp) && artifact.ID < cursor.ID)) {
@@ -1141,7 +1161,7 @@ func (s *FileStore) LibraryMCPRootArtifactPage(_ context.Context, cursor Library
 
 	items := make([]LibraryMCPRootArtifact, 0, len(s.libraryArtifacts))
 	for _, artifact := range s.libraryArtifacts {
-		if artifact == nil {
+		if artifact == nil || artifact.ContentKind == LibraryContentChatReply {
 			continue
 		}
 		if !cursor.CreatedAt.IsZero() && !(artifact.CreatedAt.Before(cursor.CreatedAt) || (artifact.CreatedAt.Equal(cursor.CreatedAt) && artifact.ID < cursor.ID)) {
@@ -1208,6 +1228,7 @@ func errorsNewLibraryProvenanceMismatch() error {
 func (s *FileStore) CreateLibraryArtifactWithInitialVersion(_ context.Context, artifact LibraryArtifact, version LibraryArtifactVersion) (LibraryArtifact, LibraryArtifactVersion, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	artifact.ContentKind = libraryContentKind(artifact.ContentKind)
 	if artifact.ID == "" {
 		artifact.ID = newLibraryArtifactID()
 	}
@@ -1343,6 +1364,9 @@ func (s *FileStore) CreateLibraryMCPClientArtifactWithInitialVersion(_ context.C
 	}
 	if s.libraryRunLocked(run.ID) != nil || s.libraryArtifactLocked(artifact.ID) != nil || s.libraryArtifactVersionLocked(artifact.ID, version.ID) != nil {
 		return LibraryRun{}, LibraryArtifact{}, LibraryArtifactVersion{}, errors.New("library artifact identity already exists")
+	}
+	if err := s.validateLibraryChatLinksLocked(artifact, *storedClient); err != nil {
+		return LibraryRun{}, LibraryArtifact{}, LibraryArtifactVersion{}, err
 	}
 	if artifact.SourceArtifactID != "" && !s.libraryMCPClientMayUseArtifactVersionLocked(artifact.SourceArtifactID, artifact.SourceArtifactVersionID, artifact.SourceArtifactDigest, *storedClient) {
 		return LibraryRun{}, LibraryArtifact{}, LibraryArtifactVersion{}, ErrLibraryArtifactNotFound
@@ -1500,12 +1524,15 @@ func (s *FileStore) LibraryMCPClientArtifactPage(_ context.Context, client MCPCl
 		}
 		artifact := s.libraryArtifactLocked(grant.ArtifactID)
 		version := s.libraryArtifactVersionLocked(grant.ArtifactID, grant.ArtifactVersionID)
-		if artifact == nil || version == nil || version.Digest != grant.ArtifactVersionDigest {
+		if artifact == nil || artifact.ContentKind == LibraryContentChatReply || version == nil || version.Digest != grant.ArtifactVersionDigest {
 			continue
 		}
 		byID[artifact.ID] = LibraryMCPClientArtifact{Artifact: libraryArtifactMetadata(*artifact), Version: libraryArtifactVersionMetadata(*version), Access: "granted"}
 	}
 	for _, artifact := range s.libraryArtifacts {
+		if artifact != nil && artifact.ContentKind == LibraryContentChatReply {
+			continue
+		}
 		if artifact == nil || artifact.AgentSurfaceID != storedClient.ID || artifact.CreatedBy != storedClient.Subject || artifact.RunID == "" {
 			continue
 		}
@@ -1574,7 +1601,7 @@ func (s *FileStore) LibraryArtifactVersion(_ context.Context, artifactID, id str
 func (s *FileStore) CreateLibraryArtifactVersion(_ context.Context, version LibraryArtifactVersion) (LibraryArtifactVersion, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.libraryArtifactLocked(version.ArtifactID) == nil {
+	if artifact := s.libraryArtifactLocked(version.ArtifactID); artifact == nil || artifact.ContentKind == LibraryContentChatReply {
 		return LibraryArtifactVersion{}, ErrLibraryArtifactNotFound
 	}
 	normalized, err := normalizedLibraryArtifactVersion(version)

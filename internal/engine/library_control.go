@@ -50,13 +50,13 @@ type LibraryControlArtifact struct {
 	// Access is "owned" or "granted" relative to the scope's surfaces, and
 	// empty on an unscoped page.
 	Access string
-	// LatestVersion is metadata only; its Body is always empty.
+	// LatestVersion is the newest authorized version metadata; its Body is always empty.
 	LatestVersion LibraryArtifactVersion
 	// GrantedVersion is the exact pinned version metadata when Access is
 	// "granted". A grant never means "latest".
 	GrantedVersion *LibraryArtifactVersion
-	// UpdatedAt is the newest immutable version's creation time. Appending a
-	// version moves the artifact to the top of the page.
+	// UpdatedAt is the newest authorized version's creation time. An unshared
+	// newer version never changes a grantee's ordering or pagination.
 	UpdatedAt time.Time
 }
 

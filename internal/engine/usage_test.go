@@ -18,6 +18,7 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"github.com/mark3labs/mcp-go/server/servertest"
 )
 
 type stubUsageStore struct {
@@ -558,7 +559,7 @@ func newSingleToolUsageGateway(
 			atomic.AddInt32(&dispatches, 1)
 			return handler(ctx, req)
 		})
-	testServer := server.NewTestStreamableHTTPServer(upstream)
+	testServer := servertest.NewTestStreamableHTTPServer(upstream)
 	t.Cleanup(testServer.Close)
 	fileStore, err := LoadFileStore(t.TempDir() + "/accounts.json")
 	if err != nil {

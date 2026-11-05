@@ -147,16 +147,16 @@ func TestControlV1LibraryArtifactsSubjectScopeShowsOwnedAndGranted(t *testing.T)
 	if len(page.Artifacts) != 2 || page.NextCursor != "" {
 		t.Fatalf("operator scope=%+v", page)
 	}
-	// The shared artifact's head moved after the owned artifact was written,
-	// so it is the most recently updated row.
+	// The shared artifact's authorized v1 was written after the owned artifact,
+	// so it is the most recently updated visible row.
 	if page.Artifacts[0].ID != f.shared.ID || page.Artifacts[1].ID != f.owned.ID {
 		t.Fatalf("scope order=%+v", page.Artifacts)
 	}
 	shared, owned := page.Artifacts[0], page.Artifacts[1]
 	if shared.Access != LibraryControlArtifactAccessGranted || shared.AgentSurfaceID != "" || shared.Format != LibraryArtifactFormatText || shared.Origin != LibraryArtifactOriginHuman ||
-		shared.LatestVersion.ID != f.sharedV2.ID || shared.LatestVersion.Version != 2 || shared.LatestVersion.Digest != f.sharedV2.Digest ||
+		shared.LatestVersion.ID != f.sharedV1.ID || shared.LatestVersion.Version != 1 || shared.LatestVersion.Digest != f.sharedV1.Digest ||
 		shared.GrantedVersion == nil || shared.GrantedVersion.ID != f.sharedV1.ID || shared.GrantedVersion.Version != 1 || shared.GrantedVersion.Digest != f.sharedV1.Digest ||
-		shared.UpdatedAt != f.sharedV2.CreatedAt.UTC().Format(time.RFC3339Nano) || shared.Title != "Shared brief" {
+		shared.UpdatedAt != f.sharedV1.CreatedAt.UTC().Format(time.RFC3339Nano) || shared.Title != "Shared brief" {
 		t.Fatalf("shared row=%+v", shared)
 	}
 	if owned.Access != LibraryControlArtifactAccessOwned || owned.AgentSurfaceID != f.codex.ID || owned.GrantedVersion != nil || owned.Format != LibraryArtifactFormatMarkdown ||
@@ -252,13 +252,13 @@ func TestControlV1LibraryArtifactDetailAndVersionBodyHonorSubjectScope(t *testin
 		return dto
 	}
 
-	// A grantee sees the artifact, its version metadata, and only the grants
+	// A grantee sees only exact authorized version metadata and live grants
 	// held by its own registrations.
 	response := detail(platformServiceActorID, "service", f.shared.ID, "usr_operator")
 	shared := decodeDetail(response)
-	if shared.Access != LibraryControlArtifactAccessGranted || shared.GrantedVersion == nil || shared.GrantedVersion.ID != f.sharedV1.ID || shared.LatestVersion.ID != f.sharedV2.ID ||
-		len(shared.Versions) != 2 || shared.Versions[0].ID != f.sharedV1.ID || shared.Versions[0].Digest != f.sharedV1.Digest || shared.Versions[0].SizeBytes != f.sharedV1.SizeBytes ||
-		shared.Versions[0].RedactionStatus != LibraryRedactionPending || shared.Versions[0].Format != LibraryArtifactFormatText || shared.Versions[1].Version != 2 ||
+	if shared.Access != LibraryControlArtifactAccessGranted || shared.GrantedVersion == nil || shared.GrantedVersion.ID != f.sharedV1.ID || shared.LatestVersion.ID != f.sharedV1.ID ||
+		len(shared.Versions) != 1 || shared.Versions[0].ID != f.sharedV1.ID || shared.Versions[0].Digest != f.sharedV1.Digest || shared.Versions[0].SizeBytes != f.sharedV1.SizeBytes ||
+		shared.Versions[0].RedactionStatus != LibraryRedactionPending || shared.Versions[0].Format != LibraryArtifactFormatText ||
 		len(shared.Grants) != 1 || shared.Grants[0].ID != f.sharedGrant.ID || shared.Grants[0].RecipientClientID != f.codex.ID || shared.Grants[0].VersionID != f.sharedV1.ID ||
 		shared.Grants[0].Digest != f.sharedV1.Digest || shared.Grants[0].State != "active" || shared.Grants[0].RevokedAt != "" {
 		t.Fatalf("shared detail=%+v", shared)
@@ -546,7 +546,9 @@ func TestControlV1LibraryAuthorizationAndServiceAllowlist(t *testing.T) {
 	// Allow header.
 	for _, wrong := range []struct{ method, path, allow string }{
 		{http.MethodPost, "/control/v1/library/artifacts", http.MethodGet},
-		{http.MethodDelete, artifact, http.MethodGet},
+		// DELETE on the artifact is the service-only erasure route
+		// (control_v1_library_delete_test.go); other methods stay refused.
+		{http.MethodPut, artifact, http.MethodGet},
 		{http.MethodPost, artifact + "/versions/" + f.sharedV1.ID, http.MethodGet},
 		{http.MethodGet, artifact + "/grants", http.MethodPost},
 		{http.MethodGet, artifact + "/grants/" + f.sharedGrant.ID + "/revoke", http.MethodPost},
@@ -779,8 +781,8 @@ func exerciseLibraryControlArtifactStore(t *testing.T, ctx context.Context, stor
 		}
 	}
 	shared := byID[f.shared.ID]
-	if shared.Access != LibraryControlArtifactAccessGranted || shared.Artifact.AgentSurfaceID != "" || shared.LatestVersion.ID != f.sharedV2.ID || shared.LatestVersion.Version != 2 ||
-		shared.GrantedVersion == nil || shared.GrantedVersion.ID != f.sharedV1.ID || shared.GrantedVersion.Digest != f.sharedV1.Digest || !sameInstant(shared.UpdatedAt, f.sharedV2.CreatedAt) {
+	if shared.Access != LibraryControlArtifactAccessGranted || shared.Artifact.AgentSurfaceID != "" || shared.LatestVersion.ID != f.sharedV1.ID || shared.LatestVersion.Version != 1 ||
+		shared.GrantedVersion == nil || shared.GrantedVersion.ID != f.sharedV1.ID || shared.GrantedVersion.Digest != f.sharedV1.Digest || !sameInstant(shared.UpdatedAt, f.sharedV1.CreatedAt) {
 		t.Fatalf("shared=%+v", shared)
 	}
 	ownedA := byID[f.ownedA.ID]
@@ -872,8 +874,8 @@ func exerciseLibraryControlArtifactStore(t *testing.T, ctx context.Context, stor
 	if err != nil {
 		t.Fatal(err)
 	}
-	if secondaryAfter.Artifacts[0].Artifact.ID != f.ownedA.ID || secondaryAfter.Artifacts[0].GrantedVersion.ID != f.ownedAV1.ID || secondaryAfter.Artifacts[0].LatestVersion.ID != bumped.ID {
-		t.Fatalf("secondary after append=%+v", secondaryAfter.Artifacts[0])
+	if secondaryAfter.Artifacts[0].Artifact.ID != f.ownedC.ID || secondaryAfter.Artifacts[1].Artifact.ID != f.ownedA.ID || secondaryAfter.Artifacts[1].GrantedVersion.ID != f.ownedAV1.ID || secondaryAfter.Artifacts[1].LatestVersion.ID != f.ownedAV1.ID || !sameInstant(secondaryAfter.Artifacts[1].UpdatedAt, f.ownedAV1.CreatedAt) {
+		t.Fatalf("unshared append changed secondary metadata or ordering: %+v", secondaryAfter.Artifacts)
 	}
 
 	// Input validation.
@@ -920,5 +922,90 @@ func TestLibraryControlArtifactPageFileStoreParity(t *testing.T) {
 		} else if item.Access != LibraryControlArtifactAccessOwned || item.Artifact.AgentSurfaceID != fixture.primary.ID {
 			t.Fatalf("reloaded owned=%+v", item)
 		}
+	}
+}
+
+func TestControlLibraryCreatorOnlyAvailableToUnscopedServiceDetail(t *testing.T) {
+	mux, store, key, now, _ := newHostedControlConsole(t)
+	f := newControlLibraryFixture(t, store)
+	path := "/control/v1/library/artifacts/" + f.shared.ID
+	for _, tc := range []struct{ name, actor, role, subject, wantCreator string }{
+		{"internal ownership check", platformServiceActorID, "service", "", "usr_owner"},
+		{"scoped service", platformServiceActorID, "service", "usr_operator", ""},
+		{"owner metadata", "usr_owner", "owner", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			response := controlLibraryRequest(t, mux, key, now, tc.actor, tc.role, http.MethodGet, path, "", tc.subject)
+			if response.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body)
+			}
+			var detail controlLibraryArtifactDetailDTO
+			if err := json.Unmarshal(response.Body.Bytes(), &detail); err != nil {
+				t.Fatal(err)
+			}
+			if detail.CreatedBy != tc.wantCreator {
+				t.Fatalf("creator=%q want=%q", detail.CreatedBy, tc.wantCreator)
+			}
+			if strings.Contains(response.Body.String(), "shared v1 body") || strings.Contains(response.Body.String(), "shared v2 body") {
+				t.Fatal("metadata exposed body")
+			}
+		})
+	}
+	page := decodeControlLibraryPage(t, controlLibraryRequest(t, mux, key, now, platformServiceActorID, "service", http.MethodGet, "/control/v1/library/artifacts", "", ""))
+	for _, artifact := range page.Artifacts {
+		if artifact.CreatedBy != "" {
+			t.Fatal("list exposed creator")
+		}
+	}
+}
+
+// An exact-version grant is a metadata boundary as well as a body boundary.
+func TestControlLibraryGrantedMetadataExcludesUnsharedVersions(t *testing.T) {
+	mux, store, key, now, _ := newHostedControlConsole(t)
+	f := newControlLibraryFixture(t, store)
+	path := "/control/v1/library/artifacts/" + f.shared.ID
+	response := controlLibraryRequest(t, mux, key, now, platformServiceActorID, "service", http.MethodGet, path, "", "usr_operator")
+	if response.Code != http.StatusOK {
+		t.Fatalf("detail=%d %s", response.Code, response.Body)
+	}
+	var detail controlLibraryArtifactDetailDTO
+	if err := json.Unmarshal(response.Body.Bytes(), &detail); err != nil {
+		t.Fatal(err)
+	}
+	if detail.LatestVersion.ID != f.sharedV1.ID || detail.UpdatedAt != f.sharedV1.CreatedAt.UTC().Format(time.RFC3339Nano) || len(detail.Versions) != 1 || detail.Versions[0].ID != f.sharedV1.ID {
+		t.Fatalf("exact-version grant disclosed unshared metadata: %+v", detail)
+	}
+	for _, secret := range []string{f.sharedV2.ID, f.sharedV2.Digest} {
+		if strings.Contains(response.Body.String(), secret) {
+			t.Fatalf("detail exposed unshared version %s", secret)
+		}
+	}
+	page := decodeControlLibraryPage(t, controlLibraryRequest(t, mux, key, now, platformServiceActorID, "service", http.MethodGet, "/control/v1/library/artifacts", "", "usr_operator"))
+	row := controlLibraryPageByID(page)[f.shared.ID]
+	if row.LatestVersion.ID != f.sharedV1.ID || row.UpdatedAt != f.sharedV1.CreatedAt.UTC().Format(time.RFC3339Nano) {
+		t.Fatalf("list disclosed unshared head: %+v", row)
+	}
+	// Multiple live grants expose their exact versions; revocation removes the
+	// revoked version even while another grant keeps the artifact visible.
+	grant, err := store.CreateLibraryArtifactGrant(context.Background(), LibraryArtifactGrant{ArtifactID: f.shared.ID, ArtifactVersionID: f.sharedV2.ID, ArtifactVersionDigest: f.sharedV2.Digest, AgentSurfaceID: f.codex2.ID, CreatedBy: "usr_owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response = controlLibraryRequest(t, mux, key, now, platformServiceActorID, "service", http.MethodGet, path, "", "usr_operator")
+	if err := json.Unmarshal(response.Body.Bytes(), &detail); err != nil {
+		t.Fatal(err)
+	}
+	if len(detail.Versions) != 2 || detail.LatestVersion.ID != f.sharedV2.ID {
+		t.Fatalf("live exact grants missing: %+v", detail)
+	}
+	if _, err := store.RevokeLibraryArtifactGrant(context.Background(), f.shared.ID, grant.ID, "usr_owner", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	response = controlLibraryRequest(t, mux, key, now, platformServiceActorID, "service", http.MethodGet, path, "", "usr_operator")
+	if err := json.Unmarshal(response.Body.Bytes(), &detail); err != nil {
+		t.Fatal(err)
+	}
+	if len(detail.Versions) != 1 || detail.LatestVersion.ID != f.sharedV1.ID || strings.Contains(response.Body.String(), f.sharedV2.ID) {
+		t.Fatalf("revoked grant exposed version metadata: %s", response.Body)
 	}
 }

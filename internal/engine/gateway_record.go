@@ -222,6 +222,15 @@ func (g *Gateway) Replay(ctx context.Context, id int64, force bool) (CallRecord,
 	if !ok {
 		return CallRecord{}, fmt.Errorf("account %q not found", orig.Account)
 	}
+	if a.MemberCredentials {
+		// A replay has no member to act as, and must not act as the account.
+		return CallRecord{}, fmt.Errorf("account %q uses each member's own account; replays are not available", orig.Account)
+	}
+	if a.CallerDelegated {
+		// A replay carries no caller grant, and the listing credential must
+		// never call a tool.
+		return CallRecord{}, fmt.Errorf("account %q acts only for the person who started a job; replays are not available", orig.Account)
+	}
 
 	start := time.Now()
 	execution := g.executeUpstream(
@@ -245,7 +254,8 @@ func (g *Gateway) Replay(ctx context.Context, id int64, force bool) (CallRecord,
 	if replayGuards != nil && callErr == nil && res != nil {
 		res, guard = applyGuards(res, *replayGuards)
 	}
-	rec := CallRecord{
+	rec := CallRecord{CallerSubject: auditCallerSubject(ctx),
+		AccountIncarnationID: a.IncarnationID, AccountOwnerSubject: a.OwnerSubject,
 		Account: orig.Account, Tool: orig.Tool, OK: callErr == nil,
 		Ms:                 time.Since(start).Milliseconds(),
 		Connector:          orig.Connector, // attribute replay to the validated endpoint

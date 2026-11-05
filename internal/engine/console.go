@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -27,6 +28,7 @@ import (
 // *Connector satisfies it, so production wiring is unchanged.
 type connector interface {
 	StartConnect(ctx context.Context, name, label, group, url, redirectURI string, sc *StaticCreds) (string, error)
+	StartMemberConnect(ctx context.Context, account Account, subject, redirectURI string) (string, error)
 	FinishConnect(ctx context.Context, state, code string) (name string, toolCount int, err error)
 }
 
@@ -34,6 +36,8 @@ type connector interface {
 // engine process so add/delete/rename/connect reflect in the live MCP server
 // immediately (no separate service, no cross-process reload).
 type ConsoleAPI struct {
+	browserSignIn    *BrowserSignInService
+	accountOAuth     *LinkedAccountOAuth
 	store            AccountStore
 	connStore        ConnectorStore      // store's connector facet; nil = connectors unsupported (501)
 	nsStore          NamespaceStore      // store's endpoint-bundle facet; nil = endpoints unsupported (501)
@@ -50,6 +54,7 @@ type ConsoleAPI struct {
 	conn             connector
 	passwordDigest   [sha256.Size]byte
 	adminTokenDigest [sha256.Size]byte
+	knowledgeKey     []byte
 	hasAdminToken    bool
 	localAdminAuth   bool
 	actorVerifier    *PlatformActorVerifier
@@ -91,7 +96,7 @@ type ConsoleAPI struct {
 type ConsoleOption func(*ConsoleAPI)
 
 // WithAdminToken enables machine-to-machine access to protected management
-// endpoints. The raw token is not retained: only its SHA-256 digest is kept,
+// endpoints. Only its digest and a purpose-derived knowledge signing key are kept,
 // and presented tokens are compared to that digest in constant time.
 //
 // An empty token leaves machine access disabled.
@@ -103,6 +108,7 @@ func WithAdminToken(token string) ConsoleOption {
 			return
 		}
 		c.adminTokenDigest = digest
+		c.knowledgeKey = knowledgeSigningKey(token)
 		c.hasAdminToken = true
 	}
 }
@@ -259,6 +265,12 @@ type serverDTO struct {
 	ConnectURL            string `json:"connectUrl,omitempty"`
 	// ReadOnly mirrors Account.ReadOnly for legacy management clients.
 	ReadOnly bool `json:"readOnly"`
+	// MemberCredentials: each member's agent calls this connection with that
+	// member's own account.
+	MemberCredentials bool `json:"memberCredentials,omitempty"`
+	// CallerDelegated marks a caller-delegated account (approvals happen at
+	// its upstream); the same block as the control-v1 connection DTO.
+	CallerDelegated *callerDelegatedDTO `json:"callerDelegated,omitempty"`
 }
 
 func toDTO(a Account) serverDTO {
@@ -278,11 +290,13 @@ func toDTO(a Account) serverDTO {
 		ConnectionNamespace: a.Group, ConnectionNamespaceID: a.ConnectionNamespaceID,
 		ConnectionScope: string(a.ConnectionScope), OwnerSubject: a.OwnerSubject, Revision: a.Revision, Group: a.Group,
 		Transport: "http", URL: a.URL, Status: "", ErrorStatus: "NONE", AuthState: auth,
-		ReadOnly: a.ReadOnly,
+		ReadOnly: a.ReadOnly, MemberCredentials: a.MemberCredentials,
+		CallerDelegated: newCallerDelegatedDTO(a),
 	}
 }
 
 func (c *ConsoleAPI) Routes(mux *http.ServeMux) {
+	c.knowledgeRoutes(mux)
 	pub := func(fn http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
 			if c.cors(w, r) {
@@ -321,11 +335,26 @@ func (c *ConsoleAPI) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/logs/{id}/replay", sec(c.handleLogReplay))
 	mux.HandleFunc("/api/logs/{id}/triage", sec(c.handleLogTriage))
 	mux.HandleFunc("/api/servers", sec(c.handleServers))
+	mux.HandleFunc("/api/account-oauth/{provider}/start", sec(c.linkedOAuthHandler(apiWire, false)))
+	mux.HandleFunc("/api/account-oauth/{provider}/complete", sec(c.linkedOAuthHandler(apiWire, true)))
+	mux.HandleFunc("/api/browser-sign-ins", sec(c.browserSignInHandler(apiWire, "list")))
+	mux.HandleFunc("/api/browser-sign-ins/start", sec(c.browserSignInHandler(apiWire, "start")))
+	for _, action := range []string{"view", "save", "cancel", "submit"} {
+		mux.HandleFunc("/api/browser-sign-ins/{flowId}/"+action, sec(c.browserSignInHandler(apiWire, action)))
+	}
+	mux.HandleFunc("/api/connection-model", sec(c.handleConnectionModel))
+	mux.HandleFunc("/api/connections/{id}/accounts", sec(c.linkedAccountHandler(apiWire, "create")))
+	mux.HandleFunc("/api/connections/{id}/accounts/{accountId}", sec(c.linkedAccountHandler(apiWire, "account")))
+	mux.HandleFunc("/api/connections/{id}/accounts/{accountId}/token", sec(c.linkedAccountHandler(apiWire, "token")))
 	mux.HandleFunc("/api/servers/{id}", sec(c.handleServerByID))
 	mux.HandleFunc("/api/servers/{id}/connect", sec(c.handleConnect))
 	mux.HandleFunc("/api/servers/{id}/token", sec(c.handleToken))
 	mux.HandleFunc("/api/servers/{id}/tools", sec(c.handleTools))
 	mux.HandleFunc("/api/servers/{id}/tools/{tool}", sec(c.handleToolPolicy))
+	mux.HandleFunc("/api/member-credentials", sec(c.handleMemberCredentials))
+	mux.HandleFunc("/api/member-credentials/{id}", sec(c.handleMemberCredential))
+	mux.HandleFunc("/api/member-credentials/{id}/connect", sec(c.handleMemberCredentialConnect))
+	mux.HandleFunc("/api/member-credentials/{id}/token", sec(c.handleMemberCredentialToken))
 	// Connection namespaces are credential ownership folders. They are wholly
 	// distinct from /api/namespaces below, which remains the legacy endpoint
 	// bundle API for shared MCP delivery.
@@ -336,6 +365,12 @@ func (c *ConsoleAPI) Routes(mux *http.ServeMux) {
 	// MCP clients are subject-bound registrations for scoped delivery. The
 	// console never mints credentials or accepts an OAuth client ID directly;
 	// binding remains in the signed consent path.
+	mux.HandleFunc("/api/connection-grants", sec(c.handleConnectionGrants))
+	mux.HandleFunc("/api/connection-grants/{id}/revoke", sec(c.handleConnectionGrantRevoke))
+	mux.HandleFunc("/control/v1/connection-grants", c.controlV1(c.handleConnectionGrants))
+	mux.HandleFunc("/control/v1/connection-grants/{id}/revoke", c.controlV1(c.handleConnectionGrantRevoke))
+	mux.HandleFunc("/control/v1/connection-grants/{id}/recipients", c.controlV1(c.handleConnectionGrantRecipients))
+	mux.HandleFunc("/control/v1/subjects/{subject}/access", c.controlV1(c.handleSubjectAccess))
 	mux.HandleFunc("/api/mcp-clients", sec(c.handleMCPClients))
 	mux.HandleFunc("/api/mcp-clients/{id}", sec(c.handleMCPClientByID))
 	mux.HandleFunc("/api/mcp-clients/{id}/namespaces", sec(c.handleMCPClientNamespaces))
@@ -348,13 +383,18 @@ func (c *ConsoleAPI) Routes(mux *http.ServeMux) {
 	// convergence, and Idempotency-Key support. Every route added here must be
 	// added to the contract document in the same change.
 	mux.HandleFunc("/control/v1/meta", c.controlV1(c.handleControlMeta))
+	mux.HandleFunc("/control/v1/workload-clients", c.controlV1(c.handleServiceWorkloadClients))
+	mux.HandleFunc("/control/v1/workload-clients/{id}", c.controlV1(c.handleServiceWorkloadClients))
+	mux.HandleFunc("/control/v1/workload-clients/{id}/revoke", c.controlV1(c.handleServiceWorkloadClients))
 	mux.HandleFunc("/control/v1/mcp-clients", c.controlV1(c.handleControlMCPClients))
 	mux.HandleFunc("/control/v1/mcp-clients/{id}", c.controlV1(c.handleControlMCPClientByID))
+	mux.HandleFunc("/control/v1/mcp-clients/{id}/personal-connections", c.controlV1(c.handlePersonalWorkloadConnections))
 	mux.HandleFunc("/control/v1/mcp-clients/{id}/namespaces", c.controlV1(c.handleControlMCPClientNamespaces))
 	mux.HandleFunc("/control/v1/mcp-clients/{id}/oauth-client/reset", c.controlV1(c.handleControlMCPClientOAuthReset))
 	mux.HandleFunc("/control/v1/mcp-clients/{id}/revoke", c.controlV1(c.handleControlMCPClientRevoke))
 	mux.HandleFunc("/control/v1/mcp-clients/{id}/profile-binding", c.controlV1(c.handleControlMCPClientProfileBinding))
 	mux.HandleFunc("/control/v1/mcp-clients/{id}/connection-evidence", c.controlV1(c.handleControlMCPClientConnectionEvidence))
+	mux.HandleFunc("/control/v1/mcp-clients/{id}/lifecycle-state", c.controlV1(c.handleControlMCPClientLifecycleState))
 	mux.HandleFunc("/control/v1/mcp-clients/{id}/activation-snapshot", c.controlV1(c.handleControlMCPClientActivationSnapshot))
 	// The Platform service mints a short-lived workload bearer here. Its
 	// success body is a credential, so the route skips Idempotency-Key replay
@@ -366,12 +406,37 @@ func (c *ConsoleAPI) Routes(mux *http.ServeMux) {
 	// member's owned and granted artifacts, serves an exact version body only
 	// under that scope, and manages exact-version grants. The subject travels
 	// in X-Synaxis-Subject because a signed actor assertion binds a bare path.
+	mux.HandleFunc("/control/v1/library/chat-replies/classify", c.controlV1(c.handleControlLibraryChatClassify))
+	mux.HandleFunc("/control/v1/library/skill-grants", c.controlV1Credential(c.handleControlSkillGrants))
+	mux.HandleFunc("/control/v1/library/member-skills", c.controlV1Credential(c.handleControlMemberSkills))
+	mux.HandleFunc("/control/v1/library/artifacts/{id}/save", c.controlV1(c.handleControlLibraryChatSave))
+	mux.HandleFunc("/control/v1/work-inspection", c.controlV1(c.handleControlWorkInspection))
 	mux.HandleFunc("/control/v1/library/artifacts", c.controlV1(c.handleControlLibraryArtifacts))
 	mux.HandleFunc("/control/v1/library/artifacts/{id}", c.controlV1(c.handleControlLibraryArtifactByID))
+	mux.HandleFunc("DELETE /control/v1/library/artifacts/{id}", c.controlV1(c.handleControlLibraryArtifactDelete))
+	mux.HandleFunc("/control/v1/library/artifacts/{id}/versions/{version}/media", c.controlV1(c.handleControlLibraryArtifactVersion))
 	mux.HandleFunc("/control/v1/library/artifacts/{id}/versions/{version}", c.controlV1(c.handleControlLibraryArtifactVersion))
 	mux.HandleFunc("/control/v1/library/artifacts/{id}/grants", c.controlV1(c.handleControlLibraryArtifactGrants))
 	mux.HandleFunc("/control/v1/library/artifacts/{id}/grants/{grant}/revoke", c.controlV1(c.handleControlLibraryArtifactGrantRevoke))
+	mux.HandleFunc("/control/v1/library/collaboration", c.controlV1Credential(c.handleControlLibraryCollaboration))
 	mux.HandleFunc("/control/v1/library/recipients", c.controlV1(c.handleControlLibraryRecipients))
+	mux.HandleFunc("/control/v1/connections", c.controlV1(c.handleControlConnections))
+	mux.HandleFunc("/control/v1/account-oauth/{provider}/start", c.controlV1Boundary(c.linkedOAuthHandler(controlWire, false), false))
+	mux.HandleFunc("/control/v1/account-oauth/{provider}/complete", c.controlV1Boundary(c.linkedOAuthHandler(controlWire, true), false))
+	mux.HandleFunc("/control/v1/browser-runtime", c.controlV1Boundary(c.browserRuntimeHandler, false))
+	mux.HandleFunc("/control/v1/browser-sign-ins", c.controlV1Boundary(c.browserSignInHandler(controlWire, "list"), false))
+	mux.HandleFunc("/control/v1/browser-sign-ins/start", c.controlV1Boundary(c.browserSignInHandler(controlWire, "start"), false))
+	for _, action := range []string{"view", "save", "cancel", "submit"} {
+		mux.HandleFunc("/control/v1/browser-sign-ins/{flowId}/"+action, c.controlV1Boundary(c.browserSignInHandler(controlWire, action), false))
+	}
+	mux.HandleFunc("/control/v1/connection-model", c.controlV1(c.handleControlConnectionModel))
+	// Private labels must not enter the plaintext control replay cache or be
+	// replayed after connection access changes. These routes reject replay keys.
+	mux.HandleFunc("/control/v1/connections/{id}/accounts", c.controlV1Boundary(c.linkedAccountHandler(controlWire, "create"), false))
+	mux.HandleFunc("/control/v1/connections/{id}/accounts/{accountId}", c.controlV1Boundary(c.linkedAccountHandler(controlWire, "account"), false))
+	mux.HandleFunc("/control/v1/connections/{id}/accounts/{accountId}/token", c.controlV1Boundary(c.linkedAccountHandler(controlWire, "token"), false))
+	mux.HandleFunc("/control/v1/connections/{name}", c.controlV1(c.handleControlConnectionByName))
+	mux.HandleFunc("/control/v1/connections/{name}/token", c.controlV1(c.handleControlConnectionToken))
 	// Any other shape or method under the group reaches the same auth
 	// chain rather than Go's plain-text 404, so a wrong method, a bare
 	// collection path, or a service-principal path outside its narrow
@@ -390,9 +455,9 @@ func (c *ConsoleAPI) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/endpoints", sec(c.handleNamespaces))
 	mux.HandleFunc("/api/endpoints/{slug}", sec(c.handleNamespaceBySlug))
 	mux.HandleFunc("/api/endpoints/{slug}/accounts/{account}", sec(c.handleNamespaceAccount))
-	mux.HandleFunc("/api/namespaces", sec(c.handleNamespaces))
-	mux.HandleFunc("/api/namespaces/{slug}", sec(c.handleNamespaceBySlug))
-	mux.HandleFunc("/api/namespaces/{slug}/accounts/{account}", sec(c.handleNamespaceAccount))
+	mux.HandleFunc("/api/namespaces", sec(deprecatedHandler("route:/api/namespaces", c.handleNamespaces)))
+	mux.HandleFunc("/api/namespaces/{slug}", sec(deprecatedHandler("route:/api/namespaces", c.handleNamespaceBySlug)))
+	mux.HandleFunc("/api/namespaces/{slug}/accounts/{account}", sec(deprecatedHandler("route:/api/namespaces", c.handleNamespaceAccount)))
 	mux.HandleFunc("/api/guardrails/test", sec(c.handleGuardrailTest))
 	mux.HandleFunc("/api/config", sec(c.handlePortableConfig))
 	mux.HandleFunc("/api/config/import", sec(c.handlePortableConfigImport))
@@ -415,15 +480,15 @@ func (c *ConsoleAPI) Routes(mux *http.ServeMux) {
 	// See skills_console.go for handlers/DTOs and skills.go for the domain
 	// model and the design decisions made where the report flagged an open
 	// question.
-	mux.HandleFunc("/api/skill-sources", sec(c.handleSkillSources))
-	mux.HandleFunc("/api/skill-sources/{id}", sec(c.handleSkillSourceByID))
-	mux.HandleFunc("/api/skill-sources/{id}/sync", sec(c.handleSkillSourceSync))
-	mux.HandleFunc("/api/skills", sec(c.handleSkills))
-	mux.HandleFunc("/api/skills/{id}", sec(c.handleSkillByID))
-	mux.HandleFunc("/api/skills/{id}/versions", sec(c.handleSkillVersions))
-	mux.HandleFunc("/api/skills/{id}/checks", sec(c.handleSkillChecks))
-	mux.HandleFunc("/api/skills/{id}/pins", sec(c.handleSkillPins))
-	mux.HandleFunc("/api/skills/{id}/pins/{slug}", sec(c.handleSkillPinBySlug))
+	mux.HandleFunc("/api/skill-sources", sec(deprecatedHandler("route:/api/skills", c.handleSkillSources)))
+	mux.HandleFunc("/api/skill-sources/{id}", sec(deprecatedHandler("route:/api/skills", c.handleSkillSourceByID)))
+	mux.HandleFunc("/api/skill-sources/{id}/sync", sec(deprecatedHandler("route:/api/skills", c.handleSkillSourceSync)))
+	mux.HandleFunc("/api/skills", sec(deprecatedHandler("route:/api/skills", c.handleSkills)))
+	mux.HandleFunc("/api/skills/{id}", sec(deprecatedHandler("route:/api/skills", c.handleSkillByID)))
+	mux.HandleFunc("/api/skills/{id}/versions", sec(deprecatedHandler("route:/api/skills", c.handleSkillVersions)))
+	mux.HandleFunc("/api/skills/{id}/checks", sec(deprecatedHandler("route:/api/skills", c.handleSkillChecks)))
+	mux.HandleFunc("/api/skills/{id}/pins", sec(deprecatedHandler("route:/api/skills", c.handleSkillPins)))
+	mux.HandleFunc("/api/skills/{id}/pins/{slug}", sec(deprecatedHandler("route:/api/skills", c.handleSkillPinBySlug)))
 	// Library v2 is deliberately distinct from the legacy /api/skills Git
 	// source surface above. Its binding scopes are generic opaque references,
 	// never credential-owning connection namespaces.
@@ -448,6 +513,9 @@ func (c *ConsoleAPI) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/library/skill-drafts/platform-import", sec(c.handleLibraryPlatformSkillDraftImport))
 	mux.HandleFunc("/api/library/artifact-drafts", sec(c.handleLibraryArtifactDrafts))
 	mux.HandleFunc("/api/library/artifact-drafts/platform-import", sec(c.handleLibraryPlatformArtifactDraftImport))
+	mux.HandleFunc("/api/library/artifacts/{id}/collaboration", sec(c.handleLibraryCollaboration))
+	mux.HandleFunc("/api/public/artifacts/mcp/{artifact}/{grant}", pub(c.handleCollaborationMCP))
+	mux.HandleFunc("/api/public/artifacts/collaborate", pub(c.handlePublicLibraryCollaboration))
 	mux.HandleFunc("/api/library/artifacts", sec(c.handleLibraryArtifacts))
 	mux.HandleFunc("/api/library/artifacts/{id}", sec(c.handleLibraryArtifactByID))
 	mux.HandleFunc("/api/library/artifacts/{id}/versions", sec(c.handleLibraryArtifactVersions))
@@ -573,7 +641,9 @@ type connectorDTO struct {
 	TotalBytes           int      `json:"totalBytes"`
 }
 
-func (c *ConsoleAPI) connectorDTO(ctx context.Context, vc VirtualConnector) connectorDTO {
+// connectorDTO renders vc with its stats from stats, the request's one
+// snapshot of the shared tool surface (see endpointStatsSnapshot).
+func (c *ConsoleAPI) connectorDTO(vc VirtualConnector, stats *endpointStatsSnapshot) connectorDTO {
 	d := connectorDTO{Slug: vc.Slug, Label: vc.Label, URL: c.selfURL + "/mcp/" + vc.Slug, Tools: vc.Tools, Approval: vc.Approval, Record: vc.Record,
 		MaxResultBytes: vc.MaxResultBytes, Redact: vc.Redact, DisableInjectionScan: vc.DisableInjectionScan}
 	if d.Tools == nil {
@@ -585,10 +655,9 @@ func (c *ConsoleAPI) connectorDTO(ctx context.Context, vc VirtualConnector) conn
 	if d.Redact == nil {
 		d.Redact = []string{}
 	}
-	if st, err := c.gw.ConnectorStats(ctx, vc.Slug); err == nil {
-		d.ExposedTools, d.TotalTools = st.ExposedTools, st.TotalTools
-		d.ExposedBytes, d.TotalBytes = st.ExposedBytes, st.TotalBytes
-	}
+	st := stats.connector(vc)
+	d.ExposedTools, d.TotalTools = st.ExposedTools, st.TotalTools
+	d.ExposedBytes, d.TotalBytes = st.ExposedBytes, st.TotalBytes
 	return d
 }
 
@@ -695,9 +764,10 @@ func (c *ConsoleAPI) handleConnectors(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 			return
 		}
+		stats := c.gw.endpointStats()
 		out := make([]connectorDTO, len(list))
 		for i, vc := range list {
-			out[i] = c.connectorDTO(r.Context(), vc)
+			out[i] = c.connectorDTO(vc, stats)
 		}
 		writeJSON(w, http.StatusOK, out)
 	case http.MethodPost:
@@ -763,6 +833,9 @@ func (c *ConsoleAPI) handleConnectors(w http.ResponseWriter, r *http.Request) {
 		}
 		vc := VirtualConnector{Slug: slug, Label: label, Tools: req.Tools, Approval: req.Approval, Record: req.Record,
 			MaxResultBytes: req.MaxResultBytes, Redact: req.Redact, DisableInjectionScan: req.DisableInjectionScan}
+		if c.refuseCallerDelegatedConnectorPolicy(w, r, vc.Tools, vc.Approval) { // exact-grant-only accounts
+			return
+		}
 		if err := c.gw.UpsertConnector(r.Context(), vc); err != nil {
 			if errors.Is(err, ErrEndpointCollision) {
 				writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
@@ -771,7 +844,7 @@ func (c *ConsoleAPI) handleConnectors(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 			return
 		}
-		writeJSON(w, http.StatusCreated, c.connectorDTO(r.Context(), vc))
+		writeJSON(w, http.StatusCreated, c.connectorDTO(vc, c.gw.endpointStats()))
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
@@ -856,13 +929,16 @@ func (c *ConsoleAPI) handleConnectorBySlug(w http.ResponseWriter, r *http.Reques
 		if req.DisableInjectionScan != nil {
 			vc.DisableInjectionScan = *req.DisableInjectionScan
 		}
+		if c.refuseCallerDelegatedConnectorPolicy(w, r, vc.Tools, vc.Approval) { // exact-grant-only accounts
+			return
+		}
 		// Through the gateway, not the store: persists AND rebuilds the live
 		// /mcp/{slug} server so the change is visible immediately.
 		if err := c.gw.UpsertConnector(r.Context(), vc); err != nil {
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 			return
 		}
-		writeJSON(w, http.StatusOK, c.connectorDTO(r.Context(), vc))
+		writeJSON(w, http.StatusOK, c.connectorDTO(vc, c.gw.endpointStats()))
 	case http.MethodDelete:
 		if _, ok := c.connStore.VirtualConnector(r.Context(), slug); !ok {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
@@ -896,7 +972,10 @@ type namespaceDTO struct {
 	TotalTools   int      `json:"totalTools"`
 }
 
-func (c *ConsoleAPI) namespaceDTO(ctx context.Context, ns Namespace) namespaceDTO {
+// namespaceDTO renders ns with its tool counts from stats, the request's one
+// snapshot of the shared tool surface. The DTO shows no byte stats, so none
+// are measured.
+func (c *ConsoleAPI) namespaceDTO(ns Namespace, stats *endpointStatsSnapshot) namespaceDTO {
 	members := append([]string(nil), ns.Accounts...)
 	if members == nil {
 		members = []string{}
@@ -905,9 +984,7 @@ func (c *ConsoleAPI) namespaceDTO(ctx context.Context, ns Namespace) namespaceDT
 		Slug: ns.Slug, Label: ns.Label, URL: c.selfURL + "/mcp/" + ns.Slug,
 		Members: members, Generation: ns.Epoch, Revision: ns.Revision,
 	}
-	if stats, err := c.gw.NamespaceStats(ctx, ns.Slug); err == nil {
-		dto.ExposedTools, dto.TotalTools = stats.ExposedTools, stats.TotalTools
-	}
+	dto.ExposedTools, dto.TotalTools = stats.namespaceCounts(ns)
 	return dto
 }
 
@@ -967,9 +1044,10 @@ func (c *ConsoleAPI) handleNamespaces(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 			return
 		}
+		stats := c.gw.endpointStats()
 		out := make([]namespaceDTO, len(list))
 		for i, ns := range list {
-			out[i] = c.namespaceDTO(r.Context(), ns)
+			out[i] = c.namespaceDTO(ns, stats)
 		}
 		writeJSON(w, http.StatusOK, out)
 	case http.MethodPost:
@@ -1010,7 +1088,7 @@ func (c *ConsoleAPI) handleNamespaces(w http.ResponseWriter, r *http.Request) {
 			writeNamespaceMutationError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusCreated, c.namespaceDTO(r.Context(), ns))
+		writeJSON(w, http.StatusCreated, c.namespaceDTO(ns, c.gw.endpointStats()))
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
@@ -1031,7 +1109,7 @@ func (c *ConsoleAPI) handleNamespaceBySlug(w http.ResponseWriter, r *http.Reques
 	}
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, http.StatusOK, c.namespaceDTO(r.Context(), current))
+		writeJSON(w, http.StatusOK, c.namespaceDTO(current, c.gw.endpointStats()))
 	case http.MethodPut:
 		var req struct {
 			Label      *string   `json:"label"`
@@ -1078,7 +1156,7 @@ func (c *ConsoleAPI) handleNamespaceBySlug(w http.ResponseWriter, r *http.Reques
 			writeNamespaceMutationError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, c.namespaceDTO(r.Context(), updated))
+		writeJSON(w, http.StatusOK, c.namespaceDTO(updated, c.gw.endpointStats()))
 	case http.MethodDelete:
 		var req NamespacePrecondition
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
@@ -1159,7 +1237,7 @@ func (c *ConsoleAPI) handleNamespaceAccount(w http.ResponseWriter, r *http.Reque
 		writeNamespaceMutationError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, c.namespaceDTO(r.Context(), ns))
+	writeJSON(w, http.StatusOK, c.namespaceDTO(ns, c.gw.endpointStats()))
 }
 
 // --- approvals: pending (approval-gated) tool calls awaiting a decision ---
@@ -1197,7 +1275,7 @@ func (c *ConsoleAPI) handleApprovals(w http.ResponseWriter, r *http.Request) {
 	out := make([]PendingCall, 0, len(calls))
 	for _, call := range calls {
 		if c.visibleApproval(r.Context(), actor, call) {
-			out = append(out, call)
+			out = append(out, c.approvalForActor(actor, call))
 		}
 	}
 	writeJSON(w, http.StatusOK, out)
@@ -1276,6 +1354,7 @@ func (c *ConsoleAPI) handleApprovalDecision(w http.ResponseWriter, r *http.Reque
 
 // handleTools: GET lists an account's tools with enabled/disabled + hints;
 // PUT { "disabled": [...] } sets the disabled set and re-aggregates live.
+// A listing failure answers with writeToolListingError's contract.
 func (c *ConsoleAPI) handleTools(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	account, _, ok := c.managedAccount(w, r, id)
@@ -1286,7 +1365,7 @@ func (c *ConsoleAPI) handleTools(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		tools, err := c.gw.ListAccountTools(r.Context(), id)
 		if err != nil {
-			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+			writeToolListingError(w, id, err, "")
 			return
 		}
 		writeJSON(w, http.StatusOK, tools)
@@ -1305,11 +1384,68 @@ func (c *ConsoleAPI) handleTools(w http.ResponseWriter, r *http.Request) {
 			writeAccountPolicyMutationError(w, err, "could not update connection policy")
 			return
 		}
-		c.gw.ReplaceAccount(r.Context(), id) // re-aggregate so /mcp reflects the curation immediately
-		tools, _ := c.gw.ListAccountTools(r.Context(), id)
+		// Re-aggregate so /mcp reflects the curation immediately. Until that
+		// succeeds the curation is saved but not live, so say so rather than
+		// answer with a listing (or, as before, 200 null).
+		if err := c.gw.refreshAccountTools(r.Context(), id); err != nil {
+			writeToolListingError(w, id, err, toolPolicySavedNotLive)
+			return
+		}
+		tools, err := c.gw.ListAccountTools(r.Context(), id)
+		if err != nil {
+			writeToolListingError(w, id, err, toolPolicySavedNotLive)
+			return
+		}
 		writeJSON(w, http.StatusOK, tools)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+// toolPolicySavedNotLive leads a listing error that follows a successful
+// policy write, so the console knows not to resubmit it.
+const toolPolicySavedNotLive = "The tool policy was saved, but the live tool list could not be refreshed. "
+
+// writeToolListingError answers a failed live tool listing with the console's
+// recovery contract — {"error": safe sentence, "code", "recovery"}:
+//
+//	409 needs_auth/connect, auth_expired/reauthorize: an authorization problem
+//	504 timeout/retry: the provider did not answer in time
+//	502 unreachable/retry: the provider failed; error/retry: the Engine did
+//
+// A connection deleted meanwhile is the usual 404. The raw cause can carry a
+// provider's own response (an OAuth error body, say), so it is logged here
+// and never returned. prefix, possibly empty, leads the sentence.
+func writeToolListingError(w http.ResponseWriter, account string, err error, prefix string) {
+	if errors.Is(err, ErrAccountNotFound) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "connection not found"})
+		return
+	}
+	status := toolListingStatusError
+	var listing *toolListingError
+	if errors.As(err, &listing) {
+		status = listing.status
+	}
+	log.Printf("engine: list tools account=%q status=%s: %v", account, status, err)
+	httpStatus, code, sentence, recovery := toolListingPresentation(status)
+	writeJSON(w, httpStatus, map[string]string{"error": prefix + sentence, "code": code, "recovery": recovery})
+}
+
+// toolListingPresentation is the public half of writeToolListingError: the
+// health presentation of a listing status, with a sentence fit for a tool
+// listing where the health wording would not be.
+func toolListingPresentation(status string) (httpStatus int, code, sentence, recovery string) {
+	if status == toolListingStatusError {
+		return http.StatusBadGateway, toolListingStatusError, "Synaxis could not load this connection's tools. Try again.", healthRecoveryRetry
+	}
+	code, sentence, recovery = healthPresentation(status)
+	switch code {
+	case healthStatusNeedsAuth, healthStatusAuthExpired:
+		return http.StatusConflict, code, sentence, recovery
+	case healthStatusTimeout:
+		return http.StatusGatewayTimeout, code, "The provider did not respond before the tool list request timed out.", recovery
+	default:
+		return http.StatusBadGateway, code, sentence, recovery
 	}
 }
 
@@ -1325,12 +1461,12 @@ func (c *ConsoleAPI) cors(w http.ResponseWriter, r *http.Request) bool {
 		}
 	}
 	w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
-	// Keyset cursors for Activity and Library lists use headers rather than
-	// query strings deliberately: a hosted Platform-to-Engine actor assertion
-	// binds and accepts only a bare path with no query string. These headers
-	// therefore cross both the browser and Platform proxy without changing the
-	// signed actor path.
-	w.Header().Set("Access-Control-Allow-Headers", "Authorization,Content-Type,X-Synaxis-Logs-Before-Ts,X-Synaxis-Logs-Before-Id,X-Synaxis-Library-Cursor,X-Synaxis-Library-Limit")
+	// Keyset cursors for Activity and Library lists, and the health "probe
+	// now" flag, use headers rather than query strings deliberately: a hosted
+	// Platform-to-Engine actor assertion binds and accepts only a bare path
+	// with no query string. These headers therefore cross both the browser and
+	// Platform proxy without changing the signed actor path.
+	w.Header().Set("Access-Control-Allow-Headers", "Authorization,Content-Type,X-Synaxis-Logs-Before-Ts,X-Synaxis-Logs-Before-Id,X-Synaxis-Library-Cursor,X-Synaxis-Library-Limit,"+healthRefreshHeader)
 	w.Header().Set("Access-Control-Expose-Headers", "X-Synaxis-Library-Next-Cursor")
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
@@ -1508,17 +1644,20 @@ type auditPersistenceReporter interface {
 }
 
 func (c *ConsoleAPI) handleGateway(w http.ResponseWriter, r *http.Request) {
+	_, individualConnections := c.store.(MCPClientAccessStore)
 	resp := map[string]any{
-		"connectorUrl":     c.selfURL + "/mcp",
-		"oauthCallbackUrl": c.selfURL + "/api/oauth/callback",
-		"endpoint":         "mcp",
-		"namespace":        "narthex",
-		"ready":            true,
+		"connectorUrl":              c.selfURL + "/mcp",
+		"mcpClientConnectionGrants": individualConnections,
+		"oauthCallbackUrl":          c.selfURL + "/api/oauth/callback",
+		"endpoint":                  "mcp",
+		"namespace":                 "narthex",
+		"ready":                     true,
 	}
 	// Audit drop counters make lossy-under-outage auditing visible to the
 	// console. Only counts and the static drop-reason category cross this
 	// boundary — never LastError, which can carry driver error text.
-	if reporter, ok := c.store.(auditPersistenceReporter); ok {
+	actor, actorOK := c.connectionNamespaceActor(r)
+	if reporter, ok := c.store.(auditPersistenceReporter); ok && actorOK && connectionNamespaceAdministrator(actor) {
 		stats := reporter.AuditPersistenceStats()
 		resp["auditPersistence"] = map[string]any{
 			"enqueued":       stats.Enqueued,
@@ -1533,18 +1672,30 @@ func (c *ConsoleAPI) handleGateway(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// healthRefreshHeader asks /api/health for live probes instead of recorded
+// rows: the console's "probe now". It is a header, not Cache-Control (which
+// browsers send on every no-store fetch) and not a query string (which the
+// hosted actor assertion rejects).
+const healthRefreshHeader = "X-Synaxis-Health-Refresh"
+
+// handleHealth reports the accounts this actor can read, and probes only
+// those: an operator never waits on, or dials, a provider in another folder.
 func (c *ConsoleAPI) handleHealth(w http.ResponseWriter, r *http.Request) {
 	actor, ok := c.requireConnectionNamespaceActor(w, r)
 	if !ok {
 		return
 	}
-	health := c.gw.Health(r.Context())
+	accounts := c.readableAccounts(r.Context(), actor, c.store.Accounts())
+	var health []AccountHealth
+	switch strings.ToLower(strings.TrimSpace(r.Header.Get(healthRefreshHeader))) {
+	case "1", "true":
+		health = c.gw.ProbeHealthFor(r.Context(), accounts)
+	default:
+		health = c.gw.HealthFor(r.Context(), accounts)
+	}
 	out := make([]AccountHealth, 0, len(health))
 	for _, item := range health {
-		account, found := c.store.Account(item.UUID)
-		if found && c.canReadAccount(r.Context(), actor, account) {
-			out = append(out, publicAccountHealth(item))
-		}
+		out = append(out, publicAccountHealth(item))
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -1613,7 +1764,7 @@ const (
 // The store is read in raw pages of logsPageSize, and each raw page is
 // visibility-filtered before joining the response. A raw page that mixes
 // visible and invisible rows — a normal occurrence for the "operator" role,
-// which is scoped to specific accounts via visibleCallPreloaded — would
+// which is scoped to its own caller subjects via visibleCallPreloaded — would
 // otherwise shrink the filtered response below logsPageSize even though more
 // visible history sits just past the unfetched remainder. Since the frontend
 // infers "more pages exist" purely from the response length equaling
@@ -1663,6 +1814,14 @@ func (c *ConsoleAPI) handleLogs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	admin := connectionNamespaceAdministrator(actor)
+	// Operators pay one account listing per request plus one lookup per
+	// distinct namespace across every page scanned — not one account and
+	// namespace pair per record, nor a fresh listing per page.
+	var accountsByName map[string]Account
+	namespaces := newNamespaceCache()
+	if !admin {
+		accountsByName = c.accountsByName()
+	}
 	out := make([]CallRecord, 0, logsPageSize)
 	for attempt := 0; attempt < maxLogsFetchAttempts && len(out) < logsPageSize; attempt++ {
 		var raw []CallRecord
@@ -1683,11 +1842,9 @@ func (c *ConsoleAPI) handleLogs(w http.ResponseWriter, r *http.Request) {
 		if admin {
 			out = append(out, raw...)
 		} else {
-			// Operators pay one account list plus one lookup per distinct
-			// namespace, not one account+namespace pair per record.
-			accountsByName, namespacesByID := c.callVisibilityData(r.Context(), raw)
+			c.loadCallNamespaces(r.Context(), namespaces, accountsByName, raw)
 			for _, call := range raw {
-				if visibleCallPreloaded(actor, call, accountsByName, namespacesByID) {
+				if visibleCallPreloaded(actor, call, accountsByName, namespaces.byID) {
 					out = append(out, call)
 				}
 			}
@@ -1703,6 +1860,15 @@ func (c *ConsoleAPI) handleLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(out) > logsPageSize {
 		out = out[:logsPageSize] // keep newest-first order; the trimmed tail is the next page's cursor
+	}
+	if c.actorVerifier != nil {
+		for i := range out {
+			// Upstream errors can contain retained arguments or result excerpts.
+			// Shared activity summaries expose status; body reads use inspection.
+			if !actorOwnsCall(actor, out[i]) {
+				out[i].Error = ""
+			}
+		}
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -1794,12 +1960,10 @@ func (c *ConsoleAPI) handleServers(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet:
-		accts := c.store.Accounts()
+		accts := c.readableAccounts(r.Context(), actor, c.store.Accounts())
 		out := make([]serverDTO, 0, len(accts))
 		for _, a := range accts {
-			if c.canReadAccount(r.Context(), actor, a) {
-				out = append(out, toDTO(a))
-			}
+			out = append(out, toDTO(a))
 		}
 		writeJSON(w, http.StatusOK, out)
 	case http.MethodPost:
@@ -1886,6 +2050,9 @@ func (c *ConsoleAPI) create(w http.ResponseWriter, r *http.Request, actor Platfo
 	}
 	toolPrefix := strings.TrimSpace(req.ToolPrefix)
 	legacyNamespace := strings.TrimSpace(req.Namespace)
+	if legacyNamespace != "" {
+		NoteDeprecated("field:account.namespace")
+	}
 	if toolPrefix != "" && legacyNamespace != "" && slugify(toolPrefix) != slugify(legacyNamespace) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "toolPrefix and namespace must resolve to the same tool prefix"})
 		return
@@ -1931,6 +2098,9 @@ func (c *ConsoleAPI) create(w http.ResponseWriter, r *http.Request, actor Platfo
 	if req.ConnectionNamespace != nil {
 		connectionNamespace = strings.TrimSpace(*req.ConnectionNamespace)
 	} else if req.Group != nil {
+		// Only a client that sends group without connectionNamespace relies
+		// on the alias; current clients send both during rolling upgrades.
+		NoteDeprecated("field:account.group")
 		connectionNamespace = strings.TrimSpace(*req.Group)
 	}
 	namespaceID := ""
@@ -2013,6 +2183,10 @@ func (c *ConsoleAPI) create(w http.ResponseWriter, r *http.Request, actor Platfo
 		writeConnectionNamespaceResolutionError(w, err)
 		return
 	}
+	if namespace.OwnerSubject != "" && (scope != ConnectionScopePersonal || namespace.OwnerSubject != ownerSubject) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "personal folders accept only their owner's personal connections"})
+		return
+	}
 	a := Account{
 		Name:                  name,
 		Label:                 friendly,
@@ -2056,6 +2230,9 @@ func (c *ConsoleAPI) handleServerByID(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if (r.Method == http.MethodDelete || r.Method == http.MethodPatch) && c.refuseCallerDelegatedConsoleWrite(w, a, actor) {
+		return
+	}
 	switch r.Method {
 	case http.MethodDelete:
 		if err := c.store.Delete(r.Context(), id, a.IncarnationID, a.Revision); err != nil {
@@ -2090,6 +2267,7 @@ func (c *ConsoleAPI) update(w http.ResponseWriter, r *http.Request, a Account, a
 		Revision              *int64           `json:"revision"`
 		Group                 *string          `json:"group"`
 		ReadOnly              *bool            `json:"readOnly"`
+		MemberCredentials     *bool            `json:"memberCredentials"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
@@ -2116,6 +2294,7 @@ func (c *ConsoleAPI) update(w http.ResponseWriter, r *http.Request, a Account, a
 	if req.ConnectionNamespace != nil {
 		legacyNamespace = strings.TrimSpace(*req.ConnectionNamespace)
 	} else if req.Group != nil {
+		NoteDeprecated("field:account.group")
 		legacyNamespace = strings.TrimSpace(*req.Group)
 	}
 	requestedNamespaceID := ""
@@ -2134,6 +2313,10 @@ func (c *ConsoleAPI) update(w http.ResponseWriter, r *http.Request, a Account, a
 		return
 	}
 	a = current
+	if problem := callerDelegatedConsoleEditProblem(a, req.ConnectionScope, req.MemberCredentials); problem != "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": problem})
+		return
+	}
 	if !labelPresent {
 		label = a.Label
 	}
@@ -2193,6 +2376,10 @@ func (c *ConsoleAPI) update(w http.ResponseWriter, r *http.Request, a Account, a
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "connection namespace access is not permitted"})
 			return
 		}
+		if ns.OwnerSubject != "" && (scope != ConnectionScopePersonal || ownerSubject != ns.OwnerSubject) {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "personal folders accept only their owner's personal connections"})
+			return
+		}
 		expectedRevision := a.Revision
 		if req.Revision != nil {
 			expectedRevision = *req.Revision
@@ -2221,23 +2408,36 @@ func (c *ConsoleAPI) update(w http.ResponseWriter, r *http.Request, a Account, a
 		}
 		a = updated
 	}
-	if labelPresent || req.ReadOnly != nil {
-		mutation := AccountPolicyMutation{ReadOnly: req.ReadOnly}
+	if req.MemberCredentials != nil && *req.MemberCredentials && a.IsPersonal() {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "only a shared connection can use each member's own account"})
+		return
+	}
+	rebound := false
+	if labelPresent || req.ReadOnly != nil || req.MemberCredentials != nil {
+		mutation := AccountPolicyMutation{ReadOnly: req.ReadOnly, MemberCredentials: req.MemberCredentials}
 		if labelPresent {
 			mutation.Label = &label
 		}
+		previousRevision := a.Revision
 		updated, err := c.store.UpdateAccountPolicy(r.Context(), a.Name, accountPolicyPrecondition(a), mutation)
 		if err != nil {
 			writeAccountPolicyMutationError(w, err, "could not update connection")
 			return
 		}
 		a = updated
+		// Member credentials change how calls authenticate, never the tool
+		// list: rebind the cached tools to the new revision, as a move does,
+		// instead of re-listing the upstream.
+		if !labelPresent && req.ReadOnly == nil && c.gw.rebindCachedAccount(a, previousRevision) {
+			c.gw.RefreshConnectors(r.Context())
+			rebound = true
+		}
 	}
 	// A namespace-only move changes account ownership metadata, not live tool
 	// identity or policy. Label/read-only fields always trigger reaggregation,
 	// even when their persisted values already match: that makes retrying a
 	// previous upstream failure repair the stale live cache.
-	if labelPresent || req.ReadOnly != nil {
+	if (labelPresent || req.ReadOnly != nil || req.MemberCredentials != nil) && !rebound {
 		if _, err := c.gw.ReplaceAccount(r.Context(), a.Name); err != nil {
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 			return
@@ -2258,6 +2458,10 @@ func (c *ConsoleAPI) handleConnect(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if a.AuthMode == "token" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "this connection uses an access token; update its token instead of starting OAuth"})
 		return
 	}
 	// Optional body selects the connect path. A no-body request reuses a static
@@ -2356,9 +2560,17 @@ func oauthConnectReturnState(err error) string {
 }
 
 func (c *ConsoleAPI) handleToken(w http.ResponseWriter, r *http.Request) {
+	// Older console clients used POST; PUT is the documented update method.
+	// Reject safe methods before reading a body so a GET can never rotate a
+	// credential without the normal mutation checks.
+	if r.Method != http.MethodPut && r.Method != http.MethodPost {
+		w.Header().Set("Allow", "PUT, POST")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
 	id := r.PathValue("id")
-	a, _, ok := c.managedAccount(w, r, id)
-	if !ok {
+	a, actor, ok := c.managedAccount(w, r, id)
+	if !ok || c.refuseCallerDelegatedConsoleWrite(w, a, actor) {
 		return
 	}
 	var req struct{ Token string }

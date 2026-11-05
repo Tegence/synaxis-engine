@@ -283,8 +283,8 @@ func libraryRuntimeClientForSlug(r *http.Request, store MCPClientStore) (MCPClie
 	if slug == "" || normalizeMCPClientSlug(slug) != slug {
 		return MCPClient{}, nil, false
 	}
-	client, found := store.MCPClientBySlug(r.Context(), slug)
-	if !found || client.Status != MCPClientStatusActive {
+	client, found, lookupErr := lookupActiveMCPClient(r.Context(), store, slug)
+	if lookupErr != nil || !found || client.Status != MCPClientStatusActive {
 		return MCPClient{}, nil, false
 	}
 	key, configured := mcpClientRuntimeAttestorPublicKey(client.RuntimeAttestorPublicKey)

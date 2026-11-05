@@ -298,7 +298,7 @@ func (s *PgStore) GrantMCPClientSkillAuthoringAdoptionLease(ctx context.Context,
 	}
 
 	skill, err := s.scanLibrarySkill(tx.QueryRow(ctx, `SELECT `+librarySkillColumns+` FROM narthex_library_skills WHERE id=$1 FOR UPDATE`, request.SkillID))
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && skill.Private) {
 		return LibraryMCPClientSkillAuthoringLease{}, s.rejectLibraryMCPClientSkillAuthoringTx(ctx, tx, client, latestID, grantedBy, LibraryMCPClientSkillAuthoringAuditOperationAdopt, "", "", ErrLibrarySkillNotFound)
 	}
 	if err != nil {

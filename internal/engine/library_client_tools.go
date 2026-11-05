@@ -17,6 +17,8 @@ import (
 // /mcp/clients/{slug} endpoint. Keep them in the endpoint's names list so a
 // refresh removes every previous built-in before rebuilding the projection.
 var mcpClientLibraryToolNames = []string{
+	"library_collaboration_list",
+	"library_collaboration",
 	"library_skill_create",
 	"library_skill_authoring_list",
 	"library_skill_update",
@@ -48,6 +50,14 @@ var mcpClientLibraryToolNames = []string{
 func registerMCPClientLibraryTools(s *server.MCPServer, store LibraryStore, sink AuditSink, client MCPClient, live func(context.Context) bool) []string {
 	if s == nil || store == nil || client.ID == "" || client.Subject == "" || client.Slug == "" || live == nil {
 		return nil
+	}
+	// The private_outputs projection keeps only the client's own outputs and
+	// its assigned skills (library_projection.go); the reads below narrow to
+	// artifacts this client created.
+	privateOutputs := effectiveLibraryProjection(client.LibraryProjection) == LibraryProjectionPrivateOutputs
+	sourceGrantSurfaceID := client.ID
+	if privateOutputs {
+		sourceGrantSurfaceID = ""
 	}
 	available := func(ctx context.Context) bool {
 		return live(ctx)
@@ -307,7 +317,7 @@ func registerMCPClientLibraryTools(s *server.MCPServer, store LibraryStore, sink
 					return mcp.NewToolResultError("assigned skill is unavailable"), nil
 				}
 				out = append(out, skillSummary{
-					ID: skill.ID, Slug: skill.Slug, Name: skill.Name, Description: skill.Description,
+					ID: skill.ID, Slug: skill.Slug, Name: skill.Name, Description: libraryRuntimeSkillDescription(skill),
 					Version: resolved.Version, VersionID: resolved.VersionID, BindingID: resolved.BindingID,
 				})
 			}
@@ -428,7 +438,7 @@ func registerMCPClientLibraryTools(s *server.MCPServer, store LibraryStore, sink
 				Bindings        []binding                      `json:"bindings"`
 				AuthorityNotice string                         `json:"authorityNotice"`
 			}{
-				Skill: skillMetadata{ID: skill.ID, Slug: skill.Slug, Name: skill.Name, Description: skill.Description},
+				Skill: skillMetadata{ID: skill.ID, Slug: skill.Slug, Name: skill.Name, Description: libraryRuntimeSkillDescription(skill)},
 				Version: version{
 					ID: selected.VersionID, Version: selected.Version, Content: selected.Content, Digest: selected.Digest,
 					RequestedCapabilities: append([]string(nil), selected.RequestedCapabilities...),
@@ -569,16 +579,17 @@ func registerMCPClientLibraryTools(s *server.MCPServer, store LibraryStore, sink
 			if err := validateLibraryArtifactSourceReference(input.SourceArtifactID, input.SourceArtifactVersionID, input.SourceArtifactDigest, true); err != nil {
 				return mcp.NewToolResultError("invalid source artifact reference"), nil
 			}
-			if input.SourceArtifactID != "" && !librarySurfaceMayUseArtifactVersion(ctx, store, input.SourceArtifactID, input.SourceArtifactVersionID, input.SourceArtifactDigest, client.Subject, client.ID, client.ID) {
+			if input.SourceArtifactID != "" && !librarySurfaceMayUseArtifactVersion(ctx, store, input.SourceArtifactID, input.SourceArtifactVersionID, input.SourceArtifactDigest, client.Subject, client.ID, sourceGrantSurfaceID) {
 				// Same response for unknown, revoked, ungranted, or mismatched
 				// sources. An agent must not be able to use source validation as
-				// an artifact/grant membership oracle.
+				// an artifact/grant membership oracle. A private_outputs client
+				// may cite only its own outputs.
 				return mcp.NewToolResultError("source artifact not found"), nil
 			}
 			// Validate caller-controlled text before the store derives the
 			// subject/surface/run provenance and commits every record together.
 			if err := validateLibraryArtifact(LibraryArtifact{
-				Title: input.Title, Summary: input.Summary, Origin: LibraryArtifactOriginAgentDirect,
+				Title: input.Title, Summary: input.Summary, Origin: LibraryArtifactOriginAgentDirect, ContentKind: input.ContentKind, LinkedArtifacts: input.LinkedArtifacts,
 			}); err != nil {
 				return mcp.NewToolResultError("invalid artifact input"), nil
 			}
@@ -586,7 +597,7 @@ func registerMCPClientLibraryTools(s *server.MCPServer, store LibraryStore, sink
 				return mcp.NewToolResultError("invalid artifact input"), nil
 			}
 			run, artifact, version, err := store.CreateLibraryMCPClientArtifactWithInitialVersion(ctx, client, LibraryArtifact{
-				Title: input.Title, Summary: input.Summary, Origin: LibraryArtifactOriginAgentDirect,
+				Title: input.Title, Summary: input.Summary, Origin: LibraryArtifactOriginAgentDirect, ContentKind: input.ContentKind, LinkedArtifacts: input.LinkedArtifacts,
 				SourceArtifactID: input.SourceArtifactID, SourceArtifactVersionID: input.SourceArtifactVersionID, SourceArtifactDigest: input.SourceArtifactDigest,
 			}, LibraryArtifactVersion{Format: input.Format, Body: input.Body})
 			if err != nil {
@@ -676,7 +687,7 @@ func registerMCPClientLibraryTools(s *server.MCPServer, store LibraryStore, sink
 	s.AddTool(
 		mcp.NewTool(
 			"library_artifact_read",
-			mcp.WithDescription("Read an artifact this MCP client owns or has been granted. Owned artifacts return this client's current private head; granted artifacts always return the exact immutable version and digest selected by the live grant."),
+			mcp.WithDescription("Read an artifact this MCP client owns or has been granted. Owned artifacts return the requested exact version or current private head; granted artifacts only return the exact immutable version and digest selected by the live grant."),
 			mcp.WithInputSchema[libraryArtifactReadInput](),
 			mcp.WithReadOnlyHintAnnotation(true),
 		),
@@ -695,8 +706,17 @@ func registerMCPClientLibraryTools(s *server.MCPServer, store LibraryStore, sink
 				return mcp.NewToolResultError("artifact not found"), nil
 			}
 			access, allowed := libraryMCPClientArtifactAccess(ctx, store, artifact, client)
-			if !allowed {
+			if !allowed || (privateOutputs && access.Mode != LibraryControlArtifactAccessOwned) {
+				// A private_outputs client replays only what it created; a
+				// granted artifact reads exactly like an unknown one.
 				return mcp.NewToolResultError("artifact not found"), nil
+			}
+			if input.ArtifactVersionID != "" {
+				exact, found := store.LibraryArtifactVersion(ctx, artifact.ID, input.ArtifactVersionID)
+				if !found || (access.Mode != LibraryControlArtifactAccessOwned && exact.ID != access.Version.ID) {
+					return mcp.NewToolResultError("artifact not found"), nil
+				}
+				access.Version = exact
 			}
 			if access.Version.Format == LibraryArtifactFormatImage {
 				mediaStore, supported := store.(LibraryArtifactMediaStore)
@@ -780,10 +800,18 @@ func registerMCPClientLibraryTools(s *server.MCPServer, store LibraryStore, sink
 		},
 	)
 
+	if privateOutputs {
+		// Memory and collaboration write where other people read; they are
+		// never registered, and every other removed tool is deleted again.
+		return projectMCPClientLibraryTools(s, store, client)
+	}
 	if memoryStore, supported := store.(LibraryMemoryStore); supported {
 		registerMCPClientMemoryTools(s, memoryStore, sink, client, live)
 	}
-	return append([]string(nil), mcpClientLibraryToolNames...)
+	if collaboration, ok := store.(LibraryCollaborationStore); ok {
+		registerCollaborationTools(s, collaboration, client, live)
+	}
+	return projectMCPClientLibraryTools(s, store, client)
 }
 
 type libraryArtifactListInput struct {
@@ -1054,4 +1082,13 @@ func libraryStoredSkillManifestProjection(ctx context.Context, store LibraryStor
 // grant and never advances it to an artifact's latest head.
 func libraryArtifactBelongsToMCPClient(ctx context.Context, store LibraryStore, artifact LibraryArtifact, client MCPClient) bool {
 	return libraryArtifactDirectlyOwnedBySurface(ctx, store, artifact, client.Subject, client.ID)
+}
+
+// Private descriptions can change with an unshared version. Runtime metadata
+// must not reintroduce the mutable head after selecting an immutable binding.
+func libraryRuntimeSkillDescription(skill LibrarySkill) string {
+	if skill.Private {
+		return ""
+	}
+	return skill.Description
 }

@@ -1,6 +1,6 @@
 # Build the Narthex engine (cmd/engine) — MCP gateway + OAuth AS + console API.
-# Requires Go >= 1.25.5 (mcp-go).
-FROM golang:1.25-bookworm AS build
+# Match the patched toolchain verified by local CI and go.mod.
+FROM golang:1.26.10-bookworm AS build
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download

@@ -33,17 +33,23 @@ var (
 // A status of approved does not permit automatic replay after an Engine
 // restart. The original MCP request is not a durable, replay-safe command.
 type PendingCall struct {
-	ID           string         `json:"id"`
-	TS           time.Time      `json:"ts"`
-	Connector    string         `json:"connector"`
-	Account      string         `json:"account"`
-	Tool         string         `json:"tool"` // BARE tool name
-	Args         map[string]any `json:"args,omitempty"`
-	Status       string         `json:"status"` // pending | approved | denied | expired | cancelled
-	ExpiresAt    *time.Time     `json:"expires_at,omitempty"`
-	DecidedAt    *time.Time     `json:"decided_at,omitempty"`
-	DecidedBy    string         `json:"decided_by,omitempty"`
-	DecisionNote string         `json:"decision_note,omitempty"`
+	CallerSubject string `json:"-"`
+	// PrivateOwnerSubject restricts private linked-account approvals independently
+	// of the parent MCP connection's managers and one-time notification links.
+	PrivateOwnerSubject string         `json:"-"`
+	InspectionRequired  bool           `json:"inspectionRequired,omitempty"`
+	CanDecide           *bool          `json:"canDecide,omitempty"`
+	ID                  string         `json:"id"`
+	TS                  time.Time      `json:"ts"`
+	Connector           string         `json:"connector"`
+	Account             string         `json:"account"`
+	Tool                string         `json:"tool"` // BARE tool name
+	Args                map[string]any `json:"args,omitempty"`
+	Status              string         `json:"status"` // pending | approved | denied | expired | cancelled
+	ExpiresAt           *time.Time     `json:"expires_at,omitempty"`
+	DecidedAt           *time.Time     `json:"decided_at,omitempty"`
+	DecidedBy           string         `json:"decided_by,omitempty"`
+	DecisionNote        string         `json:"decision_note,omitempty"`
 	// Kind is "read" or "write", captured from the tool's annotations (or the
 	// readOnlyTool name heuristic) at park time — the live mcp.Tool is not
 	// necessarily reachable any more once the call is decided or has timed
@@ -101,10 +107,29 @@ const (
 	maxApprovalNoteBytes  = 2 << 10
 )
 
+func validPrivateApprovalID(id string) bool {
+	if !strings.HasPrefix(id, "private_") || len(id) != len("private_")+32 {
+		return false
+	}
+	for _, ch := range strings.TrimPrefix(id, "private_") {
+		if !(ch >= '0' && ch <= '9' || ch >= 'a' && ch <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 func normalizePendingCall(p *PendingCall) error {
+	if p.PrivateOwnerSubject != "" && !validActorIdentifier(p.PrivateOwnerSubject) {
+		return errors.New("invalid private approval owner")
+	}
 	p.ID = strings.TrimSpace(p.ID)
 	if p.ID == "" {
 		return errors.New("pending call id is required")
+	}
+	private := p.PrivateOwnerSubject != ""
+	if strings.HasPrefix(p.ID, "private_") != private || private && !validPrivateApprovalID(p.ID) {
+		return errors.New("private approval requires a reserved private ID and owner")
 	}
 	if p.Status == "" {
 		p.Status = ApprovalPending

@@ -70,7 +70,7 @@ requested action.
 
 Requirements:
 
-- Go 1.25.5 or newer
+- Go 1.26.9 or newer
 - optional Postgres for durable production storage
 
 Run these commands from `backend/` in the private monorepo, or from the
@@ -155,22 +155,29 @@ authentication.
 
 | Methods | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/gateway`, `/api/health` | MCP endpoint metadata and per-connection health |
+| `GET` | `/api/gateway`, `/api/health` | MCP endpoint metadata and per-connection health (recorded rows, revalidated in the background; `X-Synaxis-Health-Refresh: 1` probes live) |
 | `GET` | `/api/logs`, `/api/logs/{id}` | Summary audit rows and one recorded call |
 | `POST` | `/api/logs/{id}/replay`, `/api/logs/{id}/triage` | Replay a recorded call or persist a triage decision |
 | `GET, POST` | `/api/servers` | List or create credential-bearing connections |
+| `GET` | `/api/connection-model` | Read the versioned integration, connection and connected-account projection without changing existing MCP records |
+| `POST` | `/api/connections/{id}/accounts` | Link a private named access-token account |
+| `PATCH`, `DELETE` | `/api/connections/{id}/accounts/{accountId}` | Rename or remove your linked account |
+| `PUT`, `DELETE` | `/api/connections/{id}/accounts/{accountId}/token` | Replace or delete your linked account’s token |
+| `POST` | `/api/linked-accounts` | Link a private access-token account without an MCP connection |
+| `PATCH`, `DELETE` | `/api/linked-accounts/{accountId}` | Rename or remove your standalone token or OAuth account |
+| `PUT`, `DELETE` | `/api/linked-accounts/{accountId}/token` | Replace or delete your standalone account’s credential |
 | `PATCH, DELETE` | `/api/servers/{id}` | Update policy/ownership metadata or delete a connection |
 | `POST` | `/api/servers/{id}/connect` | Start upstream OAuth |
 | `PUT` | `/api/servers/{id}/token` | Store a bearer token for a token-auth connection |
-| `GET, PUT` | `/api/servers/{id}/tools` | Read or replace the connection's enabled-tool set |
-| `PUT` | `/api/servers/{id}/tools/{tool}` | Update one tool's alias, description, or enabled policy |
+| `GET, PUT` | `/api/servers/{id}/tools` | Read or replace the connection's enabled-tool set; a listing failure answers `{"error","code","recovery"}`: `409` `needs_auth`/`connect` or `auth_expired`/`reauthorize`, `504` `timeout`/`retry`, `502` `unreachable` or `error`/`retry` |
+| `PUT` | `/api/servers/{id}/tools/{tool}` | Update one tool's alias, description, or enabled policy (listing failures as above) |
 | `GET, POST` | `/api/connection-namespaces` | List visible credential folders or create a shared folder |
 | `GET, PATCH, DELETE` | `/api/connection-namespaces/{id}` | Read, rename, or delete a credential folder |
 | `GET, PUT` | `/api/connection-namespaces/{id}/managers` | Read or replace delegated manager subjects |
 | `PUT, DELETE` | `/api/connection-namespaces/{id}/managers/{subject}` | Grant or revoke one manager subject |
 | `GET, POST` | `/api/mcp-clients` | List or register subject-bound MCP clients |
 | `GET, PATCH` | `/api/mcp-clients/{id}` | Read or rename an MCP client registration |
-| `PUT` | `/api/mcp-clients/{id}/namespaces` | Replace an MCP client's connection-namespace grants |
+| `PUT` | `/api/mcp-clients/{id}/namespaces` | Replace an MCP client's folder and exact connection grants |
 | `POST` | `/api/mcp-clients/{id}/oauth-client/reset` | Clear a stale DCR binding and rotate the endpoint epoch |
 | `POST` | `/api/mcp-clients/{id}/revoke` | Revoke a scoped MCP client and its resource tokens |
 | `GET, POST` | `/api/connectors` | List or create curated virtual connectors |
@@ -214,6 +221,92 @@ authentication.
 The legacy `/api/namespaces*` route family remains an exact compatibility alias
 for `/api/endpoints*`; it does not address credential-owning connection
 namespaces.
+
+### Connections and linked accounts
+
+`GET /api/connection-model` and `GET /control/v1/connection-model` return
+`contractVersion: "synaxis.connection-model.v1"` with `integrations`,
+`connections`, `connectedAccounts` and `capabilities` arrays. The `connection-account-model`
+capability on `/control/v1/meta` advertises this read contract only. It does
+not enable account-management writes or browser execution.
+`connection-integrations` (in `meta` and the model) says `integrations` lists
+`mcp.streamable-http`, `token_api.bearer`, `browser.website`, `oauth.instagram` and
+`oauth.linkedin`, each only under its existing linking capability, with an
+`availability` state (`ready`, `setup_required`, `update_required`) computed by the
+same check that makes the start routes refuse. Connected accounts add descriptive
+`integrationId`, `ownerKind` and `usableBy`; connections add `accountLinkingBlocked`.
+See [docs/CONNECTION_ACCOUNT_MODEL.md](../docs/CONNECTION_ACCOUNT_MODEL.md).
+
+Connections preserve their existing name/tool prefix, incarnation, namespace
+and scope. Their `accountBinding` reports a `connection`, `member` or
+`caller_delegated` mode, credential state and projected account IDs. Only
+the requesting member's matching credential can produce a member account;
+discovery credentials and temporary caller grants never produce reusable
+execution accounts. Missing credentials never imply anonymous access.
+
+The projection uses existing management permissions, returns no credentials
+or endpoint URLs, and performs no writes or upstream calls. Account IDs are
+stable credential-slot references, fenced by the connection incarnation and
+member subject. Their `identityStatus` is `opaque`: neither these IDs nor
+credential presence verify a provider identity or grant execution authority.
+Existing connection APIs, MCP dispatch and refresh behavior are unchanged.
+
+`account-linking-token` separately advertises owner-private named accounts.
+Create, rename, update token, disconnect and remove use
+`/api/connections/{id}/accounts[/{accountId}[/token]]` or their `/control/v1`
+counterparts. Writes require parent incarnation/revision and, for an existing
+link, its revision. Only the owning actor can read or edit a link, under the
+existing connection-management boundary. Linking never replaces the MCP default
+credential, grants agent access or verifies the provider identity. Postgres
+payloads are encrypted; local FileStore uses its existing credential file.
+With `account-linking-standalone`, `/api/linked-accounts[/{accountId}[/token]]`
+and an empty `connectionId` on `/api/account-oauth/{provider}/start` keep token
+and OAuth accounts with no MCP parent, owned only by the actor and stored in
+`narthex_integration_accounts` (FileStore `integration_accounts`). They are
+storage only: nothing executes with them.
+See [the full contract](../docs/CONNECTION_ACCOUNT_MODEL.md) for methods, request
+fields, lifecycle, deployment and FileStore downgrade guidance.
+
+`account-linking-browser` adds owner-private browser sign-in using a fresh cloud profile,
+without changing existing account credentials or granting execution access. Configure
+`BROWSER_SIGN_IN_CONFIG` to enable Browserbase interactive sign-in, Kernel managed
+credential/MFA forms, or both. Managed values are submitted transiently through the
+owner-only flow and are not stored in Synaxis or passed to agents. See [browser account linking](../docs/BROWSER_ACCOUNT_LINKING.md)
+for the lifecycle, routes, privacy boundary and cleanup requirements.
+
+`browser-account-runtime` separately advertises the service-only
+`POST /control/v1/browser-runtime` contract. Hosted owners can explicitly grant
+saved browser profiles to private agents for reading, owner-approved actions, or
+preauthorized actions. Native cloud-runner tools use Platform's lease-bound broker;
+they do not change MCP grants or dispatch. The provider must be configured and the
+account grant current. See [agent browser access](../docs/AGENT_BROWSER_ACCESS.md)
+for setup, private approval handling, runtime limits and downgrade precautions.
+
+`account-linking-oauth` adds registered-provider sign-in for those same private
+accounts. Configure `LINKED_ACCOUNT_OAUTH_CONFIG` with Instagram and/or LinkedIn
+application credentials. `oauthProviders` in the read model reports availability
+and requested scopes; it never contains credentials. Instagram requests
+`instagram_business_basic` for professional accounts; LinkedIn requests
+`openid profile` for a member profile. Register the configured Web origin plus
+`/oauth/accounts/instagram` or `/oauth/accounts/linkedin` as the exact redirect.
+
+`POST /api/account-oauth/{provider}/start` takes `connectionId`,
+`connectionIncarnationId`, `connectionRevision`, `displayName`, and optional
+`accountId`/`revision` for reconnect. It returns `authorizationUrl`, `redirectUri`,
+`state` and `browserProof`. The trusted client holds the proof in the initiating
+tab, navigates to consent, then calls `POST /api/account-oauth/{provider}/complete`
+with `state`, `browserProof`, and either `code` or `denied: true`, using the same
+authenticated member. Both routes also exist under `/control/v1`. Single-use
+state expires after ten minutes, survives restart, and is encrypted in Postgres.
+Neither route accepts replay keys or caller-supplied endpoints/scopes.
+
+An OAuth account exposes `identityStatus: "provider_confirmed"` and a provider
+identifier/name, expiry and any returned scopes. Credentials stay private.
+Reconnect requires the original provider, app and account identity. Disconnect
+erases access/refresh tokens locally; revoke provider consent separately if
+desired. Expired accounts need sign-in again. No automatic refresh, publishing,
+page discovery or agent access is added. Existing pasted-token accounts and MCP
+credentials retain their previous behavior.
 
 ### Activation snapshot
 
@@ -310,7 +403,10 @@ Member assertions use `owner`, `admin`, `operator`, or `viewer`; Engine
 handlers then enforce their own namespace and connection rules. The reserved
 `service` actor is accepted only as `platform-service` on
 `POST /api/oauth/revoke-all`, `PUT /api/usage/grant`, `GET /api/usage`, and
-`GET /api/activation`. It cannot mutate connections or approvals.
+`GET /api/activation` on these legacy API routes. Versioned service-only control
+operations also include workload management and `POST /control/v1/browser-runtime`;
+see [the control contract](../docs/CONTROL_V1.md). The service actor cannot decide
+human approvals or perform member connection-management operations.
 
 ## Hosted usage contract
 
@@ -459,22 +555,145 @@ IDs, and compare-and-swap revisions. A stale tab or delayed OAuth callback
 therefore cannot write policy or credentials across a move, delete/recreate,
 or concurrent manager revocation.
 
+### Each member's own account
+
+A manager can switch a shared connection to `memberCredentials`. Its account's
+own credential still lists the tools, but every tool call through a
+subject-bound MCP client uses the calling member's own upstream credential.
+Each member's actions upstream then show as that member, not as the account.
+
+- Members connect their own account under `/api/member-credentials`: OAuth
+  through `POST /api/member-credentials/{account}/connect`, which reuses the
+  account's OAuth client, or a token through `PUT .../token`. `DELETE
+  /api/member-credentials/{account}` disconnects it. A member sees only
+  connections that their own MCP clients may use or that they manage, and
+  only their own credential.
+- A call fails closed with an instruction when the member has not connected,
+  when it arrives on an endpoint without a subject (root `/mcp`, endpoint
+  bundles, connectors), or when it comes from a workload client. It never
+  falls back to the account's credential.
+- Member tokens refresh through `refreshAccount` under a per-member lock.
+  They are encrypted like the account's own and are deleted with the account.
+
+### Caller-delegated connections
+
+A caller-delegated connection serves an MCP server behind an enterprise
+authorization server. It acts only for the person who started a job: each
+workload `tools/call` carries a short-lived grant for that person, and the
+Engine exchanges it (RFC 7523) at the connection's token endpoint with the
+connection's own client credentials. The connection's bearer token is a
+listing credential that only lists tools. The Engine never interprets the
+grant's subject, so it stays unaware of users and memberships.
+
+- A hosting control plane manages these connections through
+  `/control/v1/connections` (`docs/CONTROL_V1.md`, "Connections,
+  caller-delegated") and confirms support through the
+  `caller-delegated-connections` capability on `GET /control/v1/meta`.
+  On a hosted Engine only its service actor writes them; owners and admins
+  may read them. The console's `/api/servers/{id}` edit, delete and token
+  routes keep the same rule (403), and no console edit makes such a
+  connection personal or gives it member credentials (400), on a
+  self-hosted Engine too. A whole-account write (the deprecated
+  `/admin/token` form) cannot make a connection caller-delegated or turn
+  one into a plain connection.
+- A stored credential never moves to another destination: changing the
+  URL, token endpoint or resource of a caller-delegated connection needs the
+  client secret in the same edit and drops the listing token, and any other
+  connection that holds credentials keeps its URL.
+- An authorization server may accept a new listing token only after the
+  control plane's write has returned. When the listing that follows a
+  `/control/v1/connections` token PUT or edit fails, the Engine lists that
+  account again after 2, 5, 15 and 40 seconds until it succeeds, instead of
+  waiting for the next health sweep. It logs `account "<name>" could not be
+  listed after a connection write`, then `listed on retry after a connection
+  write`, or `was listed by another pass after a connection write` when the
+  start-up reconcile or the health sweep listed it first.
+- What is stored: the existing account fields `ClientID`, `ClientSecret`,
+  `TokenEndpoint`, `Resource` and `BearerToken`, plus the
+  `CallerDelegated` flag (PgStore column `caller_delegated`, added by
+  idempotent DDL). The client secret and bearer token are encrypted at rest
+  through the store cipher (`ENGINE_ENCRYPTION_KEY`), like every account
+  credential; FileStore keeps its local plaintext posture. No grant and no
+  exchanged access token is ever stored.
+- No response, problem or log line carries a secret: management responses
+  report `clientSecretSet` and `tokenSet` only. The console account list
+  (`GET /api/servers`) carries the same `callerDelegated` block, so a
+  management UI can show that approvals happen at the upstream.
+- Request and result payloads of calls to these connections are never
+  recorded, whatever `ENGINE_RECORD_PAYLOADS` says; audit rows keep the
+  account, tool, workload subject and outcome.
+- The connection is delivered only through an exact connection grant on a
+  workload client, never through a folder grant, the root `/mcp`, a
+  connector or an endpoint bundle.
+- No new environment variable.
+- URLs are `https` only. A local end-to-end stack whose upstream listens on
+  plain `http` on this machine builds the Engine with
+  `go build -tags engine_e2e_loopback ./cmd/engine`: that build alone
+  accepts `http` on a loopback host for these connections and lets upstream
+  dials and the exchange reach a loopback host (`internal/engine/e2e_loopback.go`;
+  test with `go test -tags engine_e2e_loopback ./internal/engine -run '^TestE2ELoopback'`).
+  Release builds never pass the tag, and nothing at run time turns it on.
+
+`DELETE /control/v1/library/artifacts/{id}` lets the hosting control plane's
+service actor erase an artifact with its versions, media, grants,
+collaboration state and chat-reply provenance. It is idempotent and keeps
+only a tombstone of the ID and deletion time.
+
+### Caller grants on workload calls
+
+A workload client's `tools/call` to a caller-delegated connection carries the
+caller's grant in `X-Synaxis-Caller-Grant: resource="<url>", grant="<compact
+JWS>"` (`docs/CONTROL_V1.md`, "Caller grants on workload calls"). The Engine
+reads the header only on a workload client's `/mcp/clients/{slug}`: at most 4
+lines of at most 4 KiB, malformed lines ignored.
+
+- **Matching.** Before any network call the Engine picks the grant for the
+  connection's `resource` and checks, without verifying the signature or
+  reading the subject, that its `resource`, `client_id` and `act.client` name
+  this connection and the calling client and that it has more than 5 s left.
+- **Exchange limits.** RFC 7523 `jwt-bearer` at the connection's token
+  endpoint with HTTP Basic client authentication: 5 s timeout, no redirects,
+  an answer of at most 16 KiB, `expires_in` from 1 to 300 s. Refusals become
+  fixed tool errors; a refused exchange is logged with the connection name,
+  HTTP status and the recognised OAuth error code and reason only.
+- **Cache.** Access tokens live in memory only, under SHA-256 of the grant
+  plus the calling client's ID, until 10 s before they expire; every hit
+  re-checks the grant's claims. A 401 from the upstream drops the token and
+  exchanges once more; a token still refused after that is dropped too.
+- **Payload recording is off** for caller-delegated connections whatever
+  `ENGINE_RECORD_PAYLOADS`, a connector or a governance preset says, and
+  their calls cannot be replayed. Audit rows keep the connection, tool,
+  workload subject and outcome.
+- Only `_meta["io.synaxis/call-id"]` (`[A-Za-z0-9_-]{1,64}`) is forwarded,
+  and only to caller-delegated upstreams.
+- No new environment variable.
+
 ## Subject-bound MCP client endpoints
 
 `/mcp/clients/{slug}` is a separate path namespace from shared
 `/mcp/{slug}` endpoints. An MCP client registration contains a stable endpoint
-slug, one Platform subject, and a set of connection-namespace IDs. It contains
+slug, one Platform subject, and folder or individual connection grants. It contains
 no bearer credential. The first approved OAuth consent binds the registration
 to one DCR client ID; replacing that binding requires an explicit reset.
 
 Owners and admins may authorize shared root and connector resources. Operators
 may authorize only a subject-bound MCP client registered to their exact
 subject. A scoped endpoint projects shared/service connections from its granted
-namespaces plus personal connections owned by the same subject. The Engine
+namespaces or individually selected connections, plus personal connections owned by the same subject. The Engine
 rechecks that boundary from durable state before listing tools and immediately
 before every tool call.
 
-Changing namespace grants, moving an account across an endpoint boundary,
+Engines advertising `mcp-client-connections` accept `connectionIds` beside
+`connectionNamespaceIds` during registration and atomic `PUT .../namespaces`
+updates. The scopes form a union. Selecting a connection grants no access to
+its siblings or future folder members. Exact grants pin the account incarnation;
+deleting and recreating the same name does not inherit access. Remove the old
+grant before explicitly selecting its replacement. Omitting `connectionIds` on
+an older namespace-only update preserves exact grants; an explicit empty array
+clears them. The management DTO contains names only, never incarnation bindings.
+The same subject and personal-credential restrictions apply to either scope.
+
+Changing folder or individual connection grants, moving an account across an endpoint boundary,
 resetting the OAuth binding, or revoking the client rotates its endpoint epoch.
 Tokens, authorization codes, and refresh grants minted for the prior epoch then
 fail closed. Slugs and tool prefixes remain stable.
@@ -492,6 +711,11 @@ curated virtual connectors. The pipeline is
 `redact -> size cap -> injection scan -> audit`, and recorded payloads contain
 the post-guard result. Replays through a surviving connector apply that
 connector's current rules.
+
+Nested `tool_result` content receives the same guards, with one shared byte
+budget for text and structured content across the result. Unsupported input or
+continuation formats, unknown content types, and nesting beyond 32 levels return
+a safe tool error and the audit marker `blocked:unsupported_content`.
 
 The root `/mcp` aggregate is an intentional raw passthrough. Whole-connection
 endpoint bundles and `/mcp/clients/{slug}` subject-bound endpoints are also raw
@@ -586,6 +810,26 @@ digest, rechecks the current client/epoch/direct-run ownership atomically, and
 appends a new immutable pending version; it never overwrites content, follows a
 grant, mutates a handoff, or changes authority. Exact retry replays the prior
 result, while changed request-ID reuse or a stale head conflicts.
+Separate collaboration grants let people and agents review or edit the latest
+text/Markdown version. Owners/admins grant `view`, `comment`, or `edit`, with
+optional expiry and immediate revocation. Local clients use
+`library_collaboration_list` and `library_collaboration`; the grant pins their
+registration epoch. Comments retain their version and optional quotation.
+Edits require a request ID, expected version and digest, and create immutable
+pending versions. Existing exact-version handoffs and public snapshots remain
+unchanged. Collaboration grants do not confer publication or tool authority.
+
+An external guest or agent can receive a named bearer capability. The Engine
+stores only its hash and checks it on every operation. The public REST endpoint
+is `POST /api/public/artifacts/collaborate` (token in its JSON body); a restricted
+Streamable HTTP MCP endpoint is `/api/public/artifacts/mcp/{artifact}/{grant}`
+with `Authorization: Bearer <token>`. Its sole `artifact_collaborate` tool is
+pinned to that output. Treat output/comment text as untrusted context. The
+Console manages grants at `/api/library/artifacts/{id}/collaboration`; hosted
+control planes use the actor-asserted `/control/v1/library/collaboration` route.
+Neither endpoint returns engine credentials or makes a bearer label a verified
+human identity. FileStore and encrypted PgStore implement the same contract.
+
 `library_skill_resolve` (and the protected `POST /api/library/resolve`)
 selects an explicit binding or, per skill, the most-specific matching binding
 in the order `folder > repository > namespace > workspace`. It returns
@@ -700,14 +944,27 @@ The complete example is in [`.env.example`](.env.example). Important values:
 | `SYNAXIS_ENABLE_LEGACY_ADMIN` | Enables password-bearing `/admin/*` compatibility forms; defaults to `false`, hosted engines force `false` |
 | `DATABASE_URL` | Optional Postgres connection string |
 | `ENGINE_ENCRYPTION_KEY` | Base64 32-byte AES-GCM key for stored secrets; required when `SYNAXIS_WORKSPACE_ID` is set |
+| `BROWSER_SIGN_IN_CONFIG` | Default empty (browser sign-in disabled). Engine-only secret JSON with `provider: "browserbase"` or `"kernel"`, `apiKey`, and `projectId`. Browserbase can additionally carry `managedAuth: {"provider":"kernel","apiKey":"…","projectId":"…"}` to add credential forms while retaining existing Browserbase profiles. Use an isolated provider project and scoped key per hosted Engine; `projectId` identifies that operator-configured scope, not a key-scope attestation. Keep both configurations until their pending/saved profile cleanup finishes. See [browser account linking](../docs/BROWSER_ACCOUNT_LINKING.md). |
+| `LINKED_ACCOUNT_OAUTH_CONFIG` | Default empty (providers unavailable). Secret JSON object keyed by provider (`instagram`, `linkedin`), each with `clientId` and `clientSecret`. Enables named OAuth account linking only. Callbacks use the configured `CONSOLE_URL` origin at `/oauth/accounts/{provider}`; never changes MCP credentials |
 | `CONSOLE_URL` | Browser destination after upstream OAuth |
 | `CONSOLE_ORIGIN` | Allowed browser origins for the legacy direct console |
 | `ENGINE_SKILL_DRAFT_OPENAI_URL` | Optional HTTPS OpenAI-compatible API base or full Chat Completions endpoint for direct self-hosted skill drafts |
 | `ENGINE_SKILL_DRAFT_OPENAI_API_KEY` | Server-only provider key for the direct self-hosted creator; use a secret manager and never expose it to an MCP client, browser, or hosted workspace Engine |
 | `ENGINE_SKILL_DRAFT_OPENAI_MODEL` | Optional direct-creator model name; defaults to `gpt-4.1-mini` after URL/key are configured |
+| `ACCOUNTS_PATH` | File-store path when `DATABASE_URL` is unset; defaults to `accounts.json`, which is gitignored and must never be committed populated |
+| `ENGINE_TRUST_PROXY_HEADERS` | Keys login and consent rate limiting on the last `X-Forwarded-For` hop; enable only directly behind exactly one reverse proxy you control |
+| `ALERT_WEBHOOK_URL` | Slack/Discord-compatible webhook for account down/recovered alerts and approval pings |
+| `APPROVAL_TIMEOUT_SECONDS` | How long an approval-gated call waits for a decision before expiring; defaults to `180` |
+| `ENGINE_RECORD_PAYLOADS` | `true` records request and result payloads for calls on the default `/mcp` endpoint; connectors opt in per connector |
+| `AUDIT_RETENTION_DAYS` | Purges audit rows older than this on the Postgres store; defaults to `30`, `0` keeps them forever |
+| `ENGINE_EVENTS_URL` | Platform events endpoint a hosted Engine posts to; set at provisioning, unused when self-hosted |
+| `ENGINE_VERSION` | Explicit version string the Engine reports; otherwise the module version or VCS revision |
+| `ENGINE_ADMIN_TOKEN` | Deprecated alias for `SYNAXIS_ADMIN_TOKEN`, read only when that is unset (see `DEPRECATIONS.md`) |
+| `ENGINE_ENABLE_LEGACY_ADMIN` | Deprecated alias for `SYNAXIS_ENABLE_LEGACY_ADMIN`, read only when that is unset (see `DEPRECATIONS.md`) |
 
 Migration-sensitive `ENGINE_*` names remain supported even as user-visible
-product surfaces use Synaxis.
+product surfaces use Synaxis. `TestEnvironmentVariablesAreDocumented` fails
+when the Engine reads a variable this table does not list.
 
 ## Test
 
@@ -749,3 +1006,9 @@ durable with PostgreSQL.
 Synaxis Engine is licensed under the [Apache License 2.0](LICENSE). The license
 does not grant permission to use Synaxis trademarks except as needed to
 describe the software's origin.
+
+## Source knowledge index
+
+A trusted source service can maintain a derived index through `PUT /knowledge/v1/sources/{source}/documents` and query ranked references through `POST /knowledge/v1/sources/{source}/search`. Hosted credentials are issued only to the Platform service at `POST /control/v1/knowledge/sources/{source}/credential`; the ordinary engine admin bearer alone is insufficient in hosted mode. The `knowledge-index` control capability signals availability. A source token cannot use control/MCP APIs or another source; rotating the engine admin credential invalidates all derived source tokens.
+
+Documents use monotonic versions and retained deletion tombstones. Identical replay and stale delivery converge; a conflicting same-version payload fails. PgStore encrypts payloads using the existing storage cipher; FileStore uses its protected local data file. Search returns IDs, versions and scores only. The source service must reload and authorize each record at read time. This is bounded keyword search, not semantic retrieval: 10,000 entries including tombstones per engine, 2,000 title bytes, 64 KiB text per entry, up to 100 references per page. Capacity exhaustion is explicit; do not remove tombstones without a source watermark protocol.

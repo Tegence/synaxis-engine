@@ -71,7 +71,7 @@ func (s *PgStore) CreateLibraryMCPClientArtifactVersion(ctx context.Context, end
 	if err != nil {
 		return LibraryMCPClientArtifactVersionCreateResult{}, err
 	}
-	if artifact.Origin != LibraryArtifactOriginAgentDirect || artifact.AgentSurfaceID != client.ID || artifact.CreatedBy != client.Subject || artifact.RunID == "" {
+	if artifact.ContentKind == LibraryContentChatReply || artifact.Origin != LibraryArtifactOriginAgentDirect || artifact.AgentSurfaceID != client.ID || artifact.CreatedBy != client.Subject || artifact.RunID == "" {
 		return LibraryMCPClientArtifactVersionCreateResult{}, ErrLibraryArtifactNotFound
 	}
 	run, err := s.scanLibraryRun(tx.QueryRow(ctx, `SELECT `+libraryRunColumns+` FROM narthex_library_runs WHERE id=$1 FOR KEY SHARE`, artifact.RunID))

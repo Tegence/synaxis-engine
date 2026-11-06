@@ -24,7 +24,7 @@ const (
 	platformServiceActorID       = "platform-service"
 	platformActorAssertionMaxAge = 2 * time.Minute
 	platformActorClockSkew       = 10 * time.Second
-	maxActorAssertionBytes       = 4096
+	maxActorAssertionBytes       = 32768
 	maxActorRequestBodyBytes     = 2 << 20
 )
 
@@ -35,9 +35,11 @@ var ErrInvalidPlatformActorAssertion = errors.New("invalid Platform actor assert
 // context: handlers must never recover identity from user-controlled headers.
 // Connection-namespace ACL enforcement will consume this value directly.
 type PlatformActor struct {
-	WorkspaceID string
-	UserID      string
-	Role        string
+	InspectionEventID string
+	WorkSubjects      string
+	WorkspaceID       string
+	UserID            string
+	Role              string
 }
 
 type platformActorContextKey struct{}
@@ -69,17 +71,19 @@ type actorAssertionHeader struct {
 }
 
 type actorAssertionClaims struct {
-	Issuer      string `json:"iss"`
-	Audience    string `json:"aud"`
-	WorkspaceID string `json:"workspace_id"`
-	UserID      string `json:"user_id"`
-	Role        string `json:"role"`
-	Method      string `json:"method"`
-	Path        string `json:"path"`
-	BodySHA256  string `json:"body_sha256"`
-	IssuedAt    int64  `json:"iat"`
-	ExpiresAt   int64  `json:"exp"`
-	JTI         string `json:"jti"`
+	InspectionEventID string `json:"inspection_event,omitempty"`
+	WorkSubjects      string `json:"work_subjects,omitempty"`
+	Issuer            string `json:"iss"`
+	Audience          string `json:"aud"`
+	WorkspaceID       string `json:"workspace_id"`
+	UserID            string `json:"user_id"`
+	Role              string `json:"role"`
+	Method            string `json:"method"`
+	Path              string `json:"path"`
+	BodySHA256        string `json:"body_sha256"`
+	IssuedAt          int64  `json:"iat"`
+	ExpiresAt         int64  `json:"exp"`
+	JTI               string `json:"jti"`
 }
 
 // NewPlatformActorVerifier configures hosted request verification. audience
@@ -144,6 +148,7 @@ func (v *PlatformActorVerifier) VerifyRequest(r *http.Request) (PlatformActor, e
 		return PlatformActor{}, ErrInvalidPlatformActorAssertion
 	}
 	return PlatformActor{
+		InspectionEventID: claims.InspectionEventID, WorkSubjects: claims.WorkSubjects,
 		WorkspaceID: claims.WorkspaceID,
 		UserID:      claims.UserID,
 		Role:        claims.Role,
@@ -160,7 +165,7 @@ func parseActorAssertion(raw string) (actorAssertionHeader, actorAssertionClaims
 		return actorAssertionHeader{}, actorAssertionClaims{}, "", nil, ErrInvalidPlatformActorAssertion
 	}
 	claimsJSON, err := base64.RawURLEncoding.Strict().DecodeString(parts[1])
-	if err != nil || len(claimsJSON) == 0 || len(claimsJSON) > 2048 {
+	if err != nil || len(claimsJSON) == 0 || len(claimsJSON) > 24576 {
 		return actorAssertionHeader{}, actorAssertionClaims{}, "", nil, ErrInvalidPlatformActorAssertion
 	}
 	signature, err := base64.RawURLEncoding.Strict().DecodeString(parts[2])
@@ -191,6 +196,12 @@ func decodeStrictActorJSON(body []byte, target any) error {
 }
 
 func validActorClaims(claims actorAssertionClaims, verifier *PlatformActorVerifier) bool {
+	if !validWorkSubjects(claims.WorkSubjects, claims.Method, claims.Path) {
+		return false
+	}
+	if claims.InspectionEventID != "" && (!validActorIdentifier(claims.InspectionEventID) || (claims.Role != "owner" && claims.Role != "admin") || !validInspectionRead(claims.Method, claims.Path)) {
+		return false
+	}
 	if claims.Issuer != "synaxis-platform" ||
 		claims.Audience != verifier.audience ||
 		claims.WorkspaceID != verifier.workspaceID ||
@@ -249,18 +260,62 @@ func platformServiceControlRoute(method, requestPath string) bool {
 
 // platformServiceControlV1Route is the /control/v1 counterpart of the closed
 // service allowlist above. The service principal receives version discovery,
-// the sanitized run-correlation feed, three per-client operations that a
-// hosted control plane performs from background jobs (reading a client's
-// activation snapshot, installing or clearing its opaque profile binding, and
+// the sanitized run-correlation feed, per-client operations that a hosted
+// control plane performs from background jobs (reading lifecycle state or an
+// activation snapshot, installing or clearing an opaque profile binding, and
 // minting a workload client's short-lived token), and the subject-scoped
 // Library group (member artifact reads and exact-version grant management,
 // each one exact operation per route). It still cannot list, register,
 // rename, reset, or revoke clients.
 func platformServiceControlV1Route(method, requestPath string) bool {
+	if method == http.MethodPost && knowledgeCredentialRoute(requestPath) {
+		return true
+	}
+	if method == http.MethodPost && requestPath == "/control/v1/workload-clients" {
+		return true
+	}
+	parts := strings.Split(strings.TrimPrefix(requestPath, "/"), "/")
+	if len(parts) >= 4 && parts[0] == "control" && parts[1] == "v1" && validActorIdentifier(parts[3]) {
+		if parts[2] == "workload-clients" && ((len(parts) == 4 && method == http.MethodGet) || (len(parts) == 5 && parts[4] == "revoke" && method == http.MethodPost)) {
+			return true
+		}
+		if parts[2] == "connection-grants" && len(parts) == 5 && parts[4] == "recipients" && method == http.MethodPut {
+			return true
+		}
+		if parts[2] == "subjects" && len(parts) == 5 && parts[4] == "access" && method == http.MethodPut {
+			return true
+		}
+	}
+	if requestPath == "/control/v1/connection-grants" && method == http.MethodGet {
+		return true
+	}
+	if method == http.MethodPut && platformServiceControlMCPClientRoute(requestPath, "personal-connections") {
+		return true
+	}
+	// Caller-delegated connections and Library artifact erasure: create one
+	// connection, read/patch/delete it by name, set its listing token, and
+	// erase one artifact. Each dynamic segment is an actor identifier.
+	if platformServiceControlConnectionRoute(method, requestPath) {
+		return true
+	}
+	if method == http.MethodDelete && platformServiceControlLibraryArtifactRoute(requestPath) {
+		return true
+	}
+	// Connecting a member's workload client: replace its exact connection and
+	// folder lists, and set its Library projection. The handlers refuse an
+	// interactive client and, on PATCH, any field but libraryProjection and
+	// revision. The client ID is an actor identifier.
+	if platformServiceControlMCPClientConnectRoute(method, requestPath) {
+		return true
+	}
 	switch {
+	case method == http.MethodPost && requestPath == controlV1PathPrefix+"browser-runtime":
+		return true
 	case method == http.MethodGet && requestPath == controlV1PathPrefix+"meta":
 		return true
 	case method == http.MethodGet && requestPath == controlV1PathPrefix+"run-correlations":
+		return true
+	case method == http.MethodGet && platformServiceControlMCPClientRoute(requestPath, "lifecycle-state"):
 		return true
 	case method == http.MethodGet && platformServiceControlMCPClientRoute(requestPath, "activation-snapshot"):
 		return true
@@ -268,11 +323,21 @@ func platformServiceControlV1Route(method, requestPath string) bool {
 		return true
 	case method == http.MethodPost && platformServiceControlMCPClientRoute(requestPath, "workload-token"):
 		return true
+	case method == http.MethodPost && requestPath == controlV1PathPrefix+"library/chat-replies/classify":
+		return true
+	case method == http.MethodPost && platformServiceControlLibraryArtifactRoute(requestPath, "save"):
+		return true
 	case method == http.MethodGet && requestPath == controlV1PathPrefix+"library/artifacts":
+		return true
+	case method == http.MethodPost && (requestPath == controlV1PathPrefix+"library/member-skills" || requestPath == controlV1PathPrefix+"library/skill-grants"):
+		return true
+	case method == http.MethodPost && requestPath == controlV1PathPrefix+"library/collaboration":
 		return true
 	case method == http.MethodGet && requestPath == controlV1PathPrefix+"library/recipients":
 		return true
 	case method == http.MethodGet && platformServiceControlLibraryArtifactRoute(requestPath):
+		return true
+	case method == http.MethodGet && platformServiceControlLibraryArtifactRoute(requestPath, "versions", "*", "media"):
 		return true
 	case method == http.MethodGet && platformServiceControlLibraryArtifactRoute(requestPath, "versions", "*"):
 		return true
@@ -455,4 +520,13 @@ func normalizeActorAudience(raw string) string {
 		return ""
 	}
 	return parsed.Scheme + "://" + strings.ToLower(parsed.Host)
+}
+
+func knowledgeCredentialRoute(path string) bool {
+	const prefix = "/control/v1/knowledge/sources/"
+	const suffix = "/credential"
+	if !strings.HasPrefix(path, prefix) || !strings.HasSuffix(path, suffix) {
+		return false
+	}
+	return knowledgeSourceID.MatchString(strings.TrimSuffix(strings.TrimPrefix(path, prefix), suffix))
 }

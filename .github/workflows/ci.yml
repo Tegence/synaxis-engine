@@ -18,5 +18,9 @@ jobs:
           cache: true
       - run: go build ./...
       - run: go vet ./...
+      - name: Check dependencies and the standard library for known vulnerabilities
+        run: |
+          python3 -B -m unittest discover -s scripts -p '*_test.py'
+          python3 -B scripts/check_go_vulnerabilities.py
       - run: go test -race ./internal/engine/
       - run: go test ./...

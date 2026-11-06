@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -53,6 +54,31 @@ type upstreamConnection struct {
 // replacing it.
 var newUpstreamTransport = func() http.RoundTripper {
 	return upstreamoauth.NewHardenedTransport()
+}
+
+// checkUpstreamMCPRedirect keeps credentials and MCP session identifiers on
+// the configured resource origin. net/http can retain Authorization on a
+// subdomain or a different port, and forwards other MCP headers across hosts.
+// Keep OAuth discovery's independent redirect policy out of this boundary.
+func checkUpstreamMCPRedirect(request *http.Request, via []*http.Request) error {
+	if err := upstreamoauth.CheckUpstreamRedirect(request, via); err != nil {
+		return err
+	}
+	if len(via) == 0 || !sameUpstreamMCPOrigin(request.URL, via[0].URL) {
+		return errors.New("upstream redirect rejected: MCP resource origin changed")
+	}
+	return nil
+}
+
+func sameUpstreamMCPOrigin(a, b *url.URL) bool {
+	port := func(u *url.URL) string {
+		if p := u.Port(); p != "" {
+			return p
+		}
+		return "443"
+	}
+	return a != nil && b != nil && strings.EqualFold(a.Scheme, b.Scheme) &&
+		strings.EqualFold(a.Hostname(), b.Hostname()) && port(a) == port(b)
 }
 
 // isUnauthorized reports whether err is a TRANSPORT-LEVEL HTTP 401 from the
@@ -106,7 +132,7 @@ func (u *Upstream) dial(ctx context.Context) (*upstreamConnection, error) {
 	responseLimiter := newUpstreamResponseLimiter(newUpstreamTransport())
 	httpClient := &http.Client{
 		Transport:     responseLimiter,
-		CheckRedirect: upstreamoauth.CheckUpstreamRedirect,
+		CheckRedirect: checkUpstreamMCPRedirect,
 	}
 	c, err := client.NewStreamableHttpClient(
 		u.URL,
@@ -121,7 +147,10 @@ func (u *Upstream) dial(ctx context.Context) (*upstreamConnection, error) {
 		return nil, responseLimiter.classify(err)
 	}
 	init := mcp.InitializeRequest{}
-	init.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
+	// This adapter uses the legacy initialize/session wire contract. Pin its
+	// version independently of the SDK's latest stateless protocol so every
+	// fresh dial still begins with initialize, without a discovery probe.
+	init.Params.ProtocolVersion = mcp.ProtocolVersion20251125
 	init.Params.ClientInfo = mcp.Implementation{Name: "synaxis-engine", Version: "0.0"}
 	if _, err := c.Initialize(ctx, init); err != nil {
 		err = responseLimiter.classify(err)
@@ -199,11 +228,20 @@ func (u *Upstream) ListTools(ctx context.Context) ([]mcp.Tool, error) {
 // CallTool routes a prefixed tool call to this upstream (prefix already stripped
 // by the caller). Same refresh-and-redial guarantee.
 func (u *Upstream) CallTool(ctx context.Context, bareName string, args map[string]any) (*mcp.CallToolResult, error) {
+	return u.CallToolWithMeta(ctx, bareName, args, nil)
+}
+
+// CallToolWithMeta is CallTool with an optional _meta. The request is built
+// fresh, so nothing of the inbound call (its headers, other _meta keys) can
+// reach the upstream; the only caller that passes meta is a caller-delegated
+// account forwarding io.synaxis/call-id (callerGrantCallMeta).
+func (u *Upstream) CallToolWithMeta(ctx context.Context, bareName string, args map[string]any, meta *mcp.Meta) (*mcp.CallToolResult, error) {
 	var out *mcp.CallToolResult
 	err := u.withConn(ctx, func(c *client.Client) error {
 		req := mcp.CallToolRequest{}
 		req.Params.Name = bareName
 		req.Params.Arguments = args
+		req.Params.Meta = meta
 		res, err := c.CallTool(ctx, req)
 		if err != nil {
 			return err

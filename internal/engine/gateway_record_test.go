@@ -12,6 +12,7 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"github.com/mark3labs/mcp-go/server/servertest"
 )
 
 // newRecorderGateway builds a Gateway over a FileStore audit sink with a REAL
@@ -34,7 +35,7 @@ func newRecorderGateway(t *testing.T) (*Gateway, *FileStore, *int32) {
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			return mcp.NewToolResultText("got-upstream"), nil
 		})
-	ts := server.NewTestStreamableHTTPServer(up)
+	ts := servertest.NewTestStreamableHTTPServer(up)
 	t.Cleanup(ts.Close)
 
 	fs, err := LoadFileStore(filepath.Join(t.TempDir(), "accounts.json"))

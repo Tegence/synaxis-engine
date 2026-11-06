@@ -16,14 +16,14 @@ var _ LibraryRuntimeAttestationStore = (*PgStore)(nil)
 
 type libraryRowScanner interface{ Scan(...any) error }
 
-const librarySkillColumns = `id,slug,name,description,created_by,created_at,updated_at`
+const librarySkillColumns = `id,slug,name,description,created_by,created_at,updated_at,private`
 const librarySkillVersionColumns = `id,skill_id,version_number,content,digest,requested_capabilities,created_by,created_at,changelog,origin,generator,model,prompt_digest,draft_id,manifest,manifest_digest`
 const libraryDraftColumns = `id,name,description,content,requested_capabilities,origin,generator,model,prompt_digest,created_by,created_at,rationale,assumptions`
 const libraryArtifactDraftColumns = `id,title,summary,content,format,rationale,assumptions,origin,generator,model,prompt_digest,source_artifact_id,source_artifact_version_id,source_artifact_digest,created_by,created_at`
-const libraryBindingColumns = `id,skill_id,scope_kind,scope_id,mode,pinned_version_id,capability_ceiling,priority,created_by,created_at,updated_at`
+const libraryBindingColumns = `id,skill_id,scope_kind,scope_id,mode,pinned_version_id,capability_ceiling,priority,created_by,created_at,updated_at,shared_grant_id`
 const libraryEvaluationColumns = `id,skill_id,skill_version_id,evaluator,score,passed,summary,evidence_digest,created_by,created_at`
 const libraryRunColumns = `id,origin,attestation,skill_id,skill_version_id,binding_id,actor_ref,surface_ref,effective_capabilities,status,input_digest,output_digest,source_artifact_id,source_artifact_version_id,source_artifact_digest,started_at,completed_at`
-const libraryArtifactColumns = `id,title,summary,origin,run_id,skill_id,skill_version_id,binding_id,agent_surface_id,source_artifact_id,source_artifact_version_id,source_artifact_digest,created_by,created_at`
+const libraryArtifactColumns = `id,title,summary,origin,run_id,skill_id,skill_version_id,binding_id,agent_surface_id,source_artifact_id,source_artifact_version_id,source_artifact_digest,created_by,created_at,content_kind,linked_artifacts`
 const libraryArtifactVersionColumns = `id,artifact_id,version_number,format,body,digest,size_bytes,redaction_status,created_by,reviewed_by,reviewed_at,publication_claimed_at,created_at,changelog,origin,generator,model,prompt_digest,draft_id,review_comment`
 const libraryArtifactGrantColumns = `id,artifact_id,artifact_version_id,artifact_version_digest,agent_surface_id,created_by,created_at,revoked_by,revoked_at`
 
@@ -48,7 +48,7 @@ func (s *PgStore) decryptLibraryText(kind, id, field, value string) (string, err
 func (s *PgStore) scanLibrarySkill(row libraryRowScanner) (LibrarySkill, error) {
 	var skill LibrarySkill
 	var name, description, createdBy string
-	if err := row.Scan(&skill.ID, &skill.Slug, &name, &description, &createdBy, &skill.CreatedAt, &skill.UpdatedAt); err != nil {
+	if err := row.Scan(&skill.ID, &skill.Slug, &name, &description, &createdBy, &skill.CreatedAt, &skill.UpdatedAt, &skill.Private); err != nil {
 		return LibrarySkill{}, err
 	}
 	var err error
@@ -260,7 +260,7 @@ func (s *PgStore) scanLibrarySkillBinding(row libraryRowScanner) (LibrarySkillBi
 	var binding LibrarySkillBinding
 	var capabilities []byte
 	var createdBy string
-	if err := row.Scan(&binding.ID, &binding.SkillID, &binding.ScopeKind, &binding.ScopeID, &binding.Mode, &binding.PinnedVersionID, &capabilities, &binding.Priority, &createdBy, &binding.CreatedAt, &binding.UpdatedAt); err != nil {
+	if err := row.Scan(&binding.ID, &binding.SkillID, &binding.ScopeKind, &binding.ScopeID, &binding.Mode, &binding.PinnedVersionID, &capabilities, &binding.Priority, &createdBy, &binding.CreatedAt, &binding.UpdatedAt, &binding.SharedGrantID); err != nil {
 		return LibrarySkillBinding{}, err
 	}
 	var err error
@@ -374,7 +374,7 @@ func (s *PgStore) scanLibraryRun(row libraryRowScanner) (LibraryRun, error) {
 func (s *PgStore) scanLibraryArtifact(row libraryRowScanner) (LibraryArtifact, error) {
 	var artifact LibraryArtifact
 	var title, summary, sourceArtifactID, sourceArtifactVersionID, sourceArtifactDigest, createdBy string
-	if err := row.Scan(&artifact.ID, &title, &summary, &artifact.Origin, &artifact.RunID, &artifact.SkillID, &artifact.SkillVersionID, &artifact.BindingID, &artifact.AgentSurfaceID, &sourceArtifactID, &sourceArtifactVersionID, &sourceArtifactDigest, &createdBy, &artifact.CreatedAt); err != nil {
+	if err := row.Scan(&artifact.ID, &title, &summary, &artifact.Origin, &artifact.RunID, &artifact.SkillID, &artifact.SkillVersionID, &artifact.BindingID, &artifact.AgentSurfaceID, &sourceArtifactID, &sourceArtifactVersionID, &sourceArtifactDigest, &createdBy, &artifact.CreatedAt, &artifact.ContentKind, &artifact.LinkedArtifacts); err != nil {
 		return LibraryArtifact{}, err
 	}
 	var err error
@@ -490,7 +490,7 @@ func (s *PgStore) LibraryConsoleSkillPage(ctx context.Context, cursor LibraryCon
 	}
 
 	rows, err := s.pool.Query(ctx, `
-SELECT s.id,s.slug,s.name,s.description,s.created_by,s.created_at,s.updated_at,
+SELECT s.id,s.slug,s.name,s.description,s.created_by,s.created_at,s.updated_at,s.private,
        latest.id,latest.version_number,latest.digest,latest.requested_capabilities,latest.created_at
 FROM narthex_library_skills s
 LEFT JOIN LATERAL (
@@ -516,7 +516,7 @@ LIMIT $3`, afterTimestamp, cursor.ID, limit+1)
 		var latestCapabilities []byte
 		var latestCreatedAt *time.Time
 		if err := rows.Scan(
-			&item.Skill.ID, &item.Skill.Slug, &name, &description, &createdBy, &item.Skill.CreatedAt, &item.Skill.UpdatedAt,
+			&item.Skill.ID, &item.Skill.Slug, &name, &description, &createdBy, &item.Skill.CreatedAt, &item.Skill.UpdatedAt, &item.Skill.Private,
 			&latestID, &latestVersion, &latestDigest, &latestCapabilities, &latestCreatedAt,
 		); err != nil {
 			return LibraryConsoleSkillPage{}, err
@@ -583,7 +583,7 @@ JOIN LATERAL (
     ORDER BY version_number DESC
     LIMIT 1
 ) latest ON TRUE
-WHERE ($1::timestamptz IS NULL OR s.created_at < $1 OR (s.created_at = $1 AND s.id < $2))
+WHERE NOT s.private AND ($1::timestamptz IS NULL OR s.created_at < $1 OR (s.created_at = $1 AND s.id < $2))
 ORDER BY s.created_at DESC,s.id DESC
 LIMIT $3`, afterCreatedAt, cursor.ID, limit+1)
 	if err != nil {
@@ -693,7 +693,7 @@ func (s *PgStore) createLibrarySkillWithInitialVersion(ctx context.Context, skil
 	}
 	defer tx.Rollback(ctx)
 	now := time.Now().UTC()
-	if _, err := tx.Exec(ctx, `INSERT INTO narthex_library_skills (id,slug,name,description,created_by,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$6)`, skill.ID, skill.Slug, name, description, createdBy, now); err != nil {
+	if _, err := tx.Exec(ctx, `INSERT INTO narthex_library_skills (id,slug,name,description,created_by,created_at,updated_at,private) VALUES ($1,$2,$3,$4,$5,$6,$6,$7)`, skill.ID, skill.Slug, name, description, createdBy, now, skill.Private); err != nil {
 		if isUniqueViolation(err) {
 			return LibrarySkill{}, LibrarySkillVersion{}, ErrLibrarySkillExists
 		}
@@ -749,7 +749,7 @@ func (s *PgStore) CreateLibrarySkillVersion(ctx context.Context, version Library
 	return s.createLibrarySkillVersion(ctx, version, nil)
 }
 
-func (s *PgStore) createLibrarySkillVersion(ctx context.Context, version LibrarySkillVersion, bundle *LibrarySkillBundle) (LibrarySkillVersion, error) {
+func (s *PgStore) createLibrarySkillVersion(ctx context.Context, version LibrarySkillVersion, bundle *LibrarySkillBundle, guard ...LibraryMemberSkillRequest) (LibrarySkillVersion, error) {
 	if isBuiltInLibrarySkillID(version.SkillID) || isReservedBuiltInLibraryVersionID(version.ID) {
 		return LibrarySkillVersion{}, ErrLibraryBuiltInManaged
 	}
@@ -801,11 +801,19 @@ func (s *PgStore) createLibrarySkillVersion(ctx context.Context, version Library
 		}
 		return LibrarySkillVersion{}, err
 	}
+	if len(guard) > 0 {
+		if err := s.guardMemberSkillTx(ctx, tx, guard[0], ""); err != nil {
+			return LibrarySkillVersion{}, err
+		}
+	}
 	// The skill row lock above serializes every version append (the leased
 	// MCP update takes it too), so this head is the one the new version follows.
 	head, err := s.scanLibrarySkillVersion(tx.QueryRow(ctx, `SELECT `+librarySkillVersionColumns+` FROM narthex_library_skill_versions WHERE skill_id=$1 ORDER BY version_number DESC,id DESC LIMIT 1`, normalized.SkillID))
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return LibrarySkillVersion{}, err
+	}
+	if len(guard) > 0 && (err != nil || head.ID != guard[0].BaseVersionID) {
+		return LibrarySkillVersion{}, ErrLibraryMemberSkillConflict
 	}
 	if err == nil {
 		if err := requireLibrarySkillFilesDeclared(&head, libraryBundleDeclaresFiles(bundle)); err != nil {
@@ -1297,6 +1305,14 @@ func (s *PgStore) LibrarySkillResolutionSelections(ctx context.Context, request 
 	}
 	rows.Close()
 
+	grants, err := s.skillGrantsTx(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	clients, err := s.skillGrantClientsTx(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
 	bindingsBySkill := make(map[string][]LibrarySkillBinding, len(skills))
 	rows, err = tx.Query(ctx, `SELECT `+libraryBindingColumns+` FROM narthex_library_skill_bindings`)
 	if err != nil {
@@ -1307,6 +1323,9 @@ func (s *PgStore) LibrarySkillResolutionSelections(ctx context.Context, request 
 		if err != nil {
 			rows.Close()
 			return nil, err
+		}
+		if !skillBindingGrantAllowed(binding, grants, clients, time.Now().UTC()) {
+			continue
 		}
 		bindingsBySkill[binding.SkillID] = append(bindingsBySkill[binding.SkillID], binding)
 	}
@@ -1355,10 +1374,9 @@ func (s *PgStore) LibrarySkillResolutionSelections(ctx context.Context, request 
 	return resolved, nil
 }
 
-// LibraryAgentSurfaceSkillSelections resolves explicit agent-surface bindings
-// in one PostgreSQL statement. PostgreSQL gives a single statement one MVCC
-// snapshot, so a track binding and its selected head cannot be assembled from
-// different before/after views of a concurrent binding/version update.
+// LibraryAgentSurfaceSkillSelections resolves bindings, immutable versions, and
+// live sharing grants in one repeatable-read snapshot. A grant cannot be paired
+// with a binding or version observed after its revocation.
 func (s *PgStore) LibraryAgentSurfaceSkillSelections(ctx context.Context, agentSurfaceID string) ([]LibraryAgentSurfaceSkillSelection, error) {
 	const query = `
 WITH ranked_bindings AS (
@@ -1369,8 +1387,8 @@ WITH ranked_bindings AS (
     SELECT * FROM ranked_bindings WHERE selection_rank=1
 )
 SELECT
-    s.id,s.slug,s.name,s.description,s.created_by,s.created_at,s.updated_at,
-    b.id,b.skill_id,b.scope_kind,b.scope_id,b.mode,b.pinned_version_id,b.capability_ceiling,b.priority,b.created_by,b.created_at,b.updated_at,
+    s.id,s.slug,s.name,s.description,s.created_by,s.created_at,s.updated_at,s.private,
+    b.id,b.skill_id,b.scope_kind,b.scope_id,b.mode,b.pinned_version_id,b.capability_ceiling,b.priority,b.created_by,b.created_at,b.updated_at,b.shared_grant_id,
     v.id,v.skill_id,v.version_number,v.content,v.digest,v.requested_capabilities,v.created_by,v.created_at,v.manifest,v.manifest_digest
 FROM selected_bindings b
 JOIN narthex_library_skills s ON s.id=b.skill_id
@@ -1383,7 +1401,12 @@ JOIN LATERAL (
     LIMIT 1
 ) v ON true
 ORDER BY b.priority DESC, s.slug, s.id`
-	rows, err := s.pool.Query(ctx, query, LibraryScopeAgentSurface, agentSurfaceID)
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	rows, err := tx.Query(ctx, query, LibraryScopeAgentSurface, agentSurfaceID)
 	if err != nil {
 		return nil, err
 	}
@@ -1394,8 +1417,8 @@ ORDER BY b.priority DESC, s.slug, s.id`
 		var skillName, skillDescription, skillCreatedBy, bindingCreatedBy, versionContent, versionCreatedBy, versionManifest string
 		var bindingCapabilities, versionCapabilities []byte
 		if err := rows.Scan(
-			&selection.Skill.ID, &selection.Skill.Slug, &skillName, &skillDescription, &skillCreatedBy, &selection.Skill.CreatedAt, &selection.Skill.UpdatedAt,
-			&selection.Binding.ID, &selection.Binding.SkillID, &selection.Binding.ScopeKind, &selection.Binding.ScopeID, &selection.Binding.Mode, &selection.Binding.PinnedVersionID, &bindingCapabilities, &selection.Binding.Priority, &bindingCreatedBy, &selection.Binding.CreatedAt, &selection.Binding.UpdatedAt,
+			&selection.Skill.ID, &selection.Skill.Slug, &skillName, &skillDescription, &skillCreatedBy, &selection.Skill.CreatedAt, &selection.Skill.UpdatedAt, &selection.Skill.Private,
+			&selection.Binding.ID, &selection.Binding.SkillID, &selection.Binding.ScopeKind, &selection.Binding.ScopeID, &selection.Binding.Mode, &selection.Binding.PinnedVersionID, &bindingCapabilities, &selection.Binding.Priority, &bindingCreatedBy, &selection.Binding.CreatedAt, &selection.Binding.UpdatedAt, &selection.Binding.SharedGrantID,
 			&selection.Version.ID, &selection.Version.SkillID, &selection.Version.Version, &versionContent, &selection.Version.Digest, &versionCapabilities, &versionCreatedBy, &selection.Version.CreatedAt, &versionManifest, &selection.Version.ManifestDigest,
 		); err != nil {
 			return nil, err
@@ -1435,7 +1458,32 @@ ORDER BY b.priority DESC, s.slug, s.id`
 		}
 		selections = append(selections, selection)
 	}
-	return selections, rows.Err()
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return nil, err
+	}
+	grants, err := s.skillGrantsTx(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	clients, err := s.skillGrantClientsTx(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	filtered := selections[:0]
+	for _, selection := range selections {
+		if skillBindingGrantAllowed(selection.Binding, grants, clients, time.Now().UTC()) {
+			if selection.Binding.SharedGrantID != "" {
+				selection.Skill.Description = ""
+			}
+			filtered = append(filtered, selection)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return filtered, nil
 }
 
 // libraryAgentSurfaceSkillSelectionsForUpdateTx is the commit-time variant of
@@ -1510,6 +1558,13 @@ ORDER BY skill_id`, LibraryScopeAgentSurface, agentSurfaceID)
 
 	selections := make([]LibraryAgentSurfaceSkillSelection, 0, len(bindings))
 	for _, binding := range bindings {
+		allowed, err := s.skillBindingGrantAllowedTx(ctx, tx, binding)
+		if err != nil {
+			return nil, err
+		}
+		if !allowed {
+			continue
+		}
 		skill, err := s.scanLibrarySkill(tx.QueryRow(ctx, `SELECT `+librarySkillColumns+` FROM narthex_library_skills WHERE id=$1 FOR UPDATE`, binding.SkillID))
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrLibrarySkillNotFound
@@ -1532,12 +1587,19 @@ ORDER BY skill_id`, LibraryScopeAgentSurface, agentSurfaceID)
 		if err != nil {
 			return nil, err
 		}
+		if binding.SharedGrantID != "" {
+			skill.Description = ""
+		}
 		selections = append(selections, LibraryAgentSurfaceSkillSelection{Skill: skill, Binding: binding, Version: version})
 	}
 	return selections, nil
 }
 
 func (s *PgStore) UpsertLibrarySkillBinding(ctx context.Context, binding LibrarySkillBinding) (LibrarySkillBinding, error) {
+	return s.upsertLibrarySkillBinding(ctx, binding, nil)
+}
+
+func (s *PgStore) upsertLibrarySkillBinding(ctx context.Context, binding LibrarySkillBinding, guard *LibraryMemberSkillRequest) (LibrarySkillBinding, error) {
 	if isBuiltInLibrarySkillID(binding.SkillID) || isReservedBuiltInLibraryBindingID(binding.ID) {
 		return LibrarySkillBinding{}, ErrLibraryBuiltInManaged
 	}
@@ -1561,12 +1623,54 @@ func (s *PgStore) UpsertLibrarySkillBinding(ctx context.Context, binding Library
 		return LibrarySkillBinding{}, err
 	}
 	defer tx.Rollback(ctx)
+	if guard != nil {
+		if err := s.guardMemberSkillClientTx(ctx, tx, *guard); err != nil {
+			return LibrarySkillBinding{}, err
+		}
+	}
 	var skillID string
 	if err := tx.QueryRow(ctx, `SELECT id FROM narthex_library_skills WHERE id=$1 FOR UPDATE`, normalized.SkillID).Scan(&skillID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return LibrarySkillBinding{}, ErrLibrarySkillNotFound
 		}
 		return LibrarySkillBinding{}, err
+	}
+	if guard != nil {
+		if err := s.guardMemberSkillTx(ctx, tx, *guard, normalized.ScopeID); err != nil {
+			return LibrarySkillBinding{}, err
+		}
+	} else {
+		var private bool
+		if err := tx.QueryRow(ctx, `SELECT private FROM narthex_library_skills WHERE id=$1`, normalized.SkillID).Scan(&private); err != nil {
+			return LibrarySkillBinding{}, err
+		}
+		if private || normalized.SharedGrantID != "" {
+			return LibrarySkillBinding{}, ErrLibraryMemberSkillAccess
+		}
+	}
+	if guard != nil {
+		grants, err := s.skillGrantsTx(ctx, tx)
+		if err != nil {
+			return LibrarySkillBinding{}, err
+		}
+		skill, err := s.scanLibrarySkill(tx.QueryRow(ctx, `SELECT `+librarySkillColumns+` FROM narthex_library_skills WHERE id=$1`, normalized.SkillID))
+		if err != nil {
+			return LibrarySkillBinding{}, err
+		}
+		if !memberOwnsSkill(skill, guard.Subject) {
+			grant := memberSkillGrant(grants, *guard)
+			if grant == nil {
+				return LibrarySkillBinding{}, ErrLibraryMemberSkillAccess
+			}
+			client, err := loadMCPClientForUpdate(ctx, tx, normalized.ScopeID)
+			if err != nil {
+				return LibrarySkillBinding{}, err
+			}
+			if !skillGrantAllows(*grant, normalized.SkillID, normalized.PinnedVersionID, client.Subject, time.Now().UTC()) {
+				return LibrarySkillBinding{}, ErrLibraryMemberSkillAccess
+			}
+			normalized.SharedGrantID = grant.ID
+		}
 	}
 	if normalized.Mode == LibraryBindingModePin {
 		var versionID string
@@ -1581,16 +1685,17 @@ func (s *PgStore) UpsertLibrarySkillBinding(ctx context.Context, binding Library
 		normalized.CreatedAt = time.Now().UTC()
 	}
 	if _, err := tx.Exec(ctx, `
-INSERT INTO narthex_library_skill_bindings (id,skill_id,scope_kind,scope_id,mode,pinned_version_id,capability_ceiling,priority,created_by,created_at,updated_at)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+INSERT INTO narthex_library_skill_bindings (id,skill_id,scope_kind,scope_id,mode,pinned_version_id,capability_ceiling,priority,created_by,created_at,updated_at,shared_grant_id)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
 ON CONFLICT (skill_id,scope_kind,scope_id) DO UPDATE SET
+    shared_grant_id=EXCLUDED.shared_grant_id,
     mode=EXCLUDED.mode,
     pinned_version_id=EXCLUDED.pinned_version_id,
     capability_ceiling=EXCLUDED.capability_ceiling,
     priority=EXCLUDED.priority,
     created_by=EXCLUDED.created_by,
     updated_at=EXCLUDED.updated_at`,
-		normalized.ID, normalized.SkillID, normalized.ScopeKind, normalized.ScopeID, normalized.Mode, normalized.PinnedVersionID, capabilities, normalized.Priority, createdBy, normalized.CreatedAt, normalized.UpdatedAt); err != nil {
+		normalized.ID, normalized.SkillID, normalized.ScopeKind, normalized.ScopeID, normalized.Mode, normalized.PinnedVersionID, capabilities, normalized.Priority, createdBy, normalized.CreatedAt, normalized.UpdatedAt, normalized.SharedGrantID); err != nil {
 		return LibrarySkillBinding{}, err
 	}
 	if _, err := s.bumpLibrarySkillBindingGenerationForUpdateTx(ctx, tx, normalized.SkillID); err != nil {
@@ -1607,6 +1712,10 @@ ON CONFLICT (skill_id,scope_kind,scope_id) DO UPDATE SET
 }
 
 func (s *PgStore) DeleteLibrarySkillBinding(ctx context.Context, skillID, bindingID string) error {
+	return s.deleteLibrarySkillBinding(ctx, skillID, bindingID, nil)
+}
+
+func (s *PgStore) deleteLibrarySkillBinding(ctx context.Context, skillID, bindingID string, guard *LibraryMemberSkillRequest) error {
 	if isBuiltInLibrarySkillID(skillID) {
 		return ErrLibraryBuiltInManaged
 	}
@@ -1615,12 +1724,22 @@ func (s *PgStore) DeleteLibrarySkillBinding(ctx context.Context, skillID, bindin
 		return err
 	}
 	defer tx.Rollback(ctx)
+	if guard != nil {
+		if err := s.guardMemberSkillClientTx(ctx, tx, *guard); err != nil {
+			return err
+		}
+	}
 	var lockedSkillID string
 	if err := tx.QueryRow(ctx, `SELECT id FROM narthex_library_skills WHERE id=$1 FOR UPDATE`, skillID).Scan(&lockedSkillID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrLibraryBindingNotFound
 		}
 		return err
+	}
+	if guard != nil {
+		if err := s.guardMemberSkillTx(ctx, tx, *guard, guard.AgentSurfaceID); err != nil {
+			return err
+		}
 	}
 	tag, err := tx.Exec(ctx, `DELETE FROM narthex_library_skill_bindings WHERE skill_id=$1 AND id=$2`, skillID, bindingID)
 	if err != nil {
@@ -1728,7 +1847,8 @@ func (s *PgStore) LibraryConsoleRunPage(ctx context.Context, cursor LibraryConso
 	rows, err := s.pool.Query(ctx, `
 SELECT `+libraryRunColumns+`
 FROM narthex_library_runs
-WHERE ($1::timestamptz IS NULL OR started_at < $1 OR (started_at = $1 AND id < $2))
+WHERE NOT EXISTS (SELECT 1 FROM narthex_library_artifacts a WHERE a.run_id=narthex_library_runs.id AND a.content_kind='chat_reply')
+AND ($1::timestamptz IS NULL OR started_at < $1 OR (started_at = $1 AND id < $2))
 ORDER BY started_at DESC,id DESC
 LIMIT $3`, afterTimestamp, cursor.ID, limit+1)
 	if err != nil {
@@ -1850,7 +1970,7 @@ func (s *PgStore) validateLibraryArtifactSource(ctx context.Context, artifactID,
 }
 
 func (s *PgStore) LibraryArtifacts(ctx context.Context) ([]LibraryArtifact, error) {
-	rows, err := s.pool.Query(ctx, `SELECT `+libraryArtifactColumns+` FROM narthex_library_artifacts ORDER BY created_at`)
+	rows, err := s.pool.Query(ctx, `SELECT `+libraryArtifactColumns+` FROM narthex_library_artifacts WHERE content_kind <> 'chat_reply' ORDER BY created_at`)
 	if err != nil {
 		return nil, err
 	}
@@ -1886,7 +2006,7 @@ func (s *PgStore) LibraryConsoleArtifactPage(ctx context.Context, cursor Library
 	// The lateral join reads only latest-version metadata (never body) and,
 	// for an image head, the blob's MIME type from its metadata row.
 	rows, err := s.pool.Query(ctx, `
-SELECT a.id,a.title,a.summary,a.origin,a.run_id,a.skill_id,a.skill_version_id,a.binding_id,a.agent_surface_id,a.source_artifact_id,a.source_artifact_version_id,a.source_artifact_digest,a.created_by,a.created_at,
+SELECT a.id,a.title,a.summary,a.origin,a.run_id,a.skill_id,a.skill_version_id,a.binding_id,a.agent_surface_id,a.source_artifact_id,a.source_artifact_version_id,a.source_artifact_digest,a.created_by,a.created_at,a.content_kind,
        latest.id,latest.version_number,latest.format,latest.digest,latest.size_bytes,latest.redaction_status,latest.reviewed_at,latest.created_at,blob.mime_type
 FROM narthex_library_artifacts a
 LEFT JOIN LATERAL (
@@ -1897,7 +2017,7 @@ LEFT JOIN LATERAL (
     LIMIT 1
 ) latest ON TRUE
 LEFT JOIN narthex_library_artifact_media_blobs blob ON blob.artifact_version_id=latest.id AND latest.format='image'
-WHERE ($1::timestamptz IS NULL OR a.created_at < $1 OR (a.created_at = $1 AND a.id < $2))
+WHERE a.content_kind <> 'chat_reply' AND ($1::timestamptz IS NULL OR a.created_at < $1 OR (a.created_at = $1 AND a.id < $2))
 ORDER BY a.created_at DESC,a.id DESC
 LIMIT $3`, afterTimestamp, cursor.ID, limit+1)
 	if err != nil {
@@ -1915,7 +2035,7 @@ LIMIT $3`, afterTimestamp, cursor.ID, limit+1)
 		artifact := &item.Artifact
 		if err := rows.Scan(
 			&artifact.ID, &title, &summary, &artifact.Origin, &artifact.RunID, &artifact.SkillID, &artifact.SkillVersionID, &artifact.BindingID, &artifact.AgentSurfaceID,
-			&sourceArtifactID, &sourceArtifactVersionID, &sourceArtifactDigest, &createdBy, &artifact.CreatedAt,
+			&sourceArtifactID, &sourceArtifactVersionID, &sourceArtifactDigest, &createdBy, &artifact.CreatedAt, &artifact.ContentKind,
 			&latestID, &latestVersion, &latestFormat, &latestDigest, &latestSize, &latestRedaction, &latestReviewedAt, &latestCreatedAt, &latestMIME,
 		); err != nil {
 			return LibraryConsoleArtifactPage{}, err
@@ -1981,7 +2101,7 @@ func (s *PgStore) LibraryMCPRootArtifactPage(ctx context.Context, cursor Library
 	rows, err := s.pool.Query(ctx, `
 SELECT id,title,summary,origin,created_at
 FROM narthex_library_artifacts
-WHERE ($1::timestamptz IS NULL OR created_at < $1 OR (created_at = $1 AND id < $2))
+WHERE content_kind <> 'chat_reply' AND ($1::timestamptz IS NULL OR created_at < $1 OR (created_at = $1 AND id < $2))
 ORDER BY created_at DESC,id DESC
 LIMIT $3`, afterCreatedAt, cursor.ID, limit+1)
 	if err != nil {
@@ -2060,6 +2180,7 @@ func (s *PgStore) validateLibraryArtifactProvenance(ctx context.Context, artifac
 }
 
 func (s *PgStore) CreateLibraryArtifactWithInitialVersion(ctx context.Context, artifact LibraryArtifact, version LibraryArtifactVersion) (LibraryArtifact, LibraryArtifactVersion, error) {
+	artifact.ContentKind = libraryContentKind(artifact.ContentKind)
 	if artifact.ID == "" {
 		artifact.ID = newLibraryArtifactID()
 	}
@@ -2123,7 +2244,7 @@ func (s *PgStore) CreateLibraryArtifactWithInitialVersion(ctx context.Context, a
 		return LibraryArtifact{}, LibraryArtifactVersion{}, err
 	}
 	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, `INSERT INTO narthex_library_artifacts (id,title,summary,origin,run_id,skill_id,skill_version_id,binding_id,agent_surface_id,source_artifact_id,source_artifact_version_id,source_artifact_digest,created_by,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`, artifact.ID, title, summary, artifact.Origin, artifact.RunID, artifact.SkillID, artifact.SkillVersionID, artifact.BindingID, artifact.AgentSurfaceID, sourceArtifactID, sourceArtifactVersionID, sourceArtifactDigest, createdBy, artifact.CreatedAt); err != nil {
+	if _, err := tx.Exec(ctx, `INSERT INTO narthex_library_artifacts (id,title,summary,origin,run_id,skill_id,skill_version_id,binding_id,agent_surface_id,source_artifact_id,source_artifact_version_id,source_artifact_digest,created_by,created_at,content_kind,linked_artifacts) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`, artifact.ID, title, summary, artifact.Origin, artifact.RunID, artifact.SkillID, artifact.SkillVersionID, artifact.BindingID, artifact.AgentSurfaceID, sourceArtifactID, sourceArtifactVersionID, sourceArtifactDigest, createdBy, artifact.CreatedAt, artifact.ContentKind, nonNilLibraryChatRefs(artifact.LinkedArtifacts)); err != nil {
 		return LibraryArtifact{}, LibraryArtifactVersion{}, err
 	}
 	if _, err := tx.Exec(ctx, libraryArtifactVersionInsert, normalized.ID, normalized.ArtifactID, normalized.Version, normalized.Format, body, normalized.Digest, normalized.SizeBytes, normalized.RedactionStatus, versionCreatedBy, reviewedBy, normalized.CreatedAt,
@@ -2331,7 +2452,7 @@ func (s *PgStore) insertLibraryRunArtifactWithInitialVersionTx(ctx context.Conte
 	if _, err := tx.Exec(ctx, `INSERT INTO narthex_library_runs (id,origin,attestation,skill_id,skill_version_id,binding_id,actor_ref,surface_ref,effective_capabilities,status,input_digest,output_digest,source_artifact_id,source_artifact_version_id,source_artifact_digest,started_at,completed_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`, run.ID, run.Origin, run.Attestation, run.SkillID, run.SkillVersionID, run.BindingID, actorRef, surfaceRef, capabilities, run.Status, run.InputDigest, run.OutputDigest, runSourceArtifactID, runSourceArtifactVersionID, runSourceArtifactDigest, run.StartedAt, run.CompletedAt); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO narthex_library_artifacts (id,title,summary,origin,run_id,skill_id,skill_version_id,binding_id,agent_surface_id,source_artifact_id,source_artifact_version_id,source_artifact_digest,created_by,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`, artifact.ID, title, summary, artifact.Origin, artifact.RunID, artifact.SkillID, artifact.SkillVersionID, artifact.BindingID, artifact.AgentSurfaceID, artifactSourceID, artifactSourceVersionID, artifactSourceDigest, createdBy, artifact.CreatedAt); err != nil {
+	if _, err := tx.Exec(ctx, `INSERT INTO narthex_library_artifacts (id,title,summary,origin,run_id,skill_id,skill_version_id,binding_id,agent_surface_id,source_artifact_id,source_artifact_version_id,source_artifact_digest,created_by,created_at,content_kind,linked_artifacts) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`, artifact.ID, title, summary, artifact.Origin, artifact.RunID, artifact.SkillID, artifact.SkillVersionID, artifact.BindingID, artifact.AgentSurfaceID, artifactSourceID, artifactSourceVersionID, artifactSourceDigest, createdBy, artifact.CreatedAt, artifact.ContentKind, nonNilLibraryChatRefs(artifact.LinkedArtifacts)); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx, libraryArtifactVersionInsert, version.ID, version.ArtifactID, version.Version, version.Format, body, version.Digest, version.SizeBytes, version.RedactionStatus, versionCreatedBy, "", version.CreatedAt,
@@ -2372,6 +2493,10 @@ func (s *PgStore) CreateLibraryMCPClientArtifactWithInitialVersion(ctx context.C
 	if err != nil {
 		return LibraryRun{}, LibraryArtifact{}, LibraryArtifactVersion{}, err
 	}
+	if err := s.validateLibraryChatLinksTx(ctx, tx, artifact, client); err != nil {
+		return LibraryRun{}, LibraryArtifact{}, LibraryArtifactVersion{}, err
+	}
+
 	if artifact.SourceArtifactID != "" {
 		allowed, err := s.libraryMCPClientMayUseArtifactVersionTx(ctx, tx, artifact.SourceArtifactID, artifact.SourceArtifactVersionID, artifact.SourceArtifactDigest, client.ID, subject)
 		if err != nil {
@@ -2649,7 +2774,7 @@ JOIN narthex_library_artifacts a ON a.id=selected.artifact_id
 JOIN narthex_library_artifact_versions v ON v.artifact_id=selected.artifact_id AND v.id=selected.artifact_version_id
 JOIN narthex_mcp_clients c ON c.id=$1 AND c.subject=$4 AND c.status='active'
 LEFT JOIN narthex_library_runs run ON run.id=a.run_id
-WHERE ($2::timestamptz IS NULL OR selected.created_at < $2 OR (selected.created_at = $2 AND selected.artifact_id < $3))
+WHERE a.content_kind <> 'chat_reply' AND ($2::timestamptz IS NULL OR selected.created_at < $2 OR (selected.created_at = $2 AND selected.artifact_id < $3))
 ORDER BY selected.created_at DESC, selected.artifact_id DESC
 LIMIT $5`, client.ID, afterCreatedAt, cursor.ArtifactID, client.Subject, limit+1)
 	if err != nil {
@@ -2731,7 +2856,7 @@ func (s *PgStore) CreateLibraryArtifactVersion(ctx context.Context, version Libr
 	}
 	defer tx.Rollback(ctx)
 	var artifactID string
-	if err := tx.QueryRow(ctx, `SELECT id FROM narthex_library_artifacts WHERE id=$1 FOR UPDATE`, normalized.ArtifactID).Scan(&artifactID); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT id FROM narthex_library_artifacts WHERE id=$1 AND content_kind <> 'chat_reply' FOR UPDATE`, normalized.ArtifactID).Scan(&artifactID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return LibraryArtifactVersion{}, ErrLibraryArtifactNotFound
 		}

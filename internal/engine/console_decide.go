@@ -33,7 +33,7 @@ func (c *ConsoleAPI) handleOneTimeDecide(w http.ResponseWriter, r *http.Request)
 	}
 	id := internalApprovalID(r.PathValue("id"))
 	p, found, err := c.gw.ApprovalByID(r.Context(), id)
-	if err != nil || !found {
+	if err != nil || !found || p.PrivateOwnerSubject != "" {
 		writeDecidePage(w, http.StatusNotFound, decidePage{
 			Title: "Link not found", Body: "This link is invalid, or the request it pointed to no longer exists.",
 		})

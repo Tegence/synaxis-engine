@@ -349,7 +349,7 @@ func (s *FileStore) GrantMCPClientSkillAuthoringAdoptionLease(_ context.Context,
 	}
 
 	skill := s.librarySkillLocked(request.SkillID)
-	if skill == nil {
+	if skill == nil || skill.Private {
 		return LibraryMCPClientSkillAuthoringLease{}, s.rejectLibraryMCPClientSkillAuthoringLocked(*client, currentLeaseID, grantedBy, LibraryMCPClientSkillAuthoringAuditOperationAdopt, "", "", ErrLibrarySkillNotFound)
 	}
 	head := s.latestLibrarySkillVersionLocked(skill.ID)

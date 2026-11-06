@@ -210,6 +210,9 @@ func resolveLibrarySkillSnapshot(request LibrarySkillResolutionRequest, skills [
 func libraryResolutionCandidates(request LibrarySkillResolutionRequest, skills []LibrarySkill, bindingsBySkill map[string][]LibrarySkillBinding) ([]libraryResolutionCandidate, error) {
 	if request.ExplicitBindingID != "" {
 		for _, skill := range skills {
+			if skill.Private {
+				continue
+			}
 			for _, binding := range bindingsBySkill[skill.ID] {
 				if binding.SkillID != skill.ID {
 					return nil, errors.New("library store returned a binding for a mismatched skill")
@@ -230,6 +233,9 @@ func libraryResolutionCandidates(request LibrarySkillResolutionRequest, skills [
 	}
 	candidates := make(map[string]libraryResolutionCandidate, len(skills))
 	for _, skill := range skills {
+		if skill.Private {
+			continue
+		}
 		for _, binding := range bindingsBySkill[skill.ID] {
 			if binding.SkillID != skill.ID {
 				return nil, errors.New("library store returned a binding for a mismatched skill")

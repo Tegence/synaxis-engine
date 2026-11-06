@@ -14,9 +14,18 @@ local check set:
 go mod download
 go build ./...
 go vet ./...
+python3 -B -m unittest discover -s scripts -p '*_test.py'
+python3 -B scripts/check_go_vulnerabilities.py
 go test -race ./internal/engine/
 go test ./...
 ```
+
+The vulnerability gate requires Python 3 and the module's Go toolchain. It runs
+the full live `govulncheck` scan and fails on reachable vulnerabilities and tool
+errors. See [the security policy](SECURITY.md#go-2026-6911-local-mitigation) for
+the temporary, regression-verified redirect mitigation and its review deadline.
+`GOVULNCHECK_DB` defaults to `https://vuln.go.dev`; restricted networks may use
+Google's current official mirror, `https://storage.googleapis.com/go-vulndb`.
 
 With no `DATABASE_URL`, the engine uses the local JSON file store. Persistence
 changes must work with both the file and Postgres stores, or degrade through

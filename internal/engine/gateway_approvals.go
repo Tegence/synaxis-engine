@@ -22,6 +22,10 @@ const (
 	defaultApprovalTimeout       = 180 * time.Second
 	approvalDecisionPollInterval = 250 * time.Millisecond
 	approvalWriteTimeout         = 5 * time.Second
+	// A parked call's waiter heartbeats its durable row; boot recovery on
+	// another process cancels only rows that missed a few beats.
+	approvalHeartbeatInterval = 10 * time.Second
+	approvalOwnerStaleAfter   = 3 * approvalHeartbeatInterval
 )
 
 // approvalLog returns the store's ApprovalLog facet, if it has one (same
@@ -169,7 +173,13 @@ func (g *Gateway) DecideWithMetadata(ctx context.Context, id string, decision Ap
 	if readErr != nil {
 		return PendingCall{}, readErr
 	}
-	if found && existing.Status == ApprovalPending && !g.pendingCallBindingLive(existing) {
+	if found && existing.PrivateOwnerSubject != "" {
+		actor, verified := PlatformActorFromContext(ctx)
+		if !verified || actor.UserID != existing.PrivateOwnerSubject {
+			return PendingCall{}, ErrApprovalNotFound
+		}
+	}
+	if found && existing.Status == ApprovalPending && !g.pendingCallBindingLive(writeCtx, existing) {
 		cancelled, cancelErr := al.CancelPending(writeCtx, id, "engine", "connection ownership changed while approval was pending")
 		if cancelErr == nil {
 			if ch, live := g.takeWait(id); live {
@@ -183,7 +193,8 @@ func (g *Gateway) DecideWithMetadata(ctx context.Context, id string, decision Ap
 	// is a best-effort "this call is the one that produced the transition"
 	// signal (a narrow concurrent-decide race can double-fire a notification;
 	// the durable CAS itself is unaffected — see notify.go).
-	wasPending := found && existing.Status == ApprovalPending
+	// Workspace webhooks are not an owner-scoped delivery channel.
+	wasPending := found && existing.Status == ApprovalPending && existing.PrivateOwnerSubject == ""
 	p, err := al.DecidePending(writeCtx, id, decision)
 	if err != nil {
 		// A move/cancel or another Engine's terminal decision may have won after
@@ -231,7 +242,23 @@ func (g *Gateway) DecideWithMetadata(ctx context.Context, id string, decision Ap
 // request was parked. Unbound historical rows remain readable in approval
 // history, but only Gateway-created calls reach this dispatch path and those
 // always carry a complete binding.
-func (g *Gateway) pendingCallBindingLive(p PendingCall) bool {
+func (g *Gateway) pendingCallBindingLive(ctx context.Context, p PendingCall) bool {
+	if p.PrivateOwnerSubject != "" && p.Connector == "browser" && p.ConnectionNamespaceID == "" && p.AccountIncarnationID != "" {
+		accounts, ok := g.store.(LinkedAccountStore)
+		if !ok {
+			return false
+		}
+		records, err := accounts.LinkedAccounts(ctx, p.PrivateOwnerSubject)
+		if err != nil {
+			return false
+		}
+		for _, record := range records {
+			if record.isWebsiteAccount() && pendingCallBoundToBrowserAccount(p, record, Account{}) {
+				return true
+			}
+		}
+		return false
+	}
 	if p.AccountIncarnationID == "" && p.AccountRevision == 0 && p.ConnectionNamespaceID == "" {
 		return true // legacy audit-only record; it has no in-flight Gateway waiter
 	}
@@ -251,6 +278,8 @@ func (g *Gateway) WaitDecision(ctx context.Context, id string, timeout time.Dura
 	defer timer.Stop()
 	poll := time.NewTicker(approvalDecisionPollInterval)
 	defer poll.Stop()
+	heartbeat := time.NewTicker(approvalHeartbeatInterval)
+	defer heartbeat.Stop()
 
 	for {
 		select {
@@ -260,6 +289,8 @@ func (g *Gateway) WaitDecision(ctx context.Context, id string, timeout time.Dura
 			if resolved, approved, status := g.observeDurableDecision(ctx, id, ch); resolved {
 				return approved, status
 			}
+		case <-heartbeat.C:
+			g.heartbeatPending(ctx, id)
 		case <-timer.C:
 			return g.finishWait(ctx, id, ch, ApprovalExpired)
 		case <-ctx.Done():
@@ -290,6 +321,22 @@ func (g *Gateway) observeDurableDecision(ctx context.Context, id string, ch chan
 	default:
 		return false, false, ""
 	}
+}
+
+// heartbeatPending keeps another Engine process's boot recovery (for example
+// the next revision starting during a rollout) from cancelling a call this
+// process is still waiting on. FileStore is single-process and has no such
+// recovery. A failed beat is harmless until approvalOwnerStaleAfter elapses.
+func (g *Gateway) heartbeatPending(ctx context.Context, id string) {
+	hb, ok := g.store.(interface {
+		HeartbeatPending(ctx context.Context, id string) error
+	})
+	if !ok {
+		return
+	}
+	writeCtx, cancel := approvalWriteContext(ctx)
+	defer cancel()
+	_ = hb.HeartbeatPending(writeCtx, id)
 }
 
 // finishWait reaches the terminal state through the store's conditional
@@ -368,6 +415,12 @@ func (g *Gateway) approvalHandler(connector string, account Account, bare string
 		if sc := auditScopeFrom(ctx); sc != nil && sc.connector != "" {
 			approvalConnector = sc.connector
 		}
+		if accountDeliveredOnlyByExactGrant(account) {
+			// FAIL CLOSED: a parked call would store this caller's arguments
+			// for a Synaxis approver. Policy writes refuse such a policy
+			// (approval_not_supported_for_delegated); this covers older rows.
+			return mcp.NewToolResultError(callerDelegatedApprovalRefusal), nil
+		}
 		al, hasLog := g.approvalLog()
 		if !hasLog {
 			// FAIL CLOSED: a gated tool must never dispatch without a record.
@@ -388,7 +441,8 @@ func (g *Gateway) approvalHandler(connector string, account Account, bare string
 		now := time.Now()
 		expires := now.Add(g.approvalWait())
 		p := PendingCall{
-			ID: id, TS: now, ExpiresAt: &expires, Connector: approvalConnector, Account: account.Name,
+			CallerSubject: auditCallerSubject(ctx),
+			ID:            id, TS: now, ExpiresAt: &expires, Connector: approvalConnector, Account: account.Name,
 			Tool: bare, Args: req.GetArguments(), Status: ApprovalPending, Kind: approvalKind(readOnly),
 			AccountIncarnationID: account.IncarnationID, AccountRevision: account.Revision,
 			ConnectionNamespaceID: account.ConnectionNamespaceID,
@@ -415,7 +469,8 @@ func (g *Gateway) approvalHandler(connector string, account Account, bare string
 				outcome = "approval could not be finalized safely"
 			}
 			if g.audit != nil {
-				rec := CallRecord{
+				rec := CallRecord{CallerSubject: auditCallerSubject(ctx),
+					AccountIncarnationID: account.IncarnationID, AccountOwnerSubject: account.OwnerSubject,
 					Account: account.Name, Tool: bare, OK: false,
 					Ms: time.Since(start).Milliseconds(), Error: outcome,
 					Connector: approvalConnector, Decision: reason,
@@ -433,10 +488,11 @@ func (g *Gateway) approvalHandler(connector string, account Account, bare string
 			}
 			return mcp.NewToolResultError(outcome + " — the call was not sent upstream"), nil
 		}
-		if !g.pendingCallBindingLive(p) {
+		if !g.pendingCallBindingLive(ctx, p) {
 			const outcome = "connection ownership changed"
 			if g.audit != nil {
-				rec := CallRecord{
+				rec := CallRecord{CallerSubject: auditCallerSubject(ctx),
+					AccountIncarnationID: account.IncarnationID, AccountOwnerSubject: account.OwnerSubject,
 					Account: account.Name, Tool: bare, OK: false,
 					Ms: time.Since(start).Milliseconds(), Error: outcome,
 					Connector: approvalConnector, Decision: outcome,

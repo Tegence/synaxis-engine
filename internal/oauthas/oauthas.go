@@ -47,9 +47,16 @@ const (
 	accessTTL = 7 * 24 * time.Hour // long-lived: Claude rarely needs to refresh
 	codeTTL   = 10 * time.Minute
 	// Refresh tokens are deliberately non-rotating so a harmless retry cannot
-	// strand a client, but they are not permanent bearer credentials.  Their
-	// durable expiry bounds the recovery window after a client is retired.
-	refreshTTL            = 30 * 24 * time.Hour
+	// strand a client, but they are not permanent bearer credentials. A grant
+	// lapses refreshTTL after its last use (a refresh renews it) and never
+	// outlives refreshMaxLifetime from its authorization, so an agent in
+	// regular use is not forced to sign in again every month while a retired
+	// client's grant still expires on its own.
+	refreshTTL         = 30 * 24 * time.Hour
+	refreshMaxLifetime = 180 * 24 * time.Hour
+	// refreshRenewalStep skips renewals that would barely move the expiry, so
+	// a client that refreshes often costs at most one write a day.
+	refreshRenewalStep    = 24 * time.Hour
 	generationReadTimeout = 2 * time.Second
 	grantStoreTimeout     = 2 * time.Second
 	// tokenGenerationCacheTTL bounds how long syncTokenGeneration may skip its
@@ -88,6 +95,7 @@ type refreshGrant struct {
 	resourceEpoch string
 	generation    string
 	expires       time.Time
+	issued        time.Time // bounds renewal at refreshMaxLifetime
 }
 
 // TokenGenerationStore persists the workspace-wide OAuth generation. Engine
@@ -117,6 +125,8 @@ type DurableAuthorizationCode struct {
 
 // DurableRefreshGrant is the persisted non-rotating refresh grant.  It has
 // the same generation and endpoint-epoch fences as an authorization code.
+// IssuedAt is zero for grants stored before renewal existed; those were
+// issued exactly refreshTTL before their ExpiresAt.
 type DurableRefreshGrant struct {
 	TokenHash     string
 	ClientID      string
@@ -124,6 +134,7 @@ type DurableRefreshGrant struct {
 	ResourceEpoch string
 	Generation    string
 	ExpiresAt     time.Time
+	IssuedAt      time.Time
 }
 
 // OAuthGrantStore is the durable companion to TokenGenerationStore.  Engine
@@ -151,6 +162,14 @@ type OAuthGrantStore interface {
 type OAuthGrantEpochStore interface {
 	OAuthGrantStore
 	RevokeOAuthGrantsForResourceEpoch(context.Context, string, string) error
+}
+
+// OAuthGrantRenewalStore is the optional extension that slides a used refresh
+// grant's expiry forward. RenewRefreshGrant must only ever extend a grant that
+// is still live at now; it never revives or shortens one.
+type OAuthGrantRenewalStore interface {
+	OAuthGrantStore
+	RenewRefreshGrant(ctx context.Context, tokenHash string, expiresAt, now time.Time) error
 }
 
 // Server is the single-tenant AS. issuer is this service's public base URL.
@@ -189,7 +208,10 @@ type Server struct {
 	// after a client grant changes; this callback also prevents an authorization
 	// code or refresh token minted before that change from being upgraded into a
 	// token for the new endpoint epoch.
-	clientResourceAuthorizer func(clientID, resource string) bool
+	clientResourceAuthorizer func(clientID, resource string) (bool, error)
+	// projectionReady reports whether the Engine has built its endpoint
+	// projection (see SetResourceProjectionReady). nil means always settled.
+	projectionReady func() bool
 
 	clients map[string]client
 	codes   map[string]authCode
@@ -203,6 +225,9 @@ type Server struct {
 	// The callback lives at the Engine boundary so oauthas remains independent
 	// of the Engine store package.
 	hostedConsentAuthorizer func(context.Context, string, string, string, string) error
+	// hostedConsentReplacer replaces hostedConsentAuthorizer for an approval
+	// carrying the signed replace claim (see SetHostedConsentReplacer).
+	hostedConsentReplacer func(context.Context, string, string, string, string) error
 	// localConsentAuthorizer is the self-hosted counterpart used only for a
 	// client-bound endpoint after the local console password has been verified.
 	// Self-hosted Engines have one durable administrator identity, rather than a
@@ -267,6 +292,17 @@ func (s *Server) SetHostedConsentAuthorizer(
 	fn func(context.Context, string, string, string, string) error,
 ) {
 	s.hostedConsentAuthorizer = fn
+}
+
+// SetHostedConsentReplacer installs the callback used instead of the consent
+// authorizer when Platform signs the member's explicit "Replace sign-in"
+// choice for a client-bound resource. It must perform every check the
+// authorizer does, and may additionally move an existing OAuth-client binding
+// to the approving client. Configure it before serving requests.
+func (s *Server) SetHostedConsentReplacer(
+	fn func(context.Context, string, string, string, string) error,
+) {
+	s.hostedConsentReplacer = fn
 }
 
 // SetLocalConsentAuthorizer installs the self-hosted authorization callback
@@ -459,17 +495,56 @@ func durableRefreshGrantFrom(token string, grant refreshGrant) DurableRefreshGra
 		ResourceEpoch: grant.resourceEpoch,
 		Generation:    grant.generation,
 		ExpiresAt:     grant.expires,
+		IssuedAt:      grant.issued,
 	}
 }
 
 func refreshGrantFromDurable(grant DurableRefreshGrant) refreshGrant {
+	issued := grant.IssuedAt
+	if issued.IsZero() {
+		issued = grant.ExpiresAt.Add(-refreshTTL)
+	}
 	return refreshGrant{
 		clientID:      grant.ClientID,
 		resource:      grant.Resource,
 		resourceEpoch: grant.ResourceEpoch,
 		generation:    grant.Generation,
 		expires:       grant.ExpiresAt,
+		issued:        issued,
 	}
+}
+
+// renewRefreshGrant slides a grant that was just used to refreshTTL from now,
+// never past refreshMaxLifetime from its authorization. A failed write leaves
+// the grant valid until its current expiry, and the next refresh tries again.
+func (s *Server) renewRefreshGrant(ctx context.Context, token string, grant refreshGrant) {
+	now := s.now()
+	expiry := now.Add(refreshTTL)
+	if limit := grant.issued.Add(refreshMaxLifetime); !grant.issued.IsZero() && expiry.After(limit) {
+		expiry = limit
+	}
+	if expiry.Sub(grant.expires) < refreshRenewalStep {
+		return
+	}
+	if store := s.grantStoreForRequest(); store != nil {
+		renewal, ok := store.(OAuthGrantRenewalStore)
+		if !ok {
+			return
+		}
+		grantCtx, cancel := grantStoreContext(ctx)
+		err := renewal.RenewRefreshGrant(grantCtx, durableGrantTokenHash(token), expiry, now)
+		cancel()
+		if err != nil {
+			log.Printf("oauthas: renew refresh grant: %v", err)
+		}
+		return
+	}
+	s.mu.Lock()
+	if current, ok := s.refresh[token]; ok && current.generation == grant.generation && current.expires.Before(expiry) {
+		current.expires = expiry
+		s.refresh[token] = current
+	}
+	s.mu.Unlock()
 }
 
 // SetEpochLookup wires the resource-path → token-epoch resolver (see the
@@ -480,9 +555,44 @@ func (s *Server) SetEpochLookup(fn func(path string) (string, bool)) { s.epochOf
 // client-bound resource paths. It is intentionally called outside oauthas's
 // generation lock, so implementations may perform a bounded durable lookup.
 // It must return false for a missing, inactive, revoked, or differently-bound
-// MCP client. Configure it before serving requests.
-func (s *Server) SetClientResourceAuthorizer(fn func(clientID, resource string) bool) {
+// MCP client, and an error only when that state could not be read: the AS
+// answers an error with a retryable 503, never a 401 or invalid_grant that
+// would make a healthy client discard its tokens. Configure it before serving
+// requests.
+func (s *Server) SetClientResourceAuthorizer(fn func(clientID, resource string) (bool, error)) {
 	s.clientResourceAuthorizer = fn
+}
+
+// SetResourceProjectionReady installs the Engine's endpoint-projection
+// readiness. While it reports false, a resource that does not resolve may only
+// be missing from memory (a startup or refresh that could not read durable
+// state), so the AS answers it with a retryable 503 instead of a 401,
+// invalid_grant or invalid_target that makes a client discard its tokens or
+// abandon the connection. A 503 grants nothing. fn must not block or take
+// locks: the AS may call it while holding its own.
+func (s *Server) SetResourceProjectionReady(fn func() bool) { s.projectionReady = fn }
+
+func (s *Server) projectionSettled() bool {
+	fn := s.projectionReady
+	return fn == nil || fn()
+}
+
+// awaitingProjection reports that tok is bound to a resource that does not
+// resolve while the endpoint projection is not settled.
+func (s *Server) awaitingProjection(tok string) bool {
+	if s.projectionSettled() {
+		return false
+	}
+	parts := strings.Split(tok, ".")
+	if len(parts) != 4 {
+		return false
+	}
+	resource, err := base64.RawURLEncoding.DecodeString(parts[3])
+	if err != nil {
+		return false
+	}
+	_, live := s.epochFor(string(resource))
+	return !live
 }
 
 // SetTrustProxyHeaders switches the consent-throttle rate-limit key from
@@ -547,7 +657,7 @@ func (s *Server) generationForResource(path string) (string, bool) {
 // the given resource path — called by the gateway when a connector is deleted
 // so its refresh tokens can never mint new access tokens. Outstanding ACCESS
 // tokens are stateless and are instead invalidated by the epoch check in
-// validAccess (a deleted path no longer resolves; a recreated one has a fresh
+// verifyAccess (a deleted path no longer resolves; a recreated one has a fresh
 // epoch).
 func (s *Server) RevokeResource(path string) {
 	s.revokeResource(path, "")
@@ -901,6 +1011,10 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, ok := s.resourceEpoch(resource); !ok {
+		if !s.projectionSettled() {
+			s.redirectErr(w, r, redirectURI, state, "temporarily_unavailable", "the engine is starting; try again shortly")
+			return
+		}
 		s.redirectErr(w, r, redirectURI, state, "invalid_target", "unknown resource "+resource)
 		return
 	}
@@ -914,6 +1028,10 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	}
 	generation, ok := s.generationForResource(resource)
 	if !ok {
+		if !s.projectionSettled() {
+			s.redirectErr(w, r, redirectURI, state, "temporarily_unavailable", "the engine is starting; try again shortly")
+			return
+		}
 		s.redirectErr(w, r, redirectURI, state, "invalid_target", "unknown resource "+resource)
 		return
 	}
@@ -983,7 +1101,14 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 			request.clientID,
 			request.resourcePath,
 		); err != nil {
-			s.redirectErr(w, r, request.redirectURI, request.state, "access_denied", "the local administrator is not permitted to authorize this client")
+			switch {
+			case errors.Is(err, ErrAuthorizationStateUnavailable):
+				unavailable(w)
+			case errors.Is(err, ErrClientBoundToOtherApp):
+				s.redirectErr(w, r, request.redirectURI, request.state, "access_denied", "this agent endpoint is already connected to another app; reset its connection, then connect again")
+			default:
+				s.redirectErr(w, r, request.redirectURI, request.state, "access_denied", "the local administrator is not permitted to authorize this client")
+			}
 			return
 		}
 	}
@@ -1213,7 +1338,10 @@ func (s *Server) grantCode(w http.ResponseWriter, r *http.Request) {
 	// a redeemable bearer capability. The lookup is outside the OAuth generation
 	// lock so a durable store stall cannot block global revocation.
 	s.mu.Unlock()
-	if !s.clientResourceAllowed(ac.clientID, ac.resource) {
+	if allowed, err := s.clientResourceAllowed(ac.clientID, ac.resource); err != nil {
+		unavailable(w)
+		return
+	} else if !allowed {
 		oauthErr(w, 400, "invalid_grant", "client is no longer authorized for this resource")
 		return
 	}
@@ -1275,6 +1403,10 @@ func (s *Server) grantRefresh(w http.ResponseWriter, r *http.Request) {
 	grantResourceEpoch, resourceLive := s.resourceEpoch(g.resource)
 	if !resourceLive {
 		s.mu.Unlock()
+		if !s.projectionSettled() {
+			unavailable(w)
+			return
+		}
 		oauthErr(w, 400, "invalid_grant", "resource no longer exists")
 		return
 	}
@@ -1286,7 +1418,10 @@ func (s *Server) grantRefresh(w http.ResponseWriter, r *http.Request) {
 	// Do not let a refresh token from a formerly-bound client gain the current
 	// endpoint epoch after an operator revokes or reassigns that client.
 	s.mu.Unlock()
-	if !s.clientResourceAllowed(g.clientID, g.resource) {
+	if allowed, err := s.clientResourceAllowed(g.clientID, g.resource); err != nil {
+		unavailable(w)
+		return
+	} else if !allowed {
 		oauthErr(w, 400, "invalid_grant", "client is no longer authorized for this resource")
 		return
 	}
@@ -1309,10 +1444,15 @@ func (s *Server) grantRefresh(w http.ResponseWriter, r *http.Request) {
 	at, ok := s.signAccessForResourceEpochLocked(g.clientID, g.resource, grantResourceEpoch)
 	if !ok {
 		s.mu.Unlock()
+		if !s.projectionSettled() {
+			unavailable(w)
+			return
+		}
 		oauthErr(w, 400, "invalid_grant", "resource no longer exists")
 		return
 	}
 	s.mu.Unlock()
+	s.renewRefreshGrant(r.Context(), rt, g)
 	writeJSON(w, 200, tokenResp(at, rt, "mcp"))
 }
 
@@ -1340,6 +1480,7 @@ func (s *Server) issueTokensLocked(ctx context.Context, clientID, scope, resourc
 			resourceEpoch: resourceEpoch,
 			generation:    s.tokenGeneration,
 			expires:       s.now().Add(refreshTTL),
+			issued:        s.now(),
 		}
 		if store := s.grantStore; store != nil {
 			grantCtx, cancel := grantStoreContext(ctx)
@@ -1460,7 +1601,7 @@ func (s *Server) signAccessForResourceEpochLocked(clientID, resource, resourceEp
 }
 
 // encodeAccessLocked is the single access-token encoder, so every issuance
-// path produces exactly the format validAccess verifies. It requires s.mu
+// path produces exactly the format verifyAccess verifies. It requires s.mu
 // for reading or writing because it binds the current generation.
 func (s *Server) encodeAccessLocked(clientID, resource, resourceEpoch string, expiresAtUnix int64) string {
 	epoch := s.tokenGeneration + "|" + resourceEpoch
@@ -1479,6 +1620,23 @@ var (
 	// client-bound endpoint, that its current binding does not authorize the
 	// client identity, or that authorization state changed while minting.
 	ErrResourceAccessDenied = errors.New("resource access denied")
+	// ErrAuthorizationStateUnavailable reports that durable authorization
+	// state could not be read. Nothing was decided; the caller may retry.
+	// Consent authorizers wrap it so the AS answers 503, not a denial.
+	ErrAuthorizationStateUnavailable = errors.New("authorization state unavailable")
+	// ErrClientBoundToOtherApp is wrapped by a consent authorizer that refuses
+	// only because the subject-bound endpoint is already bound to a different
+	// OAuth client (for example an agent that registered again). The AS says
+	// so instead of reporting a generic denial.
+	ErrClientBoundToOtherApp = errors.New("endpoint is bound to another OAuth client")
+)
+
+// ConsentReasonHeader carries a machine-readable reason on a refused hosted
+// consent so Platform can explain it. ConsentReasonClientBound is the only
+// value: the endpoint is bound to another OAuth client (ErrClientBoundToOtherApp).
+const (
+	ConsentReasonHeader      = "X-Synaxis-Consent-Reason"
+	ConsentReasonClientBound = "mcp_client_bound"
 )
 
 // IssueResourceAccess mints an access token for one client-bound resource
@@ -1489,7 +1647,7 @@ var (
 // RequireAuth already verifies, bound to the current authorization
 // generation and resource epoch. The token therefore dies exactly like any
 // other: on RevokeAll, on an endpoint epoch rotation, or as soon as the
-// binding stops naming clientID (validAccess repeats that check on every
+// binding stops naming clientID (RequireAuth repeats that check on every
 // use). It also expires after ttl.
 //
 // ttl must be positive and no longer than the interactive access lifetime.
@@ -1520,11 +1678,16 @@ func (s *Server) IssueResourceAccess(ctx context.Context, clientID, resource str
 	resourceEpoch, live := s.resourceEpoch(resource)
 	s.mu.RUnlock()
 	if !live {
+		if !s.projectionSettled() {
+			return "", time.Time{}, fmt.Errorf("%w: endpoint projection is not ready", ErrAuthorizationStateUnavailable)
+		}
 		return "", time.Time{}, ErrResourceAccessDenied
 	}
 	// As in code and refresh redemption, the durable binding check runs
 	// outside the generation lock so a store stall cannot block revocation.
-	if !s.clientResourceAllowed(clientID, resource) {
+	if allowed, err := s.clientResourceAllowed(clientID, resource); err != nil {
+		return "", time.Time{}, fmt.Errorf("%w: %w", ErrAuthorizationStateUnavailable, err)
+	} else if !allowed {
 		return "", time.Time{}, ErrResourceAccessDenied
 	}
 	s.mu.RLock()
@@ -1574,13 +1737,16 @@ func clientBoundResource(resource string) bool {
 
 // clientResourceAllowed is deliberately evaluated outside the OAuth server's
 // generation mutex. Its implementation may do a bounded durable lookup, while
-// the HMAC/epoch checks remain protected by validAccess's snapshot.
-func (s *Server) clientResourceAllowed(clientID, resource string) bool {
+// the HMAC/epoch checks remain protected by verifyAccess's snapshot.
+func (s *Server) clientResourceAllowed(clientID, resource string) (bool, error) {
 	if !clientBoundResource(resource) {
-		return true
+		return true, nil
 	}
 	fn := s.clientResourceAuthorizer
-	return fn != nil && fn(clientID, resource)
+	if fn == nil {
+		return false, nil
+	}
+	return fn(clientID, resource)
 }
 
 func (s *Server) sign(msg string) string {
@@ -1589,23 +1755,24 @@ func (s *Server) sign(msg string) string {
 	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 
-// validAccess verifies signature + expiry AND that the token's bound resource
+// verifyAccess verifies signature + expiry AND that the token's bound resource
 // matches the path being requested (audience check). The signature covers the
 // resource's epoch at MINT time; it is re-verified against the CURRENT epoch,
 // so a token dies the moment its connector is deleted and stays dead even if
-// the slug is later recreated (recreation mints a fresh epoch).
-func (s *Server) validAccess(tok, path string) bool {
+// the slug is later recreated (recreation mints a fresh epoch). It is
+// memory-only; RequireAuth adds the durable client-binding check once.
+func (s *Server) verifyAccess(tok, path string) (clientID, resource string, ok bool) {
 	parts := strings.Split(tok, ".")
 	if len(parts) != 4 {
-		return false
+		return "", "", false
 	}
 	cidBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
 	if err != nil {
-		return false
+		return "", "", false
 	}
 	resBytes, err := base64.RawURLEncoding.DecodeString(parts[3])
 	if err != nil {
-		return false
+		return "", "", false
 	}
 	s.mu.RLock()
 	epoch, ok := s.epochForLocked(string(resBytes))
@@ -1615,32 +1782,57 @@ func (s *Server) validAccess(tok, path string) bool {
 	) == 1
 	s.mu.RUnlock()
 	if !signatureValid {
-		return false // bound endpoint no longer exists or token was forged
+		return "", "", false // bound endpoint no longer exists or token was forged
 	}
 	n, err := strconv.ParseInt(parts[0], 10, 64)
 	if err != nil || s.now().Unix() >= n {
-		return false
+		return "", "", false
 	}
-	resource := string(resBytes)
-	return resource == strings.TrimRight(path, "/") &&
-		s.clientResourceAllowed(string(cidBytes), resource)
+	if string(resBytes) != strings.TrimRight(path, "/") {
+		return "", "", false
+	}
+	return string(cidBytes), string(resBytes), true
 }
 
 // RequireAuth wraps the MCP handler: valid Bearer passes; otherwise a 401 whose
 // WWW-Authenticate points Claude at the protected-resource metadata (RFC 9728).
+// The token is checked against memory before and after the generation sync;
+// the durable client binding is checked once, last.
 func (s *Server) RequireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		scheme, tok, hasCredentials := strings.Cut(r.Header.Get("Authorization"), " ")
 		if !hasCredentials || !strings.EqualFold(scheme, "Bearer") ||
-			strings.ContainsAny(tok, " \t\r\n") || !s.validAccess(tok, r.URL.Path) {
+			strings.ContainsAny(tok, " \t\r\n") {
+			s.rejectAccess(w, r)
+			return
+		}
+		if _, _, ok := s.verifyAccess(tok, r.URL.Path); !ok {
+			if s.awaitingProjection(tok) {
+				unavailable(w)
+				return
+			}
 			s.rejectAccess(w, r)
 			return
 		}
 		if err := s.syncTokenGeneration(r.Context()); err != nil {
-			oauthErr(w, http.StatusServiceUnavailable, "temporarily_unavailable", "authorization state unavailable")
+			unavailable(w)
 			return
 		}
-		if !s.validAccess(tok, r.URL.Path) {
+		clientID, resource, ok := s.verifyAccess(tok, r.URL.Path)
+		if !ok {
+			if s.awaitingProjection(tok) {
+				unavailable(w)
+				return
+			}
+			s.rejectAccess(w, r)
+			return
+		}
+		allowed, err := s.clientResourceAllowed(clientID, resource)
+		if err != nil {
+			unavailable(w)
+			return
+		}
+		if !allowed {
 			s.rejectAccess(w, r)
 			return
 		}
@@ -1680,6 +1872,13 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func oauthErr(w http.ResponseWriter, status int, code, desc string) {
 	writeJSON(w, status, map[string]string{"error": code, "error_description": desc})
+}
+
+// unavailable answers a failure to read authorization state. It is retryable
+// by definition, so it must never look like a verdict on the client's tokens.
+func unavailable(w http.ResponseWriter) {
+	w.Header().Set("Retry-After", "2")
+	oauthErr(w, http.StatusServiceUnavailable, "temporarily_unavailable", "authorization state unavailable")
 }
 
 func randToken(n int) string {

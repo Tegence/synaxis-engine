@@ -189,6 +189,7 @@ func prepareLibraryMCPClientImageArtifact(client MCPClient, artifact LibraryArti
 		return LibraryRun{}, LibraryArtifact{}, LibraryArtifactVersion{}, err
 	}
 
+	artifact.ContentKind = libraryContentKind(artifact.ContentKind)
 	artifact.ID = newLibraryArtifactID()
 	artifact.RunID = newLibraryRunID()
 	artifact.CreatedBy = client.Subject
@@ -235,6 +236,7 @@ func prepareLibraryRootMCPImageArtifact(artifact LibraryArtifact, image libraryA
 		return LibraryRun{}, LibraryArtifact{}, LibraryArtifactVersion{}, err
 	}
 
+	artifact.ContentKind = libraryContentKind(artifact.ContentKind)
 	artifact.ID = newLibraryArtifactID()
 	artifact.RunID = newLibraryRunID()
 	artifact.CreatedBy = libraryRootMCPActorRef
@@ -293,6 +295,7 @@ func prepareLibraryHumanImageArtifact(artifact LibraryArtifact, image libraryArt
 		return LibraryRun{}, LibraryArtifact{}, LibraryArtifactVersion{}, err
 	}
 
+	artifact.ContentKind = libraryContentKind(artifact.ContentKind)
 	artifact.ID = newLibraryArtifactID()
 	artifact.RunID = newLibraryRunID()
 	if artifact.CreatedAt.IsZero() {

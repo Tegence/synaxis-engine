@@ -1,6 +1,11 @@
 package engine
 
-import "github.com/mark3labs/mcp-go/server"
+import (
+	"context"
+
+	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
+)
 
 // governancePolicyScope identifies approvals/audit rows created by a durable
 // tool policy rather than a manually-curated connector. It is deliberately not
@@ -20,6 +25,14 @@ func (g *Gateway) governedAccountToolHandler(
 ) server.ToolHandlerFunc {
 	if !preset.requiresApproval() {
 		return inner
+	}
+	if accountDeliveredOnlyByExactGrant(account) {
+		// An approval policy cannot apply to a caller-delegated account (its
+		// parked arguments would be shown to a Synaxis approver), and a stored
+		// one must not be bypassed either: refuse the tool outright.
+		return func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultError(callerDelegatedApprovalRefusal), nil
+		}
 	}
 
 	// Audit scope has to wrap approval so an approved call carries its decision

@@ -248,7 +248,7 @@ func prepareLibraryRuntimeAttestationOutput(client MCPClient, parsed parsedLibra
 	runID := newLibraryRunID()
 	artifact := LibraryArtifact{
 		ID: clientScopedRuntimeArtifactID(), Title: parsed.Request.Output.Title, Summary: parsed.Request.Output.Summary,
-		Origin: LibraryArtifactOriginSkillRun, RunID: runID,
+		Origin: LibraryArtifactOriginSkillRun, RunID: runID, ContentKind: LibraryContentArtifact,
 		SkillID: parsed.Request.SkillID, SkillVersionID: parsed.Request.SkillVersionID, BindingID: parsed.Request.BindingID,
 		AgentSurfaceID: client.ID, CreatedBy: client.Subject, CreatedAt: now,
 	}
@@ -351,8 +351,8 @@ func NewLibraryRuntimeAttestationHandler(store LibraryRuntimeAttestationStore) h
 		// This direct route identifies a registration by its stable endpoint
 		// slug only. Do not use ActiveMCPClient here because that helper also
 		// accepts opaque IDs for internal callers.
-		client, found := mcpStore.MCPClientBySlug(r.Context(), slug)
-		if !found || client.Status != MCPClientStatusActive {
+		client, found, lookupErr := lookupActiveMCPClient(r.Context(), mcpStore, slug)
+		if lookupErr != nil || !found || client.Status != MCPClientStatusActive {
 			http.NotFound(w, r)
 			return
 		}

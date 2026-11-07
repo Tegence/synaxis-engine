@@ -78,7 +78,7 @@ func RegisterLibraryArtifactTools(s *server.MCPServer, store LibraryStore, sink 
 				return mcp.NewToolResultError("skillId is required"), nil
 			}
 			skill, found := store.LibrarySkill(ctx, input.SkillID)
-			if !found {
+			if !found || skill.Private {
 				return mcp.NewToolResultError("skill not found"), nil
 			}
 			versions, err := store.LibrarySkillVersions(ctx, skill.ID)
@@ -119,6 +119,10 @@ func RegisterLibraryArtifactTools(s *server.MCPServer, store LibraryStore, sink 
 			}
 			filePath, err := normalizeLibrarySkillPath(strings.TrimSpace(input.Path))
 			if err != nil {
+				return mcp.NewToolResultError("skill file not found"), nil
+			}
+			skill, found := store.LibrarySkill(ctx, input.SkillID)
+			if !found || skill.Private {
 				return mcp.NewToolResultError("skill file not found"), nil
 			}
 			bundleStore, supported := store.(LibrarySkillBundleStore)
@@ -248,6 +252,13 @@ func RegisterLibraryArtifactTools(s *server.MCPServer, store LibraryStore, sink 
 				return mcp.NewToolResultError("artifact content is unavailable"), nil
 			}
 			version := versions[len(versions)-1]
+			if input.ArtifactVersionID != "" {
+				exact, found := store.LibraryArtifactVersion(ctx, artifact.ID, input.ArtifactVersionID)
+				if !found {
+					return mcp.NewToolResultError("artifact not found"), nil
+				}
+				version = exact
+			}
 			if version.Format == LibraryArtifactFormatImage {
 				mediaStore, supported := store.(LibraryArtifactMediaStore)
 				if !supported {
@@ -380,17 +391,20 @@ func encodeLibraryMCPRootPageCursor(cursor LibraryMCPRootPageCursor, kind string
 }
 
 type libraryArtifactCreateInput struct {
-	Title                   string `json:"title" jsonschema:"Short artifact title"`
-	Summary                 string `json:"summary,omitempty" jsonschema:"Optional concise artifact summary"`
-	Format                  string `json:"format,omitempty" jsonschema:"Artifact body format: markdown or text; defaults to markdown"`
-	Body                    string `json:"body" jsonschema:"Artifact content"`
-	SourceArtifactID        string `json:"sourceArtifactId,omitempty" jsonschema:"Optional exact source artifact ID; requires sourceArtifactVersionId and sourceArtifactDigest"`
-	SourceArtifactVersionID string `json:"sourceArtifactVersionId,omitempty" jsonschema:"Optional immutable source artifact version ID"`
-	SourceArtifactDigest    string `json:"sourceArtifactDigest,omitempty" jsonschema:"Optional SHA-256 digest for the exact source version"`
+	ContentKind             string                   `json:"contentKind,omitempty" jsonschema:"artifact (default) or chat_reply for a conversation message"`
+	LinkedArtifacts         []LibraryChatArtifactRef `json:"linkedArtifacts,omitempty" jsonschema:"Exact artifacts produced during this conversation turn; only for chat_reply"`
+	Title                   string                   `json:"title" jsonschema:"Short artifact title"`
+	Summary                 string                   `json:"summary,omitempty" jsonschema:"Optional concise artifact summary"`
+	Format                  string                   `json:"format,omitempty" jsonschema:"Artifact body format: markdown or text; defaults to markdown"`
+	Body                    string                   `json:"body" jsonschema:"Artifact content"`
+	SourceArtifactID        string                   `json:"sourceArtifactId,omitempty" jsonschema:"Optional exact source artifact ID; requires sourceArtifactVersionId and sourceArtifactDigest"`
+	SourceArtifactVersionID string                   `json:"sourceArtifactVersionId,omitempty" jsonschema:"Optional immutable source artifact version ID"`
+	SourceArtifactDigest    string                   `json:"sourceArtifactDigest,omitempty" jsonschema:"Optional SHA-256 digest for the exact source version"`
 }
 
 type libraryArtifactReadInput struct {
-	ArtifactID string `json:"artifactId" jsonschema:"Opaque Library artifact ID"`
+	ArtifactVersionID string `json:"artifactVersionId,omitempty" jsonschema:"Optional exact immutable version; otherwise current accessible version"`
+	ArtifactID        string `json:"artifactId" jsonschema:"Opaque Library artifact ID"`
 }
 
 type librarySkillReadInput struct {

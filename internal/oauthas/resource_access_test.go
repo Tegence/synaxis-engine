@@ -28,8 +28,8 @@ func newResourceAccessServer(t *testing.T, epochs map[string]string, store *memo
 		epoch, ok := epochs[path]
 		return epoch, ok
 	})
-	server.SetClientResourceAuthorizer(func(clientID, resource string) bool {
-		return clientID == workloadTestClientID && resource == workloadTestResource
+	server.SetClientResourceAuthorizer(func(clientID, resource string) (bool, error) {
+		return clientID == workloadTestClientID && resource == workloadTestResource, nil
 	})
 	configureGeneration(t, server, store)
 	return server
@@ -115,7 +115,7 @@ func TestIssueResourceAccessRefusesSharedResourcesAndMalformedRequests(t *testin
 	epochs := map[string]string{"/mcp": "root", "/mcp/team": "team", workloadTestResource: "epoch-1"}
 	server := newResourceAccessServer(t, epochs, &memoryTokenGenerationStore{})
 	// Admit everything so each refusal below is attributable to its input.
-	server.SetClientResourceAuthorizer(func(string, string) bool { return true })
+	server.SetClientResourceAuthorizer(func(string, string) (bool, error) { return true, nil })
 
 	for _, ttl := range []time.Duration{0, -time.Second, accessTTL + time.Second} {
 		if _, _, err := server.IssueResourceAccess(ctx, workloadTestClientID, workloadTestResource, ttl); !errors.Is(err, ErrInvalidResourceAccess) {
@@ -189,7 +189,7 @@ func TestIssueResourceAccessTokensDieWithEpochRotationBindingLossAndRevokeAll(t 
 
 	// validAccess re-asks the Engine on every use, so losing the binding
 	// (a reset or revoke that has not rotated anything else yet) kills it.
-	server.SetClientResourceAuthorizer(func(string, string) bool { return false })
+	server.SetClientResourceAuthorizer(func(string, string) (bool, error) { return false, nil })
 	if server.validAccess(token, workloadTestResource) {
 		t.Fatal("token survived the loss of its client binding")
 	}
@@ -230,20 +230,20 @@ func TestIssueResourceAccessRefusesWhenAuthorizationStateMovesMidIssue(t *testin
 
 	// The binding was approved for epoch-1, but the endpoint rotated before
 	// signing: the token must not be issued for state nobody authorized.
-	server.SetClientResourceAuthorizer(func(string, string) bool {
+	server.SetClientResourceAuthorizer(func(string, string) (bool, error) {
 		epochs[workloadTestResource] = "epoch-2"
-		return true
+		return true, nil
 	})
 	if _, _, err := server.IssueResourceAccess(ctx, workloadTestClientID, workloadTestResource, time.Hour); !errors.Is(err, ErrResourceAccessDenied) {
 		t.Fatalf("epoch moved during authorization err=%v; want denied", err)
 	}
 
 	// Likewise for a workspace-wide revocation that lands mid-issue.
-	server.SetClientResourceAuthorizer(func(string, string) bool {
+	server.SetClientResourceAuthorizer(func(string, string) (bool, error) {
 		if err := server.RevokeAll(context.Background()); err != nil {
 			t.Errorf("RevokeAll: %v", err)
 		}
-		return true
+		return true, nil
 	})
 	if _, _, err := server.IssueResourceAccess(ctx, workloadTestClientID, workloadTestResource, time.Hour); !errors.Is(err, ErrResourceAccessDenied) {
 		t.Fatalf("generation moved during authorization err=%v; want denied", err)

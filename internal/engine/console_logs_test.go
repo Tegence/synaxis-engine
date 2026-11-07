@@ -316,7 +316,11 @@ func TestHostedOperatorLogsPaginationBackfillsPastInvisibleRows(t *testing.T) {
 		if i%5 == 0 {
 			account = "private_notion"
 		}
-		store.LogCall(CallRecord{Account: account, Tool: toolName(i), TS: baseTS.Add(time.Duration(i) * time.Second)})
+		subject := "usr_elsewhere"
+		if account == "team_notion" {
+			subject = "usr_operator"
+		}
+		store.LogCall(CallRecord{Account: account, CallerSubject: subject, Tool: toolName(i), TS: baseTS.Add(time.Duration(i) * time.Second)})
 	}
 	var wantVisible []string // tool names, newest-first
 	for i := total - 1; i >= 0; i-- {
